@@ -1,4 +1,5 @@
 ﻿#Requires -Version 5.1
+#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     注册校园网自动登录计划任务。

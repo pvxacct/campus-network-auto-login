@@ -84,7 +84,7 @@ powershell -ExecutionPolicy Bypass -File .\Setup-DrcomAutoLogin.ps1
 
 1. 提示输入校园网账号和密码，用 DPAPI 加密保存到 `credential.xml`；
 2. 注册计划任务 `CampusAutoLogin`；
-3. 立即执行一次登录测试。
+3. 立即执行一次状态检查。
 
 安装完成后：
 
@@ -186,7 +186,7 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1
 
 - `credential.xml` 使用 Windows DPAPI 加密，与当前 Windows 用户绑定；
 - 不要把 `credential.xml` 提交到 Git 或复制到其他电脑；
-- `.gitignore` 已默认忽略 `credential.xml`、`*.log` 和 `work/`；
+- `.gitignore` 已默认忽略 `credential.xml`、`*.log`、`work/`、`id_ed25519`、`*.pem`、`*.ppk`；
 - 公开仓库中不要写入自己的学号、密码、Portal 内网地址等个人信息。
 
 ## 目录结构
@@ -204,6 +204,7 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1
 │   └── TROUBLESHOOTING.md             # 常见问题
 └── generic/
     ├── CampusAutoLogin.ps1            # 通用 Portal 版本
+    ├── Save-CampusCredential.ps1      # 通用版凭据保存
     └── config.example.json            # 通用版配置示例
 ```
 
@@ -217,9 +218,33 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1
 
 如果不是 Dr.COM，或者登录接口不是 `/drcom/login`，可以使用 [`generic/CampusAutoLogin.ps1`](generic/CampusAutoLogin.ps1)：
 
-1. 用浏览器开发者工具抓取登录请求；
-2. 把 URL、方法、字段名、密码加密方式填入 `generic/config.example.json`；
-3. 用同样的方式注册计划任务。
+1. 复制配置模板：
+
+```powershell
+Copy-Item .\generic\config.example.json .\generic\config.json
+```
+
+2. 用浏览器开发者工具抓取登录请求；
+3. 把 URL、方法、字段名、密码加密方式填入 `generic/config.json`；
+4. 保存账号密码：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\generic\Save-CampusCredential.ps1
+```
+
+5. 手动测试：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\generic\CampusAutoLogin.ps1
+```
+
+6. 注册计划任务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1 -ScriptPath .\generic\CampusAutoLogin.ps1 -ConfigPath .\generic\config.json
+```
+
+> 注册计划任务需要以管理员身份运行 PowerShell。
 
 ## License
 

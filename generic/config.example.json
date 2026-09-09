@@ -2,6 +2,7 @@
   "CredentialPath": "",
   "TimeoutSec": 10,
   "VerifyDelaySec": 2,
+  "CheckIntervalMinutes": 2,
 
   "CheckUrls": [
     { "Url": "http://www.msftconnecttest.com/connecttest.txt", "Expect": "Microsoft Connect Test" },

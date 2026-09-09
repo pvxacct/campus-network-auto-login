@@ -298,9 +298,31 @@ if (-not (Test-Path -LiteralPath $credPath)) {
     exit 1
 }
 
-$cred = Import-Clixml -LiteralPath $credPath
-$username = $cred.UserName
-$password = $cred.GetNetworkCredential().Password
+try {
+    $cred = Import-Clixml -LiteralPath $credPath
+    $username = $cred.UserName
+    $password = $null
+    try {
+        $password = $cred.GetNetworkCredential().Password
+    } catch {
+        if ($cred.Password -is [System.Security.SecureString]) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($cred.Password)
+            try {
+                $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+            } finally {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            }
+        } else {
+            $password = [string]$cred.Password
+        }
+    }
+    if ([string]::IsNullOrEmpty($password)) {
+        throw '凭据文件中的密码为空或无法解密。'
+    }
+} catch {
+    Write-Log "读取凭据失败（凭据文件与当前 Windows 用户绑定）：$($_.Exception.Message)" 'ERROR'
+    exit 1
+}
 
 if (-not $Force) {
     Write-Log '正在检测网络连通性...'

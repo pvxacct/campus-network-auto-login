@@ -48,6 +48,11 @@ if ($null -eq $cred) {
     exit 1
 }
 
+if ($cred.Password.Length -eq 0) {
+    Write-Error '密码不能为空，已取消。'
+    exit 1
+}
+
 $cred | Export-Clixml -LiteralPath $Path -Force
 
 Write-Host ''
