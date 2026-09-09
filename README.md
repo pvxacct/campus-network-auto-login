@@ -39,11 +39,23 @@ flowchart TD
 ### 1. 下载
 
 ```powershell
-git clone https://github.com/<your-name>/campus-network-auto-login.git
+git clone https://github.com/pvxacct/campus-network-auto-login.git
 cd campus-network-auto-login
 ```
 
 或者直接点击 GitHub 页面右上角的 **Code → Download ZIP**，解压后进入目录。
+
+> 如果本机 Git 报 `schannel: SEC_E_NO_CREDENTIALS`，可以改用 OpenSSL 后端：
+>
+> ```powershell
+> git -c http.sslBackend=openssl -c http.sslVerify=false clone https://github.com/pvxacct/campus-network-auto-login.git
+> ```
+>
+> 或者使用 SSH：
+>
+> ```powershell
+> git clone git@github.com:pvxacct/campus-network-auto-login.git
+> ```
 
 ### 2. 修改 Portal 地址
 
