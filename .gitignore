@@ -3,6 +3,12 @@ credential.xml
 *.log
 *.log.old
 
+# SSH 私钥，绝不能提交
+id_ed25519
+id_ed25519.pub
+*.pem
+*.ppk
+
 # 临时文件
 work/
 tmp/
