@@ -1,0 +1,20 @@
+# 凭据与日志，绝不能提交
+credential.xml
+*.log
+*.log.old
+
+# 临时文件
+work/
+tmp/
+*.tmp
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# VS Code / Visual Studio
+.vs/
+.vscode/
+
+# PowerShell
+*.ps1xml

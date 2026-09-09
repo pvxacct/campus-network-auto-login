@@ -1,0 +1,31 @@
+{
+  "CredentialPath": "",
+  "TimeoutSec": 10,
+  "VerifyDelaySec": 2,
+
+  "CheckUrls": [
+    { "Url": "http://www.msftconnecttest.com/connecttest.txt", "Expect": "Microsoft Connect Test" },
+    { "Url": "http://connectivitycheck.gstatic.com/generate_204", "Expect": "" }
+  ],
+
+  "PortalPageUrl": "",
+  "LoginUrl": "http://10.0.0.1/login",
+  "Method": "POST",
+  "ContentType": "application/x-www-form-urlencoded",
+
+  "UsernameField": "username",
+  "PasswordField": "password",
+  "PasswordTransform": "plain",
+  "PasswordSaltPrefix": "",
+  "PasswordSaltSuffix": "",
+
+  "StaticFields": {
+    "domain": "default"
+  },
+
+  "Headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+  },
+
+  "SuccessKeyword": ""
+}
