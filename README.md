@@ -197,6 +197,7 @@ Unregister-ScheduledTask -TaskName CampusAutoLogin -Confirm:$false
 ├── Uninstall-CampusAutoLoginTask.ps1   # 卸载计划任务
 ├── Diagnose-CampusAutoLogin.ps1        # 生成诊断报告
 ├── drcom-config.json                   # Portal 配置
+├── CHANGELOG.md                        # 更新日志
 ├── docs/
 │   ├── DRCOM-PROTOCOL.md               # 抓包与协议说明
 │   └── TROUBLESHOOTING.md              # 常见问题
@@ -309,6 +310,10 @@ powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1 -Scri
 - Windows 10 / Windows 11
 - Windows PowerShell 5.1 及以上（不需要 PowerShell 7）
 - 脚本文件使用 UTF-8 with BOM 保存，确保 Windows PowerShell 5.1 正确解析中文
+
+## 更新日志
+
+各版本的改动记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本：**1.1.0**（2026-09-12）。
 
 ## License
 
