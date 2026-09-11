@@ -1,0 +1,55 @@
+# 用 GitHub 自带的 GITHUB_TOKEN 为最新的 v* 标签创建 Pre-release。
+# 触发方式：
+#   1) 这个文件本身被修改并推送到 main 时自动运行一次；
+#   2) 在 Actions 页面点 “Run workflow” 手动运行（可指定标签）。
+# 说明：GITHUB_TOKEN 由 GitHub 自动提供，不需要你配置任何密钥。
+name: Create GitHub Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/create-release.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的标签，例如 v1.1.0；留空则使用最新的 v* 标签'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create pre-release for the newest tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag="$(git describe --tags --abbrev=0)"
+          fi
+          echo "tag=$tag"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag 已经存在，跳过。"
+            exit 0
+          fi
+          ver="${tag#v}"
+          notes=(--generate-notes)
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="$ver" '$0 ~ "^## \\[" v "\\]" {f=1; next} f && /^## \[/ {f=0} f {print}' CHANGELOG.md > /tmp/notes.md || true
+            if [ -s /tmp/notes.md ]; then
+              notes=(--notes-file /tmp/notes.md)
+            fi
+          fi
+          gh release create "$tag" --title "校园网自动登录 $tag（Pre-release）" --prerelease --verify-tag "${notes[@]}"
