@@ -82,4 +82,4 @@ jobs:
           fi
 
           gh release upload "$tag" "$zip" --clobber
-          gh release view "$tag" --json tagName,name,isPrerelease,isLatest,assets
+          gh release view "$tag" --json tagName,name,isPrerelease,url,assets
