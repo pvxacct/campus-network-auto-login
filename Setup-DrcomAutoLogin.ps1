@@ -18,7 +18,7 @@
     已经保存过凭据时，强制重新输入并覆盖。
 
 .PARAMETER IntervalSeconds
-    检查间隔（秒），默认 30。
+    检查间隔（秒）。不指定时读取 drcom-config.json 的 CheckIntervalSeconds，缺省 30 秒。
 
 .PARAMETER VerifySeconds
     安装后的自检观察时长（秒），默认 80；设为 0 跳过自检。
@@ -37,7 +37,7 @@
 param(
     [string]$UserName = '',
     [string]$TaskName = 'CampusAutoLogin',
-    [int]$IntervalSeconds = 30,
+    [int]$IntervalSeconds = 0,
     [int]$VerifySeconds = 80,
     [switch]$Reconfigure,
     [switch]$NoElevate
@@ -102,7 +102,27 @@ Write-Host ''
 Write-Host '========================================' -ForegroundColor Cyan
 Write-Host '  校园网自动登录一键安装（Dr.COM）' -ForegroundColor Cyan
 Write-Host '========================================' -ForegroundColor Cyan
-Write-Host ("  检查间隔：每 {0} 秒" -f $IntervalSeconds)
+
+# 间隔先看命令行参数，再看配置文件，最后用 30 秒兜底（实际生效值由安装脚本打印）
+$intervalDisplay = $IntervalSeconds
+if ($intervalDisplay -le 0) {
+    $intervalDisplay = 30
+    $configFile = Join-Path $root 'drcom-config.json'
+    if (Test-Path -LiteralPath $configFile) {
+        try {
+            $configJson = Get-Content -LiteralPath $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($configJson.CheckIntervalSeconds) {
+                $intervalDisplay = [int]$configJson.CheckIntervalSeconds
+            } elseif ($configJson.CheckIntervalMinutes) {
+                $intervalDisplay = [int]$configJson.CheckIntervalMinutes * 60
+            }
+        } catch {
+            Write-Warning "读取 drcom-config.json 失败，使用默认间隔 30 秒：$($_.Exception.Message)"
+        }
+    }
+}
+
+Write-Host ("  检查间隔：每 {0} 秒" -f $intervalDisplay)
 Write-Host ("  数据目录：{0}" -f $dataDir)
 Write-Host ''
 

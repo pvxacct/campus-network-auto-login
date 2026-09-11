@@ -148,13 +148,15 @@ function New-CampusTaskXml {
         [Parameter(Mandatory = $true)][int]$IntervalSeconds,
         [Parameter(Mandatory = $true)][string]$ActionKind,
         [bool]$UseDualTrigger = $false,
+        [string]$IndefiniteDuration = 'P10675199DT2H48M5.4775807S',
         [string]$LauncherPath = '',
         [string]$PowerShellPath = '',
         [string]$TargetScriptPath = ''
     )
 
-    # Task Scheduler 用它自己的方式表示“无限期”：TimeSpan.MaxValue 对应的 ISO8601 时长
-    $indefinite = 'P10675199DT2H48M5.4775807S'
+    # “无限期”的表示方式：默认用 Task Scheduler 自己导出的 TimeSpan.MaxValue 形式，
+    # 个别系统不接受时上层会改用 PT0S 再试一次。
+    $indefinite = $IndefiniteDuration
 
     $start = (Get-Date).AddMinutes(1)
     if (($IntervalSeconds % 86400) -eq 0) {
@@ -280,11 +282,12 @@ function Get-CampusRunCount {
 function Install-CampusTaskNow {
     param(
         [Parameter(Mandatory = $true)][string]$ActionKind,
-        [Parameter(Mandatory = $true)][bool]$UseDualTrigger
+        [Parameter(Mandatory = $true)][bool]$UseDualTrigger,
+        [string]$IndefiniteDuration = 'P10675199DT2H48M5.4775807S'
     )
 
     $xml = New-CampusTaskXml -UserId $userId -WorkingDirectory $workingDirectory -IntervalSeconds $IntervalSeconds `
-        -ActionKind $ActionKind -UseDualTrigger $UseDualTrigger `
+        -ActionKind $ActionKind -UseDualTrigger $UseDualTrigger -IndefiniteDuration $IndefiniteDuration `
         -LauncherPath $launcherPath -PowerShellPath $powerShellExePath -TargetScriptPath $ScriptPath
 
     Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force -ErrorAction Stop | Out-Null
@@ -324,32 +327,54 @@ $useDualTrigger = $false
 $registered = $false
 $registerError = ''
 
-try {
-    Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $useDualTrigger
-    $registered = $true
-} catch {
-    $registerError = $_.Exception.Message
-    Write-Warning ("注册失败：{0}" -f $registerError)
-}
-
 $effectiveSeconds = 0
-if ($registered) {
-    try { $effectiveSeconds = Get-RegisteredIntervalSeconds -Name $TaskName } catch { $effectiveSeconds = 0 }
 
-    if ($IntervalSeconds -lt 60 -and ($effectiveSeconds -eq 0 -or $effectiveSeconds -gt $IntervalSeconds)) {
-        Write-Host '系统没有接受小于 1 分钟的重复间隔，改用“两条 1 分钟触发器错开 30 秒”。' -ForegroundColor Yellow
-        try {
-            Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $true
-            $useDualTrigger = $true
-            $effectiveSeconds = Get-RegisteredIntervalSeconds -Name $TaskName
-        } catch {
-            Write-Warning ("改用双触发器方案失败：{0}" -f $_.Exception.Message)
+# 按“最理想的写法 → 兼容写法”依次尝试，直到系统真的接受为止：
+#   1) 单触发器 + TimeSpan.MaxValue 形式的无限期（最标准）
+#   2) 两条错开 30 秒的 1 分钟触发器 + 无限期（系统不接受小于 1 分钟间隔时使用）
+#   3) 上面两种再各配一个 PT0S 形式的无限期（个别系统只认这一种写法）
+$attemptList = @(
+    @{ Dual = $false; Duration = 'P10675199DT2H48M5.4775807S' },
+    @{ Dual = $true;  Duration = 'P10675199DT2H48M5.4775807S' },
+    @{ Dual = $false; Duration = 'PT0S' },
+    @{ Dual = $true;  Duration = 'PT0S' }
+)
+
+foreach ($attempt in $attemptList) {
+    if ($attempt.Dual -and $IntervalSeconds -ge 60) { continue }
+
+    $modeName = '单触发器'
+    if ($attempt.Dual) { $modeName = '双触发器' }
+
+    try {
+        Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $attempt.Dual -IndefiniteDuration $attempt.Duration
+    } catch {
+        $registerError = $_.Exception.Message
+        Write-Warning ("注册尝试失败（{0}，无限期写法 {1}）：{2}" -f $modeName, $attempt.Duration, $registerError)
+        continue
+    }
+
+    $readBack = 0
+    try { $readBack = Get-RegisteredIntervalSeconds -Name $TaskName } catch { $readBack = 0 }
+
+    if ($readBack -gt 0 -and $readBack -le $IntervalSeconds) {
+        $registered = $true
+        $useDualTrigger = $attempt.Dual
+        $effectiveSeconds = $readBack
+        if ($attempt.Dual) {
+            Write-Host '系统不接受小于 1 分钟的重复间隔，已改用“两条 1 分钟触发器错开 30 秒”的等价方案。' -ForegroundColor Yellow
         }
+        break
+    }
+
+    if ($readBack -le 0) {
+        Write-Warning '任务已写入，但读不到触发间隔，继续尝试其他写法...'
+    } else {
+        Write-Warning ("任务已写入，但系统把间隔调整成了每 {0} 秒，继续尝试其他写法..." -f $readBack)
     }
 }
 
 if (-not $registered) { throw ("计划任务注册失败：{0}" -f $registerError) }
-if ($effectiveSeconds -le 0) { $effectiveSeconds = $IntervalSeconds }
 
 Write-Host ("计划任务已注册：{0}（实际检查间隔约 {1} 秒）" -f $TaskName, $effectiveSeconds) -ForegroundColor Green
 
