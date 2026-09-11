@@ -155,20 +155,66 @@ Add-Line ''
 
 # ---------- 5. 计划任务 ----------
 Add-Line '【5】计划任务'
+
+function ConvertTo-DurationSeconds {
+    param($Value)
+
+    if ($null -eq $Value) { return 0 }
+    if ($Value -is [TimeSpan]) { return [double]$Value.TotalSeconds }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return 0 }
+
+    $match = [regex]::Match($text, '^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$')
+    if (-not $match.Success) { return 0 }
+
+    $seconds = 0.0
+    if ($match.Groups[1].Success) { $seconds += [double]$match.Groups[1].Value * 86400 }
+    if ($match.Groups[2].Success) { $seconds += [double]$match.Groups[2].Value * 3600 }
+    if ($match.Groups[3].Success) { $seconds += [double]$match.Groups[3].Value * 60 }
+    if ($match.Groups[4].Success) { $seconds += [double]$match.Groups[4].Value }
+    return $seconds
+}
+
 try {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     Add-Line ("  任务名：{0}    状态：{1}" -f $task.TaskName, $task.State)
     $count = 0
     foreach ($trigger in $task.Triggers) {
         $count++
-        $type = $trigger.CimClass.CimClassName
+        $type = '未知触发器'
+        try { $type = $trigger.CimClass.CimClassName } catch { }
+
         $interval = ''
         if ($trigger.Repetition -and $trigger.Repetition.Interval) {
-            $interval = ("，重复间隔 {0} 秒" -f [int]$trigger.Repetition.Interval.TotalSeconds)
+            $seconds = ConvertTo-DurationSeconds $trigger.Repetition.Interval
+            if ($seconds -gt 0) { $interval = ("，重复间隔 {0} 秒" -f [int]$seconds) }
         }
-        Add-Line ("  触发器 {0}：{1}{2}" -f $count, $type, $interval)
+
+        $duration = ''
+        if ($trigger.Repetition -and $trigger.Repetition.Duration) {
+            $durationSeconds = ConvertTo-DurationSeconds $trigger.Repetition.Duration
+            if ($durationSeconds -gt 0 -and $durationSeconds -lt (86400 * 300)) {
+                $duration = ("，只在 {0} 天内重复" -f [int]($durationSeconds / 86400))
+            }
+        }
+
+        Add-Line ("  触发器 {0}：{1}{2}{3}" -f $count, $type, $interval, $duration)
     }
     if ($count -eq 0) { Add-Line '  没有配置任何触发器。' }
+
+    # 有效检查间隔：两条错开的 1 分钟触发器 = 每 30 秒
+    $repeatIntervals = @()
+    foreach ($trigger in $task.Triggers) {
+        if ($trigger.Repetition -and $trigger.Repetition.Interval) {
+            $repeatIntervals += (ConvertTo-DurationSeconds $trigger.Repetition.Interval)
+        }
+    }
+    if ($repeatIntervals.Count -eq 2 -and $repeatIntervals[0] -eq $repeatIntervals[1]) {
+        Add-Line ("  有效检查间隔：约 {0} 秒（两条错开的 1 分钟触发器）" -f [int]($repeatIntervals[0] / 2))
+    } elseif ($repeatIntervals.Count -eq 1) {
+        Add-Line ("  有效检查间隔：约 {0} 秒" -f [int]$repeatIntervals[0])
+    }
 
     foreach ($action in $task.Actions) {
         Add-Line ("  执行：{0} {1}" -f $action.Execute, $action.Arguments)

@@ -25,7 +25,7 @@
     检查间隔（秒）。不指定时读取 drcom-config.json 的 CheckIntervalSeconds，缺省 30 秒。
 
 .PARAMETER VerifySeconds
-    注册后实际观察多少秒来确认任务在跑，默认 80 秒；设为 0 表示跳过自检。
+    注册后实际观察多少秒来确认任务在跑，默认 100 秒；设为 0 表示跳过自检。
 
 .PARAMETER NoElevate
     不自动请求管理员权限（脚本内部递归调用时使用）。
@@ -43,7 +43,7 @@ param(
     [string]$DataDir = '',
     [string]$TaskName = 'CampusAutoLogin',
     [int]$IntervalSeconds = 0,
-    [int]$VerifySeconds = 80,
+    [int]$VerifySeconds = 100,
     [switch]$NoElevate
 )
 
@@ -141,6 +141,24 @@ $vbsLines = @(
 [System.IO.File]::WriteAllText($launcherPath, (($vbsLines -join "`r`n") + "`r`n"), [System.Text.Encoding]::Unicode)
 
 # ===================== 生成任务 XML =====================
+function New-CampusTimeTrigger {
+    param(
+        [Parameter(Mandatory = $true)][string]$StartBoundary,
+        [Parameter(Mandatory = $true)][string]$Interval,
+        [string]$Duration = ''
+    )
+
+    # 注意：Windows 计划任务里“无限期”必须省略 <Duration> 元素。
+    # 写成 PT0S 或 TimeSpan.MaxValue 之类的值都会被拒绝
+    # （The task XML contains a value which is incorrectly formatted or out of range）。
+    $repetition = '<Interval>{0}</Interval>' -f $Interval
+    if (-not [string]::IsNullOrWhiteSpace($Duration)) {
+        $repetition += '<Duration>{0}</Duration><StopAtDurationEnd>false</StopAtDurationEnd>' -f $Duration
+    }
+
+    return ('<TimeTrigger><StartBoundary>{0}</StartBoundary><Enabled>true</Enabled><Repetition>{1}</Repetition></TimeTrigger>' -f $StartBoundary, $repetition)
+}
+
 function New-CampusTaskXml {
     param(
         [Parameter(Mandatory = $true)][string]$UserId,
@@ -148,17 +166,13 @@ function New-CampusTaskXml {
         [Parameter(Mandatory = $true)][int]$IntervalSeconds,
         [Parameter(Mandatory = $true)][string]$ActionKind,
         [bool]$UseDualTrigger = $false,
-        [string]$IndefiniteDuration = 'P10675199DT2H48M5.4775807S',
+        [string]$IndefiniteDuration = '',
         [string]$LauncherPath = '',
         [string]$PowerShellPath = '',
         [string]$TargetScriptPath = ''
     )
 
-    # “无限期”的表示方式：默认用 Task Scheduler 自己导出的 TimeSpan.MaxValue 形式，
-    # 个别系统不接受时上层会改用 PT0S 再试一次。
-    $indefinite = $IndefiniteDuration
-
-    $start = (Get-Date).AddMinutes(1)
+    $start = (Get-Date).AddSeconds(5)
     if (($IntervalSeconds % 86400) -eq 0) {
         $singleInterval = 'P{0}D' -f [int]($IntervalSeconds / 86400)
     } elseif (($IntervalSeconds % 3600) -eq 0) {
@@ -173,9 +187,10 @@ function New-CampusTaskXml {
         # 两条 1 分钟触发器错开 30 秒：等价于每 30 秒检查一次
         $triggerA = $start.ToString('yyyy-MM-ddTHH:mm:ss')
         $triggerB = $start.AddSeconds(30).ToString('yyyy-MM-ddTHH:mm:ss')
-        $timeTriggers = "<TimeTrigger><StartBoundary>$triggerA</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1M</Interval><Duration>$indefinite</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger><TimeTrigger><StartBoundary>$triggerB</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1M</Interval><Duration>$indefinite</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>"
+        $timeTriggers = (New-CampusTimeTrigger -StartBoundary $triggerA -Interval 'PT1M' -Duration $IndefiniteDuration) +
+                        (New-CampusTimeTrigger -StartBoundary $triggerB -Interval 'PT1M' -Duration $IndefiniteDuration)
     } else {
-        $timeTriggers = "<TimeTrigger><StartBoundary>$($start.ToString('yyyy-MM-ddTHH:mm:ss'))</StartBoundary><Enabled>true</Enabled><Repetition><Interval>$singleInterval</Interval><Duration>$indefinite</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>"
+        $timeTriggers = New-CampusTimeTrigger -StartBoundary $start.ToString('yyyy-MM-ddTHH:mm:ss') -Interval $singleInterval -Duration $IndefiniteDuration
     }
 
     if ($ActionKind -eq 'direct') {
@@ -247,19 +262,61 @@ function New-CampusTaskXml {
     return ($lines -join "`r`n")
 }
 
-function Get-RegisteredIntervalSeconds {
+function ConvertTo-DurationSeconds {
+    # 计划任务里的时长可能是 TimeSpan，也可能是 'PT1M'/'P1D' 这类字符串，两种都要能处理
+    param($Value)
+
+    if ($null -eq $Value) { return 0 }
+    if ($Value -is [TimeSpan]) { return [double]$Value.TotalSeconds }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return 0 }
+
+    $match = [regex]::Match($text, '^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$')
+    if (-not $match.Success) { return 0 }
+
+    $seconds = 0.0
+    if ($match.Groups[1].Success) { $seconds += [double]$match.Groups[1].Value * 86400 }
+    if ($match.Groups[2].Success) { $seconds += [double]$match.Groups[2].Value * 3600 }
+    if ($match.Groups[3].Success) { $seconds += [double]$match.Groups[3].Value * 60 }
+    if ($match.Groups[4].Success) { $seconds += [double]$match.Groups[4].Value }
+    return $seconds
+}
+
+function Get-RegisteredTriggerInfo {
     param([Parameter(Mandatory = $true)][string]$Name)
 
     $task = Get-ScheduledTask -TaskName $Name -ErrorAction Stop
     $intervals = @()
+    $durations = @()
+
     foreach ($trigger in $task.Triggers) {
         if ($trigger.Repetition -and $trigger.Repetition.Interval) {
-            $intervals += [double]$trigger.Repetition.Interval.TotalSeconds
+            $intervals += (ConvertTo-DurationSeconds $trigger.Repetition.Interval)
+            if ($trigger.Repetition.Duration) {
+                $durations += (ConvertTo-DurationSeconds $trigger.Repetition.Duration)
+            }
         }
     }
-    if ($intervals.Count -eq 0) { return 0 }
-    if ($intervals.Count -ge 2) { return [int]($intervals[0] / 2) }
-    return [int]$intervals[0]
+
+    $intervalSeconds = 0
+    if ($intervals.Count -ge 2) {
+        # 双触发器方案：两条错开的 1 分钟触发器，实际间隔是它们的一半
+        $intervalSeconds = [int]($intervals[0] / 2)
+    } elseif ($intervals.Count -eq 1) {
+        $intervalSeconds = [int]$intervals[0]
+    }
+
+    $durationSeconds = 0
+    if ($durations.Count -gt 0) {
+        $durationSeconds = [int](($durations | Measure-Object -Minimum).Minimum)
+    }
+
+    return [pscustomobject]@{
+        IntervalSeconds = $intervalSeconds
+        DurationSeconds = $durationSeconds
+        RepeatTriggerCount = $intervals.Count
+    }
 }
 
 # ===================== 注册任务 =====================
@@ -283,7 +340,7 @@ function Install-CampusTaskNow {
     param(
         [Parameter(Mandatory = $true)][string]$ActionKind,
         [Parameter(Mandatory = $true)][bool]$UseDualTrigger,
-        [string]$IndefiniteDuration = 'P10675199DT2H48M5.4775807S'
+        [string]$IndefiniteDuration = ''
     )
 
     $xml = New-CampusTaskXml -UserId $userId -WorkingDirectory $workingDirectory -IntervalSeconds $IntervalSeconds `
@@ -293,23 +350,27 @@ function Install-CampusTaskNow {
     Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force -ErrorAction Stop | Out-Null
 }
 
-function Measure-CampusRuns {
+function Measure-CampusAutoRuns {
     param([Parameter(Mandatory = $true)][int]$Seconds)
 
-    $before = Get-CampusRunCount
     try {
         Start-ScheduledTask -TaskName $TaskName
     } catch {
         Write-Warning ("手动启动任务失败：{0}" -f $_.Exception.Message)
     }
 
-    $deadline = (Get-Date).AddSeconds($Seconds)
+    # 先手动跑一次并预热几秒，之后统计到的才是“计划任务自己触发的次数”
+    $warmupSeconds = 8
+    Start-Sleep -Seconds $warmupSeconds
+    $baseline = Get-CampusRunCount
+
+    $deadline = (Get-Date).AddSeconds([Math]::Max(5, $Seconds - $warmupSeconds))
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 5
-        Write-Host ("  已自动运行 {0} 次" -f ((Get-CampusRunCount) - $before))
+        Write-Host ("  计划任务已自动触发 {0} 次" -f ((Get-CampusRunCount) - $baseline))
     }
 
-    return [int]((Get-CampusRunCount) - $before)
+    return [int]((Get-CampusRunCount) - $baseline)
 }
 
 Write-Host ''
@@ -329,80 +390,110 @@ $registerError = ''
 
 $effectiveSeconds = 0
 
-# 按“最理想的写法 → 兼容写法”依次尝试，直到系统真的接受为止：
-#   1) 单触发器 + TimeSpan.MaxValue 形式的无限期（最标准）
-#   2) 两条错开 30 秒的 1 分钟触发器 + 无限期（系统不接受小于 1 分钟间隔时使用）
-#   3) 上面两种再各配一个 PT0S 形式的无限期（个别系统只认这一种写法）
-$attemptList = @(
-    @{ Dual = $false; Duration = 'P10675199DT2H48M5.4775807S' },
-    @{ Dual = $true;  Duration = 'P10675199DT2H48M5.4775807S' },
-    @{ Dual = $false; Duration = 'PT0S' },
-    @{ Dual = $true;  Duration = 'PT0S' }
-)
+$effectiveDurationSeconds = 0
+
+# 依次尝试“最理想 → 最兼容”的写法，直到系统真的接受为止。
+# 已知 Windows 的两条硬约束（实测报错会写明 out of range）：
+#   1) 重复间隔最小 1 分钟，PT30S 会被拒绝；
+#   2) “无限期”必须省略 Duration 元素，写 PT0S 或超大值都会被拒绝。
+$attemptList = @()
+if ($IntervalSeconds -lt 60) {
+    # 每 30 秒 = 两条错开的 1 分钟触发器
+    $attemptList += @{ Dual = $true;  Duration = '';     Name = '两条 1 分钟触发器错开 30 秒（无限期）' }
+    $attemptList += @{ Dual = $true;  Duration = 'P30D'; Name = '两条 1 分钟触发器错开 30 秒（30 天）' }
+    $attemptList += @{ Dual = $false; Duration = '';     Name = '单触发器每 1 分钟（降级方案）' }
+} else {
+    $attemptList += @{ Dual = $false; Duration = '';     Name = '单触发器（无限期）' }
+    $attemptList += @{ Dual = $false; Duration = 'P30D'; Name = '单触发器（30 天）' }
+}
+
+$degradedResult = $null
+$activeDuration = ''
 
 foreach ($attempt in $attemptList) {
-    if ($attempt.Dual -and $IntervalSeconds -ge 60) { continue }
-
-    $modeName = '单触发器'
-    if ($attempt.Dual) { $modeName = '双触发器' }
-
     try {
         Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $attempt.Dual -IndefiniteDuration $attempt.Duration
     } catch {
         $registerError = $_.Exception.Message
-        Write-Warning ("注册尝试失败（{0}，无限期写法 {1}）：{2}" -f $modeName, $attempt.Duration, $registerError)
+        Write-Warning ("注册尝试失败（{0}）：{1}" -f $attempt.Name, $registerError)
         continue
     }
 
-    $readBack = 0
-    try { $readBack = Get-RegisteredIntervalSeconds -Name $TaskName } catch { $readBack = 0 }
+    $info = $null
+    try { $info = Get-RegisteredTriggerInfo -Name $TaskName } catch { $info = $null }
 
-    if ($readBack -gt 0 -and $readBack -le $IntervalSeconds) {
-        $registered = $true
-        $useDualTrigger = $attempt.Dual
-        $effectiveSeconds = $readBack
-        if ($attempt.Dual) {
-            Write-Host '系统不接受小于 1 分钟的重复间隔，已改用“两条 1 分钟触发器错开 30 秒”的等价方案。' -ForegroundColor Yellow
+    if ($info -and $info.IntervalSeconds -gt 0) {
+        if ($info.IntervalSeconds -le $IntervalSeconds) {
+            $registered = $true
+            $useDualTrigger = $attempt.Dual
+            $effectiveSeconds = $info.IntervalSeconds
+            $effectiveDurationSeconds = $info.DurationSeconds
+            $activeDuration = $attempt.Duration
+            if ($attempt.Dual -and $IntervalSeconds -lt 60) {
+                Write-Host 'Windows 不接受小于 1 分钟的重复间隔，已改用“两条 1 分钟触发器错开 30 秒”的等价方案。' -ForegroundColor Yellow
+            }
+            break
         }
-        break
+
+        # 能跑起来、但比要求慢（例如退化成 1 分钟一次）：先记下来当兜底
+        if ($null -eq $degradedResult) {
+            $degradedResult = @{ Dual = $attempt.Dual; Seconds = $info.IntervalSeconds; Duration = $info.DurationSeconds; DurationText = $attempt.Duration }
+        }
+        Write-Warning ("任务已写入，但系统把间隔调整成了每 {0} 秒，继续尝试其他写法..." -f $info.IntervalSeconds)
+        continue
     }
 
-    if ($readBack -le 0) {
-        Write-Warning '任务已写入，但读不到触发间隔，继续尝试其他写法...'
-    } else {
-        Write-Warning ("任务已写入，但系统把间隔调整成了每 {0} 秒，继续尝试其他写法..." -f $readBack)
-    }
+    Write-Warning '任务已写入，但读不到触发间隔，继续尝试其他写法...'
+}
+
+if (-not $registered -and $null -ne $degradedResult) {
+    $registered = $true
+    $useDualTrigger = $degradedResult.Dual
+    $effectiveSeconds = $degradedResult.Seconds
+    $effectiveDurationSeconds = $degradedResult.Duration
+    $activeDuration = $degradedResult.DurationText
+    Write-Warning ("只能退而求其次：任务会每 {0} 秒检查一次。" -f $effectiveSeconds)
 }
 
 if (-not $registered) { throw ("计划任务注册失败：{0}" -f $registerError) }
 
 Write-Host ("计划任务已注册：{0}（实际检查间隔约 {1} 秒）" -f $TaskName, $effectiveSeconds) -ForegroundColor Green
 
+if ($effectiveDurationSeconds -gt 0 -and $effectiveDurationSeconds -lt (86400 * 300)) {
+    $days = [int]($effectiveDurationSeconds / 86400)
+    Write-Host ("注意：系统要求必须指定重复持续时间，当前是 {0} 天，到期后请重新运行一次安装脚本。" -f $days) -ForegroundColor Yellow
+}
+
 $observedRuns = -1
 if ($VerifySeconds -gt 0) {
     Write-Host ''
     Write-Host ("正在启动任务并观察 {0} 秒，确认它会自己跑起来..." -f $VerifySeconds) -ForegroundColor Cyan
-    $observedRuns = Measure-CampusRuns -Seconds $VerifySeconds
+
+    # 期望的自动触发次数（减去预热的那一次运行）
+    $expectedAutoRuns = [Math]::Floor([Math]::Max(5, $VerifySeconds - 8) / $effectiveSeconds)
+    $minAutoRuns = [Math]::Max(1, $expectedAutoRuns - 1)
+
+    $observedRuns = Measure-CampusAutoRuns -Seconds $VerifySeconds
 
     # 万一系统禁用了 Windows 脚本宿主，就换成直接调用 powershell.exe
-    if ($observedRuns -lt 2 -and $actionKind -eq 'vbs') {
+    if ($observedRuns -lt $minAutoRuns -and $actionKind -eq 'vbs') {
         Write-Host ''
         Write-Host '没有观察到预期的运行次数，可能系统禁用了 Windows 脚本宿主（wscript）。' -ForegroundColor Yellow
         Write-Host '正在改用“直接调用 powershell.exe”的方案重新注册，并再次自检...' -ForegroundColor Yellow
         try {
             $actionKind = 'direct'
-            Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $useDualTrigger
-            $observedRuns = Measure-CampusRuns -Seconds $VerifySeconds
+            Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $useDualTrigger -IndefiniteDuration $activeDuration
+            $observedRuns = Measure-CampusAutoRuns -Seconds $VerifySeconds
         } catch {
             Write-Warning ("改用直接调用方案失败：{0}" -f $_.Exception.Message)
         }
     }
 
     Write-Host ''
-    if ($observedRuns -ge 2) {
-        Write-Host ("自检通过：{0} 秒内脚本被自动执行了 {1} 次（运行方式：{2}），任务已正常工作。" -f $VerifySeconds, $observedRuns, $actionKind) -ForegroundColor Green
+    if ($observedRuns -ge $minAutoRuns) {
+        Write-Host ("自检通过：{0} 秒内计划任务自动触发了 {1} 次（检查间隔约 {2} 秒，运行方式：{3}）。" -f $VerifySeconds, $observedRuns, $effectiveSeconds, $actionKind) -ForegroundColor Green
     } else {
-        Write-Host ("自检没有通过：{0} 秒内只自动执行了 {1} 次。" -f $VerifySeconds, $observedRuns) -ForegroundColor Red
+        Write-Host ("自检没有通过：{0} 秒内只自动触发了 {1} 次（预期至少 {2} 次）。" -f $VerifySeconds, $observedRuns, $minAutoRuns) -ForegroundColor Red
         Write-Host '请运行 Diagnose-CampusAutoLogin.ps1 生成诊断报告；常见原因是安全软件拦截，或计划任务服务被禁用。' -ForegroundColor Yellow
     }
 }

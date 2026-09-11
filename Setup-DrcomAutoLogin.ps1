@@ -21,7 +21,7 @@
     检查间隔（秒）。不指定时读取 drcom-config.json 的 CheckIntervalSeconds，缺省 30 秒。
 
 .PARAMETER VerifySeconds
-    安装后的自检观察时长（秒），默认 80；设为 0 跳过自检。
+    安装后的自检观察时长（秒），默认 100；设为 0 跳过自检。
 
 .PARAMETER NoElevate
     不自动申请管理员权限（脚本内部递归调用时使用）。
@@ -38,7 +38,7 @@ param(
     [string]$UserName = '',
     [string]$TaskName = 'CampusAutoLogin',
     [int]$IntervalSeconds = 0,
-    [int]$VerifySeconds = 80,
+    [int]$VerifySeconds = 100,
     [switch]$Reconfigure,
     [switch]$NoElevate
 )

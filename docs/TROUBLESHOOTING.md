@@ -33,7 +33,7 @@ Get-ScheduledTask -TaskName CampusAutoLogin | Select-Object -ExpandProperty Trig
 Get-ScheduledTaskInfo -TaskName CampusAutoLogin
 ```
 
-正常情况下应当看到 `LogonTrigger`、`TimeTrigger`（重复间隔 30 秒）、`EventTrigger` 三种触发器。
+正常情况下应当看到 `LogonTrigger`、两条 `TimeTrigger`（各 1 分钟、错开 30 秒）、`EventTrigger` 三种触发器（共 4 条）。
 
 3. 手动运行一次：
 
@@ -58,6 +58,35 @@ Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\login.log" -Tail 100
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1
 ```
+
+## 安装时提示 “The task XML contains a value which is incorrectly formatted or out of range”
+
+这是 Windows 任务计划管理器对触发器的硬性限制，和账号密码、Portal 地址都没有关系：
+
+| 报错片段 | 原因 | 正确写法 |
+| --- | --- | --- |
+| `(14,121):Interval:PT30S` | 重复间隔最小是 **1 分钟** | 写 `PT1M` |
+| `(14,145):Duration:PT0S` | 表示“无限期重复”时必须**不写** `<Duration>` 元素 | 省略该元素 |
+| `Duration:P10675199DT2H48M5.4775807S` | `TimeSpan.MaxValue` 这类超大值超出允许范围 | 省略该元素 |
+
+1.0.0 之前的安装脚本正好踩中了这三条，所以会一路失败。新版 `Install-CampusAutoLoginTask.ps1` 已经按上面的规则生成 XML：
+30 秒检查改用 **两条各 1 分钟、彼此错开 30 秒的触发器** 实现，“无限期”则直接省略 `<Duration>`。
+
+如果你看到这个报错，说明本机脚本还是旧版本，拉取最新代码后重新安装即可：
+
+```powershell
+git pull
+```
+
+然后重新运行 `一键安装.cmd`（或 `Setup-DrcomAutoLogin.ps1`）。
+
+安装结束时留意最后几行输出：
+
+- `计划任务已注册：CampusAutoLogin（实际检查间隔约 30 秒）` —— 正常；
+- `只能退而求其次：任务会每 60 秒检查一次` —— 你的系统连双触发器都不支持，功能正常，只是慢一点；
+- `注意：系统要求必须指定重复持续时间，当前是 30 天` —— 任务会在 30 天后停止重复，请在到期前重新运行一次安装脚本。
+
+想确认实际生效的间隔，可以运行 `Diagnose-CampusAutoLogin.ps1`，报告里会打印每条触发器的重复间隔和“有效检查间隔”。
 
 ## 每 30 秒会不会太频繁、会不会弹黑窗口
 
