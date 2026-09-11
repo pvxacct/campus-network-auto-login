@@ -43,7 +43,7 @@ jobs:
           if [ -z "$tag" ]; then tag="$(git describe --tags --abbrev=0)"; fi
           mkdir -p dist
           zip="dist/campus-network-auto-login-$tag.zip"
-          git archive --format=zip --prefix="campus-network-auto-login-$tag/" -o "$zip" "$tag" -- . ':(exclude).github'
+          git -c core.autocrlf=true archive --format=zip --prefix="campus-network-auto-login-$tag/" -o "$zip" "$tag" -- . ':(exclude).github'
           ls -l dist
           sha256sum "$zip"
 
