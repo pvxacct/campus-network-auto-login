@@ -1,6 +1,72 @@
 # 常见问题排查
 
-## 脚本无法运行
+## 脚本好像没有正常运行（没有任何反应）
+
+先跑一次诊断脚本，它会把你机器上的真实情况全部打印出来，并保存成报告文件：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Diagnose-CampusAutoLogin.ps1
+```
+
+报告保存在 `%LOCALAPPDATA%\CampusAutoLogin\diagnose-<时间>.txt`，重点看这几行：
+
+| 报告内容 | 含义与处理 |
+| --- | --- |
+| `【4】运行状态与日志` 里没有 `state.json` | 脚本一次都没被执行过，问题在计划任务（见下一节） |
+| `【3】凭据文件` 显示“没有找到凭据文件” | 还没保存过账号密码，运行 `Setup-DrcomAutoLogin.ps1` |
+| `【3】凭据文件` 显示“解密失败” | 凭据是在别的 Windows 用户下保存的，需要重新保存 |
+| `【2】Portal 连通性` 显示“访问 Portal 失败” | 当前没连上校园网，这是正常现象，连上后脚本会自动登录 |
+| `【6】隐藏启动器` 提示 `wscript` 被禁用 | 用重新注册命令切到直接调用 PowerShell 的方式 |
+
+## 计划任务没有执行
+
+1. 确认任务存在：
+
+```powershell
+Get-ScheduledTask -TaskName CampusAutoLogin
+```
+
+2. 查看触发间隔和上一次运行结果：
+
+```powershell
+Get-ScheduledTask -TaskName CampusAutoLogin | Select-Object -ExpandProperty Triggers
+Get-ScheduledTaskInfo -TaskName CampusAutoLogin
+```
+
+正常情况下应当看到 `LogonTrigger`、`TimeTrigger`（重复间隔 30 秒）、`EventTrigger` 三种触发器。
+
+3. 手动运行一次：
+
+```powershell
+Start-ScheduledTask -TaskName CampusAutoLogin
+```
+
+4. 观察是否真的被反复触发：`state.json` 里的 `RunCount` 会不断变大。
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\state.json"
+Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\login.log" -Tail 100
+```
+
+5. 如果任务存在但从不运行：
+
+   - 检查任务是不是被“已禁用”（任务计划程序里看状态）；
+   - 检查安全软件是否拦截了 `wscript.exe` 或 `powershell.exe`；
+   - 检查“任务计划程序”服务是否被禁用：`Get-Service Schedule`；
+   - 重新注册一次（会自动切换运行方式并自检）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1
+```
+
+## 每 30 秒会不会太频繁、会不会弹黑窗口
+
+- 默认每 30 秒只发一次“查询在线状态”的请求，很轻量，不会触发限流（限流只针对登录请求）；
+- 任务通过自动生成的 `run-hidden.vbs` 静默启动 PowerShell，运行时不会出现黑色命令行窗口；
+- 如果系统禁用了 Windows 脚本宿主，安装脚本会在自检失败后自动改为直接调用 `powershell.exe -WindowStyle Hidden`；
+- 不想这么频繁的话，把 `drcom-config.json` 里的 `CheckIntervalSeconds` 改成 `60` 或更大，然后重新运行安装脚本即可。
+
+## 脚本无法运行（提示禁止运行脚本）
 
 报错：`无法加载文件，因为在此系统上禁止运行脚本`
 
@@ -45,7 +111,7 @@ Invoke-WebRequest 'http://10.66.209.2/drcom/chkstatus?callback=dr1&v=1&lang=zh&j
 2. 用一个明显错误的密码做对照测试；
 3. 如果错误密码也返回 `userid error2`，说明是“已在线”而不是密码错误。
 
-脚本正常模式不会在已在线时重复登录，所以不影响使用。
+脚本正常模式不会在已在线时重复登录；即使遇到这个错误码，也会先复检状态，确认在线就按成功处理。
 
 ## `error5 waitsec <3`
 
@@ -59,9 +125,13 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -Relogin
 
 通常是请求过于频繁或参数异常：
 
-- 降低检查频率；
-- 等待 30 秒后重试；
+- 调大 `CheckIntervalSeconds`；
+- 脚本已经识别限流并会自动等待后重试；
 - 检查 `drcom-config.json` 中的字段是否完整。
+
+## 登录一直失败会不会反复撞 Portal
+
+不会。脚本会统计连续失败次数，连续失败 3 次后进入冷却（2 分钟起，最多 30 分钟），冷却期间只查询状态、不再提交登录请求。
 
 ## 凭据无法解密
 
@@ -76,32 +146,6 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -Relogin
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Save-DrcomCredential.ps1
-```
-
-## 计划任务没有执行
-
-1. 确认任务存在：
-
-```powershell
-Get-ScheduledTask -TaskName CampusAutoLogin
-```
-
-2. 查看上次运行结果：
-
-```powershell
-Get-ScheduledTask -TaskName CampusAutoLogin | Get-ScheduledTaskInfo
-```
-
-3. 手动运行一次：
-
-```powershell
-Start-ScheduledTask -TaskName CampusAutoLogin
-```
-
-4. 查看日志：
-
-```powershell
-Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\login.log" -Tail 100
 ```
 
 ## 账号一直显示在线
@@ -140,4 +184,5 @@ Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\login.log" -Tail 100
 powershell -ExecutionPolicy Bypass -File .\Uninstall-CampusAutoLoginTask.ps1 -RemoveData
 ```
 
-`-RemoveData` 会同时删除 `credential.xml` 和日志目录。
+不加 `-RemoveData` 时只删除计划任务和隐藏启动器，凭据、日志、状态文件会保留。
+

@@ -1,6 +1,6 @@
 # 校园网自动登录（Dr.COM / 哆点）
 
-Windows 下的校园网 Portal 自动登录工具。检测到掉线后自动重新认证，支持开机自启、定时检查、网络切换触发，账号密码使用 Windows DPAPI 加密保存。
+Windows 下的校园网 Portal 自动登录工具。**每 30 秒**检查一次在线状态，掉线后自动重新认证；支持开机自启、网络切换立即触发、后台静默运行（不会弹黑窗口），账号密码使用 Windows DPAPI 加密保存。
 
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue)](https://learn.microsoft.com/powershell/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6)](https://www.microsoft.com/windows/)
@@ -10,29 +10,34 @@ Windows 下的校园网 Portal 自动登录工具。检测到掉线后自动重�
 
 ## 功能
 
-- **掉线自动重连**：默认每 2 分钟查询一次 Portal 在线状态，掉线后自动提交账号密码。
-- **开机自启**：登录 Windows 后由计划任务自动启动，无需手动运行。
-- **网络变化触发**：切换 Wi-Fi、插拔网线、网络配置文件变化时立即检查。
-- **密码加密**：使用 Windows DPAPI 加密保存，只有当前 Windows 用户能解密。
-- **错误翻译**：调用 Portal 的错误码接口，把 `userid error2` 之类的代码翻译成可读提示。
-- **限流保护**：识别“注销后 3 秒内禁止重登”等限流响应，自动等待后重试。
-- **日志记录**：所有操作写入 `%LOCALAPPDATA%\CampusAutoLogin\login.log`，方便排查。
+- **掉线自动重连**：默认每 30 秒查询一次 Portal 在线状态，掉线后自动提交账号密码；
+- **开机自启**：登录 Windows 后 15 秒自动开始检查，无需手动运行；
+- **网络变化触发**：切换 Wi-Fi、插拔网线、网络配置文件变化时立即检查；
+- **后台静默**：任务通过自动生成的隐藏启动器运行，不会每 30 秒闪一次黑窗口；
+- **密码加密**：使用 Windows DPAPI 加密保存，只有当前 Windows 用户能解密，不入库、不明文落盘；
+- **失败退避**：连续登录失败会自动进入冷却（2 分钟起，最多 30 分钟），不会反复撞 Portal；
+- **防重入**：上一次检查没结束时，新的触发会被跳过，不会叠加执行；
+- **可观测**：每次运行都会写入 `state.json`（运行次数、当前状态、最近结果），一眼就能看出脚本有没有在跑；
+- **错误翻译**：调用 Portal 的错误码接口，把 `userid error2` 之类的代码翻译成可读提示；
+- **一键安装 / 一键诊断**：双击 `一键安装.cmd` 即可完成；出问题跑一次诊断脚本生成报告。
 
 ## 工作原理
 
 ```mermaid
 flowchart TD
-    A[计划任务触发] --> B[GET /drcom/chkstatus]
-    B -- result = 1 --> C[已在线，退出]
-    B -- result = 0 --> D[POST /drcom/login]
-    D --> E{解析返回页}
-    E -- Dr.COMWebLoginID_3.htm --> F[等待 2 秒后复检]
-    E -- Dr.COMWebLoginID_2.htm --> G[解析错误码并写日志]
-    F -- result = 1 --> H[登录成功]
-    F -- result = 0 --> G
+    A[计划任务触发<br/>登录时 / 每 30 秒 / 网络变化] --> B[静默启动器 run-hidden.vbs]
+    B --> C[GET /drcom/chkstatus]
+    C -- result = 1 --> D[已在线，退出]
+    C -- 访问失败 --> E[不尝试登录，等下一次触发]
+    C -- result = 0 --> F[POST /drcom/login]
+    F --> G{解析返回页}
+    G -- Dr.COMWebLoginID_3.htm --> H[等待 2 秒后复检]
+    G -- Dr.COMWebLoginID_2.htm --> I[解析错误码并写日志]
+    H -- result = 1 --> J[登录成功]
+    H -- result = 0 --> I
 ```
 
-> 本项目目前针对 **Dr.COM（哆点）ePortal** 做了适配。其他学校的 Portal 可参考 [`generic/`](generic/) 下的通用版本。
+> 本项目针对 **Dr.COM（哆点）ePortal** 适配。其他学校的 Portal 可参考 [`generic/`](generic/) 下的通用版本。
 
 ## 快速开始
 
@@ -57,7 +62,7 @@ cd campus-network-auto-login
 > git clone git@github.com:pvxacct/campus-network-auto-login.git
 > ```
 
-### 2. 修改 Portal 地址
+### 2. 改 Portal 地址（非本项目学校才需要）
 
 打开 `drcom-config.json`，把 `PortalHost` 改成你学校的 Portal 地址：
 
@@ -66,38 +71,65 @@ cd campus-network-auto-login
   "PortalHost": "10.66.209.2",
   "EportalPort": 801,
   "StatusPath": "/drcom/chkstatus",
-  "LoginPath": "/drcom/login"
+  "LoginPath": "/drcom/login",
+  "CheckIntervalSeconds": 30
 }
 ```
 
-如果你不确定地址和字段，请参考 [`docs/DRCOM-PROTOCOL.md`](docs/DRCOM-PROTOCOL.md)，用浏览器开发者工具抓一次登录请求。
+如果不知道地址和字段，请参考 [`docs/DRCOM-PROTOCOL.md`](docs/DRCOM-PROTOCOL.md)，用浏览器开发者工具抓一次登录请求。
 
 ### 3. 一键安装
 
-按 `Win` 搜索 `PowerShell`，右键 **以管理员身份运行**，然后执行：
+**双击 `一键安装.cmd`**，在弹出的 UAC 窗口点“是”，然后按提示输入一次校园网账号密码。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Setup-DrcomAutoLogin.ps1
+脚本会自动完成：
+
+1. 申请管理员权限（UAC 弹窗一次）；
+2. 提示输入账号密码，用 DPAPI 加密保存到 `%LOCALAPPDATA%\CampusAutoLogin\credential.xml`；
+3. 注册计划任务 `CampusAutoLogin`（登录时启动、每 30 秒检查、网络变化触发）；
+4. **实际观察 80 秒**，确认任务真的被自动执行了（自检）；
+5. 立即检查一次当前在线状态。
+
+自检通过会显示：
+
+```text
+自检通过：80 秒内脚本被自动执行了 3 次（运行方式：vbs），任务已正常工作。
 ```
 
-脚本会依次完成：
+### 4. 确认一切正常（可选）
 
-1. 提示输入校园网账号和密码，用 DPAPI 加密保存到 `credential.xml`；
-2. 注册计划任务 `CampusAutoLogin`；
-3. 立即执行一次状态检查。
+```powershell
+# 只看状态，不做任何登录
+powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -CheckOnly
 
-安装完成后：
+# 看运行状态：RunCount 会随时间不断变大
+Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\state.json"
 
-- 每次登录 Windows 自动启动；
-- 每 2 分钟检查一次，掉线自动重连；
-- 切换 Wi-Fi、插拔网线时也会触发；
-- 日志位于 `%LOCALAPPDATA%\CampusAutoLogin\login.log`。
+# 看日志
+Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\login.log" -Tail 30
+```
+
+## 手动安装（不用一键脚本）
+
+```powershell
+# 1) 保存账号密码（可以在普通权限下运行）
+powershell -ExecutionPolicy Bypass -File .\Save-DrcomCredential.ps1
+
+# 2) 注册计划任务（会自动申请管理员权限）
+powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1
+
+# 3) 立即检查一次
+powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1
+```
 
 ## 手动测试
 
 ```powershell
 # 查询状态，掉线才登录
 powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1
+
+# 只查询状态，不登录
+powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -CheckOnly
 
 # 强制登录一次（不判断是否已在线）
 powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -Force
@@ -106,11 +138,14 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -Force
 powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -Relogin
 ```
 
-查看日志：
+## 出问题了先跑诊断
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\login.log" -Tail 50
+powershell -ExecutionPolicy Bypass -File .\Diagnose-CampusAutoLogin.ps1
 ```
+
+它会检查运行环境、Portal 连通性、凭据、日志、计划任务、隐藏启动器，并把结果保存成
+`%LOCALAPPDATA%\CampusAutoLogin\diagnose-<时间>.txt`。
 
 ## 配置说明
 
@@ -124,55 +159,95 @@ Get-Content "$env:LOCALAPPDATA\CampusAutoLogin\login.log" -Tail 50
 | `LoginPath` | 登录路径，默认 `/drcom/login` |
 | `LogoutPath` | 注销路径，默认 `/drcom/logout` |
 | `ErrorPromptPath` | 错误码翻译接口路径 |
+| `CheckIntervalSeconds` | 计划任务检查间隔，默认 30 秒（改成 60 等数值后重新运行安装脚本） |
 | `StaticFields` | 登录时必须一起提交的固定字段 |
-| `CheckIntervalMinutes` | 计划任务检查间隔，默认 2 分钟 |
 
 ## 计划任务
 
-安装后可在“任务计划程序”中看到 `CampusAutoLogin`，触发条件：
+安装后可在“任务计划程序”中看到 `CampusAutoLogin`：
 
-- 用户登录时；
-- 注册后每 N 分钟（默认 2 分钟）；
-- 网络配置文件变化时（Event ID 10000）。
+| 项目 | 说明 |
+| --- | --- |
+| 触发器 | 登录 Windows 后 15 秒、每 30 秒一次、网络配置文件变化（Event ID 10000） |
+| 运行方式 | 当前用户、普通权限（不需要管理员，不会弹 UAC） |
+| 启动命令 | `wscript.exe //B //Nologo "%LOCALAPPDATA%\CampusAutoLogin\run-hidden.vbs"` |
+| 并发策略 | `IgnoreNew`（上一次没跑完就跳过本次） |
+| 电源策略 | 电池供电时也运行、不因为切换电源而停止、错过的触发会尽快补上 |
+
+> Windows 的任务计划管理器对“小于 1 分钟的重复间隔”支持不一致。安装脚本会先尝试 30 秒；如果系统不接受，会自动改写成 **两条错开 30 秒的 1 分钟触发器**，实际检查频率仍然是 30 秒，并在安装时打印实际生效的间隔。
 
 常用命令：
 
 ```powershell
-Start-ScheduledTask -TaskName CampusAutoLogin
-Get-ScheduledTask -TaskName CampusAutoLogin | Get-ScheduledTaskInfo
+Start-ScheduledTask -TaskName CampusAutoLogin          # 立即运行一次
+Get-ScheduledTaskInfo -TaskName CampusAutoLogin        # 看上次运行结果
+Get-ScheduledTask -TaskName CampusAutoLogin | Select-Object -ExpandProperty Triggers
 Unregister-ScheduledTask -TaskName CampusAutoLogin -Confirm:$false
 ```
 
-也可以直接运行卸载脚本：
+## 目录结构
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Uninstall-CampusAutoLoginTask.ps1
+```text
+.
+├── 一键安装.cmd                        # 双击安装（自动申请管理员权限）
+├── Setup-DrcomAutoLogin.ps1            # 一键安装主逻辑
+├── DrcomAutoLogin.ps1                  # 主脚本（状态检查 + 自动登录）
+├── Save-DrcomCredential.ps1            # 保存账号密码（DPAPI 加密）
+├── Install-CampusAutoLoginTask.ps1     # 注册计划任务（每 30 秒、自检）
+├── Uninstall-CampusAutoLoginTask.ps1   # 卸载计划任务
+├── Diagnose-CampusAutoLogin.ps1        # 生成诊断报告
+├── drcom-config.json                   # Portal 配置
+├── docs/
+│   ├── DRCOM-PROTOCOL.md               # 抓包与协议说明
+│   └── TROUBLESHOOTING.md              # 常见问题
+└── generic/
+    ├── CampusAutoLogin.ps1             # 通用 Portal 版本
+    ├── Save-CampusCredential.ps1       # 通用版凭据保存
+    └── config.example.json             # 通用版配置示例
 ```
+
+运行时产生的文件都在 `%LOCALAPPDATA%\CampusAutoLogin\`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `credential.xml` | DPAPI 加密的账号密码（只有当前 Windows 用户能解密） |
+| `state.json` | 运行次数、当前在线状态、最近一次结果、连续失败次数 |
+| `login.log` | 仅记录有意义的事件与每小时心跳（不会每 30 秒刷一条） |
+| `run-hidden.vbs` | 自动生成的隐藏启动器 |
+| `diagnose-*.txt` | 诊断报告 |
 
 ## 常见问题
 
-### 1. `userid error2 -> 密码错误`
+### 1. 脚本好像没有正常运行
+
+先运行 `Diagnose-CampusAutoLogin.ps1`。报告里若“没有 `state.json`”，说明任务没有真正跑起来；此时重新运行安装脚本，它会重新注册并自动自检。
+
+### 2. `userid error2 -> 密码错误`
 
 在部分 Dr.COM 部署中，`userid error2` 实际表示 **“账号已在线 / 重复认证”**，并不是密码错误。可以用一个明显错误的密码做对照测试：
 
 - 如果错误密码和正确密码返回完全相同的 `userid error2`，说明该错误码是“已在线”；
 - 如果只有正确密码返回其他错误，说明需要检查密码。
 
-脚本正常模式下会先查询状态，只有 `result=0` 才登录，因此不会和已在线设备冲突。
+脚本只有确认掉线后才登录，并且遇到这个错误码会复检状态，确认在线就按成功处理。
 
-### 2. `error5 waitsec <3`
+### 3. 每 30 秒会不会太频繁
 
-注销后 Portal 要求至少等待 3 秒才能重新登录。脚本的 `-Relogin` 模式默认等待 5 秒。
+每 30 秒只有一次轻量的状态查询（浏览器打开 Portal 页面时也是这个查询），不会触发限流；限流只针对登录请求，脚本已经识别并自动等待重试。想更省一点就把 `CheckIntervalSeconds` 改成 `60`。
 
-### 3. 账号被 MAC 绑定
+### 4. `error5 waitsec <3`
+
+注销后 Portal 要求至少等待 3 秒才能重新登录。`-Relogin` 模式默认等待 5 秒。
+
+### 5. 账号被 MAC 绑定
 
 部分学校会把账号绑定到首次认证的 MAC 地址。如果换设备登录失败，请联系网络中心解绑，或使用原来那台设备执行脚本。
 
-### 4. 需要验证码
+### 6. 需要验证码
 
 纯脚本无法自动识别验证码。可以联系网络中心关闭验证码，或改造成半自动模式。
 
-### 5. 提示“禁止运行脚本”
+### 7. 提示“禁止运行脚本”
 
 使用 `-ExecutionPolicy Bypass` 启动即可：
 
@@ -182,37 +257,22 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1
 
 更多问题见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
 
+## 卸载
+
+```powershell
+# 只删任务，保留凭据和日志
+powershell -ExecutionPolicy Bypass -File .\Uninstall-CampusAutoLoginTask.ps1
+
+# 任务 + 凭据 + 日志 + 状态一起删
+powershell -ExecutionPolicy Bypass -File .\Uninstall-CampusAutoLoginTask.ps1 -RemoveData
+```
+
 ## 安全说明
 
 - `credential.xml` 使用 Windows DPAPI 加密，与当前 Windows 用户绑定；
-- 不要把 `credential.xml` 提交到 Git 或复制到其他电脑；
+- 不要把它提交到 Git 或复制到其他电脑；
 - `.gitignore` 已默认忽略 `credential.xml`、`*.log`、`work/`、`id_ed25519`、`*.pem`、`*.ppk`；
 - 公开仓库中不要写入自己的学号、密码、Portal 内网地址等个人信息。
-
-## 目录结构
-
-```text
-.
-├── DrcomAutoLogin.ps1                 # 主脚本
-├── Save-DrcomCredential.ps1           # 保存账号密码
-├── Install-CampusAutoLoginTask.ps1    # 注册计划任务
-├── Setup-DrcomAutoLogin.ps1           # 一键安装
-├── Uninstall-CampusAutoLoginTask.ps1  # 卸载
-├── drcom-config.json                  # Portal 配置
-├── docs/
-│   ├── DRCOM-PROTOCOL.md              # 抓包与协议说明
-│   └── TROUBLESHOOTING.md             # 常见问题
-└── generic/
-    ├── CampusAutoLogin.ps1            # 通用 Portal 版本
-    ├── Save-CampusCredential.ps1      # 通用版凭据保存
-    └── config.example.json            # 通用版配置示例
-```
-
-## 兼容性
-
-- Windows 10 / Windows 11
-- Windows PowerShell 5.1 及以上
-- 脚本文件使用 UTF-8 with BOM 保存，确保 Windows PowerShell 5.1 正确解析中文
 
 ## 其他学校
 
@@ -244,8 +304,13 @@ powershell -ExecutionPolicy Bypass -File .\generic\CampusAutoLogin.ps1
 powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1 -ScriptPath .\generic\CampusAutoLogin.ps1 -ConfigPath .\generic\config.json
 ```
 
-> 注册计划任务需要以管理员身份运行 PowerShell。
+## 兼容性
+
+- Windows 10 / Windows 11
+- Windows PowerShell 5.1 及以上（不需要 PowerShell 7）
+- 脚本文件使用 UTF-8 with BOM 保存，确保 Windows PowerShell 5.1 正确解析中文
 
 ## License
 
 [MIT](LICENSE)
+

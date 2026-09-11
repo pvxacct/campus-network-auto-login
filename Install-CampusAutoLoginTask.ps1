@@ -1,116 +1,407 @@
 ﻿#Requires -Version 5.1
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    注册校园网自动登录计划任务。
+    注册校园网自动登录计划任务（默认每 30 秒检查一次）。
 
 .DESCRIPTION
-    触发时机：
-      1. 用户登录时；
-      2. 注册后每 N 分钟检查一次（默认读取 drcom-config.json 的 CheckIntervalMinutes）；
-      3. 网络配置文件变化时（Wi-Fi 切换、插拔网线）。
+    触发方式：
+      1. 用户登录 Windows 后 15 秒；
+      2. 常驻定时触发，默认每 30 秒一次；
+      3. 网络配置文件变化时（Event ID 10000，例如切换 Wi-Fi、插拔网线）。
+
+    任务默认通过 wscript.exe 调用自动生成的隐藏启动器（run-hidden.vbs），
+    运行时不会弹出黑色命令行窗口，所以每 30 秒触发一次也不影响正常使用。
+    如果系统禁用了 Windows 脚本宿主，会在自检失败后自动改为直接调用 powershell.exe。
+
+    如果 Windows 不接受小于 1 分钟的重复间隔，脚本会自动改写成
+    “两条 1 分钟触发器、彼此错开 30 秒”的等价方案，实际检查频率仍然是 30 秒。
+
+    注册完成后会真实启动任务并观察若干秒，确认任务确实在运行。
+
+.PARAMETER ScriptPath
+    要定时执行的主脚本，默认当前目录下的 DrcomAutoLogin.ps1。
+
+.PARAMETER IntervalSeconds
+    检查间隔（秒）。不指定时读取 drcom-config.json 的 CheckIntervalSeconds，缺省 30 秒。
+
+.PARAMETER VerifySeconds
+    注册后实际观察多少秒来确认任务在跑，默认 80 秒；设为 0 表示跳过自检。
+
+.PARAMETER NoElevate
+    不自动请求管理员权限（脚本内部递归调用时使用）。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1 -IntervalMinutes 5
+    powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1 -IntervalSeconds 60
 #>
 [CmdletBinding()]
 param(
     [string]$ScriptPath = '',
     [string]$ConfigPath = '',
+    [string]$DataDir = '',
     [string]$TaskName = 'CampusAutoLogin',
-    [int]$IntervalMinutes = 0,
-    [switch]$RunAsSystem
+    [int]$IntervalSeconds = 0,
+    [int]$VerifySeconds = 80,
+    [switch]$NoElevate
 )
 
 $ErrorActionPreference = 'Stop'
 
+# ===================== 路径 =====================
 $ScriptRoot = $PSScriptRoot
 if ([string]::IsNullOrEmpty($ScriptRoot)) {
     $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
 }
-if ([string]::IsNullOrEmpty($ScriptPath)) {
-    $ScriptPath = Join-Path $ScriptRoot 'DrcomAutoLogin.ps1'
-}
-if ([string]::IsNullOrEmpty($ConfigPath)) {
-    $ConfigPath = Join-Path $ScriptRoot 'drcom-config.json'
+if ([string]::IsNullOrEmpty($ScriptRoot)) { $ScriptRoot = (Get-Location).Path }
+
+if ([string]::IsNullOrEmpty($ScriptPath)) { $ScriptPath = Join-Path $ScriptRoot 'DrcomAutoLogin.ps1' }
+if ([string]::IsNullOrEmpty($ConfigPath)) { $ConfigPath = Join-Path $ScriptRoot 'drcom-config.json' }
+if ([string]::IsNullOrWhiteSpace($DataDir)) {
+    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $DataDir = $ScriptRoot
+    } else {
+        $DataDir = Join-Path $env:LOCALAPPDATA 'CampusAutoLogin'
+    }
 }
 
-if (-not (Test-Path -LiteralPath $ScriptPath)) {
-    throw "找不到主脚本：$ScriptPath"
+if (-not (Test-Path -LiteralPath $ScriptPath)) { throw "找不到主脚本：$ScriptPath" }
+$ScriptPath = (Resolve-Path -LiteralPath $ScriptPath).Path
+
+# ===================== 管理员权限 =====================
+function Test-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-if ($IntervalMinutes -le 0) {
-    $IntervalMinutes = 2
+if (-not (Test-Admin)) {
+    if ($NoElevate) { throw '注册计划任务需要管理员权限，请用管理员身份重新运行。' }
+
+    Write-Host '注册计划任务需要管理员权限，正在弹出 UAC 授权窗口，请点击“是”。' -ForegroundColor Yellow
+    $elevateExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $elevateExe)) { $elevateExe = 'powershell.exe' }
+
+    $myPath = $MyInvocation.MyCommand.Path
+    if ([string]::IsNullOrEmpty($myPath)) { $myPath = Join-Path $ScriptRoot 'Install-CampusAutoLoginTask.ps1' }
+
+    $argList = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', ('"{0}"' -f $myPath),
+        '-ScriptPath', ('"{0}"' -f $ScriptPath),
+        '-ConfigPath', ('"{0}"' -f $ConfigPath),
+        '-DataDir', ('"{0}"' -f $DataDir),
+        '-TaskName', ('"{0}"' -f $TaskName),
+        '-IntervalSeconds', $IntervalSeconds,
+        '-VerifySeconds', $VerifySeconds
+    )
+
+    Start-Process -FilePath $elevateExe -ArgumentList $argList -Verb RunAs
+    exit 0
+}
+
+# ===================== 检查间隔 =====================
+if ($IntervalSeconds -le 0) {
+    $IntervalSeconds = 30
     if (Test-Path -LiteralPath $ConfigPath) {
         try {
             $cfg = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($cfg.CheckIntervalMinutes) {
-                $IntervalMinutes = [int]$cfg.CheckIntervalMinutes
+            if ($cfg.CheckIntervalSeconds) {
+                $IntervalSeconds = [int]$cfg.CheckIntervalSeconds
+            } elseif ($cfg.CheckIntervalMinutes) {
+                $IntervalSeconds = [int]$cfg.CheckIntervalMinutes * 60
             }
         } catch {
-            Write-Warning "读取配置失败，使用默认间隔 2 分钟：$($_.Exception.Message)"
+            Write-Warning "读取 drcom-config.json 失败，使用默认间隔 30 秒：$($_.Exception.Message)"
+        }
+    }
+}
+if ($IntervalSeconds -lt 10) {
+    Write-Warning '检查间隔不能小于 10 秒，已调整为 10 秒。'
+    $IntervalSeconds = 10
+}
+
+# ===================== 隐藏启动器 =====================
+if (-not (Test-Path -LiteralPath $DataDir)) {
+    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+}
+
+$launcherPath = Join-Path $DataDir 'run-hidden.vbs'
+$vbsCommandLine = 'cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File """ & "' + $ScriptPath + '" & """ -Quiet"'
+$vbsLines = @(
+    "' Auto-generated by Install-CampusAutoLoginTask.ps1. Do not edit.",
+    "' Runs the campus auto-login script with no visible window.",
+    'Option Explicit',
+    'Dim shell, cmd',
+    'Set shell = CreateObject("WScript.Shell")',
+    $vbsCommandLine,
+    'shell.Run cmd, 0, True'
+)
+# 用 UTF-16 保存，这样脚本路径里出现中文用户名也不会乱码
+[System.IO.File]::WriteAllText($launcherPath, (($vbsLines -join "`r`n") + "`r`n"), [System.Text.Encoding]::Unicode)
+
+# ===================== 生成任务 XML =====================
+function New-CampusTaskXml {
+    param(
+        [Parameter(Mandatory = $true)][string]$UserId,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][int]$IntervalSeconds,
+        [Parameter(Mandatory = $true)][string]$ActionKind,
+        [bool]$UseDualTrigger = $false,
+        [string]$LauncherPath = '',
+        [string]$PowerShellPath = '',
+        [string]$TargetScriptPath = ''
+    )
+
+    # Task Scheduler 用它自己的方式表示“无限期”：TimeSpan.MaxValue 对应的 ISO8601 时长
+    $indefinite = 'P10675199DT2H48M5.4775807S'
+
+    $start = (Get-Date).AddMinutes(1)
+    if (($IntervalSeconds % 86400) -eq 0) {
+        $singleInterval = 'P{0}D' -f [int]($IntervalSeconds / 86400)
+    } elseif (($IntervalSeconds % 3600) -eq 0) {
+        $singleInterval = 'PT{0}H' -f [int]($IntervalSeconds / 3600)
+    } elseif (($IntervalSeconds % 60) -eq 0) {
+        $singleInterval = 'PT{0}M' -f [int]($IntervalSeconds / 60)
+    } else {
+        $singleInterval = 'PT{0}S' -f $IntervalSeconds
+    }
+
+    if ($UseDualTrigger) {
+        # 两条 1 分钟触发器错开 30 秒：等价于每 30 秒检查一次
+        $triggerA = $start.ToString('yyyy-MM-ddTHH:mm:ss')
+        $triggerB = $start.AddSeconds(30).ToString('yyyy-MM-ddTHH:mm:ss')
+        $timeTriggers = "<TimeTrigger><StartBoundary>$triggerA</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1M</Interval><Duration>$indefinite</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger><TimeTrigger><StartBoundary>$triggerB</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1M</Interval><Duration>$indefinite</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>"
+    } else {
+        $timeTriggers = "<TimeTrigger><StartBoundary>$($start.ToString('yyyy-MM-ddTHH:mm:ss'))</StartBoundary><Enabled>true</Enabled><Repetition><Interval>$singleInterval</Interval><Duration>$indefinite</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>"
+    }
+
+    if ($ActionKind -eq 'direct') {
+        $actionCommand = $PowerShellPath
+        $actionArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Quiet' -f $TargetScriptPath
+    } else {
+        $actionCommand = '{0}\System32\wscript.exe' -f $env:SystemRoot
+        $actionArguments = '//B //Nologo "{0}"' -f $LauncherPath
+    }
+
+    $eventSubscription = '<QueryList><Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"><Select Path="Microsoft-Windows-NetworkProfile/Operational">*[System[EventID=10000]]</Select></Query></QueryList>'
+
+    $lines = @(
+        '<?xml version="1.0" encoding="UTF-16"?>',
+        '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+        '  <RegistrationInfo>',
+        ('    <Date>{0}</Date>' -f (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')),
+        ('    <Author>{0}</Author>' -f $UserId),
+        ('    <Description>校园网掉线自动重连：每 {0} 秒检查一次 Portal 在线状态</Description>' -f $IntervalSeconds),
+        '  </RegistrationInfo>',
+        '  <Triggers>',
+        '    <LogonTrigger>',
+        '      <Enabled>true</Enabled>',
+        ('      <UserId>{0}</UserId>' -f $UserId),
+        '      <Delay>PT15S</Delay>',
+        '    </LogonTrigger>',
+        ('    {0}' -f $timeTriggers),
+        '    <EventTrigger>',
+        '      <Enabled>true</Enabled>',
+        ('      <Subscription><![CDATA[{0}]]></Subscription>' -f $eventSubscription),
+        '    </EventTrigger>',
+        '  </Triggers>',
+        '  <Principals>',
+        '    <Principal id="Author">',
+        ('      <UserId>{0}</UserId>' -f $UserId),
+        '      <LogonType>InteractiveToken</LogonType>',
+        '      <RunLevel>LeastPrivilege</RunLevel>',
+        '    </Principal>',
+        '  </Principals>',
+        '  <Settings>',
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>',
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>',
+        '    <AllowHardTerminate>true</AllowHardTerminate>',
+        '    <StartWhenAvailable>true</StartWhenAvailable>',
+        '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>',
+        '    <IdleSettings>',
+        '      <StopOnIdleEnd>false</StopOnIdleEnd>',
+        '      <RestartOnIdle>false</RestartOnIdle>',
+        '    </IdleSettings>',
+        '    <AllowStartOnDemand>true</AllowStartOnDemand>',
+        '    <Enabled>true</Enabled>',
+        '    <Hidden>false</Hidden>',
+        '    <RunOnlyIfIdle>false</RunOnlyIfIdle>',
+        '    <WakeToRun>false</WakeToRun>',
+        '    <ExecutionTimeLimit>PT3M</ExecutionTimeLimit>',
+        '    <Priority>7</Priority>',
+        '  </Settings>',
+        '  <Actions Context="Author">',
+        '    <Exec>',
+        ('      <Command>{0}</Command>' -f $actionCommand),
+        ('      <Arguments>{0}</Arguments>' -f $actionArguments),
+        ('      <WorkingDirectory>{0}</WorkingDirectory>' -f $WorkingDirectory),
+        '    </Exec>',
+        '  </Actions>',
+        '</Task>'
+    )
+
+    return ($lines -join "`r`n")
+}
+
+function Get-RegisteredIntervalSeconds {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $task = Get-ScheduledTask -TaskName $Name -ErrorAction Stop
+    $intervals = @()
+    foreach ($trigger in $task.Triggers) {
+        if ($trigger.Repetition -and $trigger.Repetition.Interval) {
+            $intervals += [double]$trigger.Repetition.Interval.TotalSeconds
+        }
+    }
+    if ($intervals.Count -eq 0) { return 0 }
+    if ($intervals.Count -ge 2) { return [int]($intervals[0] / 2) }
+    return [int]$intervals[0]
+}
+
+# ===================== 注册任务 =====================
+$userId = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+$workingDirectory = Split-Path -Parent $ScriptPath
+$statePath = Join-Path $DataDir 'state.json'
+
+$powerShellExePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path -LiteralPath $powerShellExePath)) { $powerShellExePath = 'powershell.exe' }
+
+function Get-CampusRunCount {
+    if (-not (Test-Path -LiteralPath $statePath)) { return 0 }
+    try {
+        return [int](Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json).RunCount
+    } catch {
+        return 0
+    }
+}
+
+function Install-CampusTaskNow {
+    param(
+        [Parameter(Mandatory = $true)][string]$ActionKind,
+        [Parameter(Mandatory = $true)][bool]$UseDualTrigger
+    )
+
+    $xml = New-CampusTaskXml -UserId $userId -WorkingDirectory $workingDirectory -IntervalSeconds $IntervalSeconds `
+        -ActionKind $ActionKind -UseDualTrigger $UseDualTrigger `
+        -LauncherPath $launcherPath -PowerShellPath $powerShellExePath -TargetScriptPath $ScriptPath
+
+    Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force -ErrorAction Stop | Out-Null
+}
+
+function Measure-CampusRuns {
+    param([Parameter(Mandatory = $true)][int]$Seconds)
+
+    $before = Get-CampusRunCount
+    try {
+        Start-ScheduledTask -TaskName $TaskName
+    } catch {
+        Write-Warning ("手动启动任务失败：{0}" -f $_.Exception.Message)
+    }
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 5
+        Write-Host ("  已自动运行 {0} 次" -f ((Get-CampusRunCount) - $before))
+    }
+
+    return [int]((Get-CampusRunCount) - $before)
+}
+
+Write-Host ''
+Write-Host '========================================' -ForegroundColor Cyan
+Write-Host '  注册校园网自动登录计划任务' -ForegroundColor Cyan
+Write-Host '========================================' -ForegroundColor Cyan
+Write-Host ("  主脚本  ：{0}" -f $ScriptPath)
+Write-Host ("  运行账号：{0}" -f $userId)
+Write-Host ("  检查间隔：每 {0} 秒" -f $IntervalSeconds)
+Write-Host ("  静默启动器：{0}" -f $launcherPath)
+Write-Host ''
+
+$actionKind = 'vbs'
+$useDualTrigger = $false
+$registered = $false
+$registerError = ''
+
+try {
+    Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $useDualTrigger
+    $registered = $true
+} catch {
+    $registerError = $_.Exception.Message
+    Write-Warning ("注册失败：{0}" -f $registerError)
+}
+
+$effectiveSeconds = 0
+if ($registered) {
+    try { $effectiveSeconds = Get-RegisteredIntervalSeconds -Name $TaskName } catch { $effectiveSeconds = 0 }
+
+    if ($IntervalSeconds -lt 60 -and ($effectiveSeconds -eq 0 -or $effectiveSeconds -gt $IntervalSeconds)) {
+        Write-Host '系统没有接受小于 1 分钟的重复间隔，改用“两条 1 分钟触发器错开 30 秒”。' -ForegroundColor Yellow
+        try {
+            Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $true
+            $useDualTrigger = $true
+            $effectiveSeconds = Get-RegisteredIntervalSeconds -Name $TaskName
+        } catch {
+            Write-Warning ("改用双触发器方案失败：{0}" -f $_.Exception.Message)
         }
     }
 }
 
-$action = New-ScheduledTaskAction `
-    -Execute 'powershell.exe' `
-    -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $ScriptPath)
+if (-not $registered) { throw ("计划任务注册失败：{0}" -f $registerError) }
+if ($effectiveSeconds -le 0) { $effectiveSeconds = $IntervalSeconds }
 
-$triggers = @()
-$triggers += New-ScheduledTaskTrigger -AtLogOn
-$triggers += New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
+Write-Host ("计划任务已注册：{0}（实际检查间隔约 {1} 秒）" -f $TaskName, $effectiveSeconds) -ForegroundColor Green
 
-# 网络变化触发：Event ID 10000 = NetworkProfile 已连接
+$observedRuns = -1
+if ($VerifySeconds -gt 0) {
+    Write-Host ''
+    Write-Host ("正在启动任务并观察 {0} 秒，确认它会自己跑起来..." -f $VerifySeconds) -ForegroundColor Cyan
+    $observedRuns = Measure-CampusRuns -Seconds $VerifySeconds
+
+    # 万一系统禁用了 Windows 脚本宿主，就换成直接调用 powershell.exe
+    if ($observedRuns -lt 2 -and $actionKind -eq 'vbs') {
+        Write-Host ''
+        Write-Host '没有观察到预期的运行次数，可能系统禁用了 Windows 脚本宿主（wscript）。' -ForegroundColor Yellow
+        Write-Host '正在改用“直接调用 powershell.exe”的方案重新注册，并再次自检...' -ForegroundColor Yellow
+        try {
+            $actionKind = 'direct'
+            Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $useDualTrigger
+            $observedRuns = Measure-CampusRuns -Seconds $VerifySeconds
+        } catch {
+            Write-Warning ("改用直接调用方案失败：{0}" -f $_.Exception.Message)
+        }
+    }
+
+    Write-Host ''
+    if ($observedRuns -ge 2) {
+        Write-Host ("自检通过：{0} 秒内脚本被自动执行了 {1} 次（运行方式：{2}），任务已正常工作。" -f $VerifySeconds, $observedRuns, $actionKind) -ForegroundColor Green
+    } else {
+        Write-Host ("自检没有通过：{0} 秒内只自动执行了 {1} 次。" -f $VerifySeconds, $observedRuns) -ForegroundColor Red
+        Write-Host '请运行 Diagnose-CampusAutoLogin.ps1 生成诊断报告；常见原因是安全软件拦截，或计划任务服务被禁用。' -ForegroundColor Yellow
+    }
+}
+
+Write-Host ''
 try {
-    $cimClass = Get-CimClass -Namespace 'root/Microsoft/Windows/TaskScheduler' -ClassName 'MSFT_TaskEventTrigger'
-    $networkTrigger = New-CimInstance -CimClass $cimClass -ClientOnly
-    $networkTrigger.Enabled = $true
-    $networkTrigger.Subscription = @'
-<QueryList>
-  <Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational">
-    <Select Path="Microsoft-Windows-NetworkProfile/Operational">*[System[EventID=10000]]</Select>
-  </Query>
-</QueryList>
-'@
-    $triggers += $networkTrigger
-    Write-Host '已添加“网络变化”触发器。'
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+    Write-Host ("最近一次运行：{0}，返回码：{1}" -f $taskInfo.LastRunTime, $taskInfo.LastTaskResult)
 } catch {
-    Write-Warning "添加网络变化触发器失败（不影响其他触发器）：$($_.Exception.Message)"
+    Write-Host '暂时读取不到任务的运行记录，可稍后在“任务计划程序”里查看。'
 }
 
-if ($RunAsSystem) {
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-} else {
-    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+$credentialPath = Join-Path $DataDir 'credential.xml'
+if (-not (Test-Path -LiteralPath $credentialPath)) {
+    Write-Host ''
+    Write-Host '注意：还没有保存校园网账号密码，任务目前只会检查状态、不会登录。' -ForegroundColor Yellow
+    Write-Host '请运行：powershell -ExecutionPolicy Bypass -File .\Save-DrcomCredential.ps1' -ForegroundColor Yellow
 }
 
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable `
-    -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger $triggers `
-    -Principal $principal `
-    -Settings $settings `
-    -Description '检测到校园网未认证时自动登录' `
-    -Force | Out-Null
-
 Write-Host ''
-Write-Host "计划任务已创建：$TaskName" -ForegroundColor Green
-Write-Host "  主脚本：$ScriptPath"
-Write-Host "  间隔：每 $IntervalMinutes 分钟"
+Write-Host '常用命令：' -ForegroundColor Cyan
+Write-Host '  查看状态：powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -CheckOnly'
+Write-Host ("  立即运行：Start-ScheduledTask -TaskName {0}" -f $TaskName)
+Write-Host ("  查看日志：Get-Content '{0}\login.log' -Tail 30" -f $DataDir)
+Write-Host '  卸载任务：powershell -ExecutionPolicy Bypass -File .\Uninstall-CampusAutoLoginTask.ps1'
 Write-Host ''
-Write-Host '立即运行一次：Start-ScheduledTask -TaskName ' -NoNewline
-Write-Host $TaskName
-Write-Host '删除任务：Unregister-ScheduledTask -TaskName ' -NoNewline
-Write-Host $TaskName -Confirm:$false
+
