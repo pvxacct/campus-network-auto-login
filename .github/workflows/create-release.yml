@@ -1,15 +1,14 @@
-# 为最新的 v* 标签创建 GitHub Release，并附上打包好的 zip（解压即用）。
+# 为 v* 标签创建 GitHub Release，并附上打包好的 zip（解压即用）。
 # 触发方式：
-#   1) 这个文件本身被修改并推送到 main 时自动运行一次；
+#   1) 推送 v* 标签（例如 git push origin v1.2.0）时自动运行，发布该标签；
 #   2) 在 Actions 页面点 “Run workflow” 手动运行（可指定标签、可勾选 Pre-release）。
 # 说明：GITHUB_TOKEN 由 GitHub 自动提供，不需要配置任何密钥。
 name: Create GitHub Release
 
 on:
   push:
-    branches: [main]
-    paths:
-      - '.github/workflows/create-release.yml'
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
