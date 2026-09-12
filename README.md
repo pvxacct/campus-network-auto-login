@@ -368,7 +368,7 @@ powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1 -Scri
 
 ## 更新日志
 
-各版本的改动记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本：**1.1.0**（2026-09-12）。
+各版本的改动记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本：**1.5.1**（2026-09-12）。
 
 ## License
 

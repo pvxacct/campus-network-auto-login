@@ -218,12 +218,17 @@ v1.5.0 的默认值已经堵住这条路径：
 
 从 v1.4.0 起脚本改成“**连不上网才动手**”，所以如果当前能正常上网，脚本本来就什么都不做、也不会写日志——这是预期行为。
 
+不过从 v1.5.1 起，每次被计划任务唤起都会刷新一次 `state.json`（纯本地写入，不发任何请求），
+所以 `state.json` 的修改时间**始终是 30 秒以内**。反过来，如果它的修改时间超过几分钟，
+就说明计划任务没有在正常调用脚本，可以运行 `Diagnose-CampusAutoLogin.ps1` 看【4】【6】两节。
+
 想确认它到底有没有在工作，打开 `%LOCALAPPDATA%\CampusAutoLogin\state.json` 看两个字段：
 
 | 字段 | 含义 |
 | --- | --- |
+| `RunCount` / `LastTrigger` | 每次触发都会更新，用来确认计划任务确实每 30 秒把脚本唤起来了 |
 | `LastProbe` | 最近一次真的去查 Portal 的时间 |
-| `Connectivity` | 判断“能不能上网”用的是哪种方式：`nlm`（系统网络列表，正常）、`cim`（网络连接配置文件，正常）、`fallback`（两种都读不到，退化成都市按“有网”处理 + 兜底巡检） |
+| `Connectivity` | 判断“能不能上网”用的是哪种方式：`nlm`（系统网络列表，正常）、`cim`（网络连接配置文件，正常）、`fallback`（两种都读不到，退化为按“有网”处理 + 兜底巡检） |
 
 如果 `Connectivity` 长时间是 `fallback`，说明这台机器读不到系统联网状态，脚本会退化成“每 `OnlineCheckIntervalSeconds` 秒查一次 Portal”，功能仍然正常，只是请求多一些。这种情况可以把该值设小一点，或者运行 `Diagnose-CampusAutoLogin.ps1` 看详细报告。
 

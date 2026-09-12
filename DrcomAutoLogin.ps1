@@ -11,7 +11,8 @@
       4. 返回页包含 Dr.COMWebLoginID_3.htm 判定为登录成功；
       5. 失败时调用错误码接口，把 userid error2 之类的代码翻译成中文；
       6. 账号密码由 Save-DrcomCredential.ps1 使用 Windows DPAPI 加密保存；
-      7. 每次运行结果都会写入 state.json，可用来确认脚本是否真的在运行。
+      7. 每次运行都会写 state.json（纯本地写入，不发请求），其中 RunCount / LastTrigger
+         每次触发都会更新，可用来确认计划任务是否真的每 30 秒把脚本唤起来。
 
 .PARAMETER ConfigPath
     Portal 配置文件，默认脚本同目录下的 drcom-config.json。
@@ -108,7 +109,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:QuietMode = [bool]$Quiet
-$script:ScriptVersion = '1.5.0'
+$script:ScriptVersion = '1.5.1'
 
 # ===================== 路径解析 =====================
 $ScriptRoot = $PSScriptRoot
@@ -579,12 +580,29 @@ try {
 
         $conn = Test-LocalConnectivity
         $state['Connectivity'] = $conn.Method
-        if (-not $conn.HasAdapter) { exit 0 }
-        if ($conn.HasInternet -and -not $probeDue) { exit 0 }
+
+        # 只写本地状态文件（不产生任何网络请求），让安装自检和诊断脚本能确认
+        # “计划任务确实每 30 秒把脚本唤起来了”。之前这里直接 exit，state.json 会长时间不动，
+        # 看起来像脚本没在运行。
+        $state['RunCount'] = [int]$state['RunCount'] + 1
+        $state['LastTrigger'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+
+        if (-not $conn.HasAdapter) {
+            $state['LastResult'] = 'no-adapter'
+            Save-DrcomState -State $state
+            exit 0
+        }
+        if ($conn.HasInternet -and -not $probeDue) {
+            # 冷却信息比“能上网”更有价值，不要覆盖掉
+            if ([string]$state['LastResult'] -ne 'cooldown') { $state['LastResult'] = 'online-skip' }
+            Save-DrcomState -State $state
+            exit 0
+        }
     }
 
     $state['RunCount'] = [int]$state['RunCount'] + 1
     $state['LastProbe'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $state['LastTrigger'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 
     if (-not (Test-Path -LiteralPath $CredentialPath)) {
         Write-Log "找不到凭据文件：$CredentialPath" 'ERROR'

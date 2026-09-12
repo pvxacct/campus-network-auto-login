@@ -136,7 +136,17 @@ Add-Line ''
 Add-Line '【4】运行状态与日志'
 $statePath = Join-Path $DataDir 'state.json'
 if (Test-Path -LiteralPath $statePath) {
-    Add-Line ("  state.json（{0}）：" -f (Get-Item -LiteralPath $statePath).LastWriteTime)
+    $stateItem = Get-Item -LiteralPath $statePath
+    Add-Line ("  state.json（{0}）：" -f $stateItem.LastWriteTime)
+    # 脚本每次被触发都会刷新 state.json（纯本地写入，不发请求），
+    # 所以“多久没更新”就是判断计划任务有没有在调用脚本的最好证据。
+    $stateAgeMinutes = ((Get-Date) - $stateItem.LastWriteTime).TotalMinutes
+    if ($stateAgeMinutes -ge 5) {
+        Add-Line ("  [警告] state.json 已经有 {0} 分钟没有更新：脚本多半没有被计划任务正常调用。" -f [int]$stateAgeMinutes)
+        Add-Line '          正常情况每 30 秒就会刷新一次；请对照下面【6】计划任务的返回码与起始目录。'
+    } else {
+        Add-Line ("  state.json 刚刚刷新过（约 {0} 秒前），说明计划任务正在调用脚本。" -f [int]($stateAgeMinutes * 60))
+    }
     Add-Line ('  ' + (Get-Content -LiteralPath $statePath -Raw -Encoding UTF8).Trim())
 } else {
     Add-Line '  还没有 state.json：脚本一次都没有被成功执行过。'
@@ -162,7 +172,7 @@ try {
     try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($nlm) } catch { }
     Add-Line ("  现在能否上网：{0}" -f $(if ($onlineNow) { '能（脚本会跳过 Portal 查询，只做兜底巡检）' } else { '不能（脚本会去查 Portal 并自动登录）' }))
 } catch {
-    Add-Line '  现在能否上网：读不到系统状态（会退化成都市按“有网”处理 + 兜底巡检）'
+        Add-Line '  现在能否上网：读不到系统状态（会退化为按“有网”处理 + 兜底巡检）'
 }
 
 $gateState = $null
@@ -179,6 +189,7 @@ if ($gateState) {
         ''         { $methodText = '（还没记录）' }
     }
     Add-Line ("  本地联网判断：{0}" -f $methodText)
+    if ($gateState.LastTrigger) { Add-Line ("  最近一次触发：{0}" -f $gateState.LastTrigger) }
     if ($gateState.LastProbe)  { Add-Line ("  最近一次真实查询：{0}" -f $gateState.LastProbe) }
     if ($gateState.LastResult) { Add-Line ("  最近一次结果：{0}" -f $gateState.LastResult) }
     if ($gateState.ConsecutiveFailures) { Add-Line ("  连续失败次数：{0}" -f $gateState.ConsecutiveFailures) }
@@ -265,6 +276,47 @@ try {
 
     foreach ($action in $task.Actions) {
         Add-Line ("  执行：{0} {1}" -f $action.Execute, $action.Arguments)
+        Add-Line ("  起始目录：{0}" -f $action.WorkingDirectory)
+        if ($action.WorkingDirectory -and -not (Test-Path -LiteralPath $action.WorkingDirectory)) {
+            Add-Line '  [警告] 起始目录不存在：计划任务每次启动都会立刻失败（返回码 0x8007010B），脚本根本不会运行。'
+            Add-Line '          通常是因为原来的安装目录被删掉或移动过（例如 D:\campus-network-auto-login）。'
+            Add-Line '          处理办法：把文件夹放回原位，或者重新运行一次安装脚本。'
+        }
+
+        # 跟着隐藏启动器（run-hidden.vbs）找到真正要执行的主脚本，确认它还在
+        $targetPs1 = ''
+        $vbsMatch = [regex]::Match([string]$action.Arguments, '"([^"]+\.vbs)"')
+        if ($vbsMatch.Success) {
+            $vbsPath = $vbsMatch.Groups[1].Value
+            if (-not (Test-Path -LiteralPath $vbsPath)) {
+                Add-Line ("  [警告] 隐藏启动器不存在：{0}" -f $vbsPath)
+            } else {
+                $vbsText = [string](Get-Content -LiteralPath $vbsPath -Raw -ErrorAction SilentlyContinue)
+                $psMatch = [regex]::Match($vbsText, '([A-Za-z]:\\[^"]*?\.ps1)')
+                if ($psMatch.Success) { $targetPs1 = $psMatch.Groups[1].Value }
+            }
+        } elseif ([string]$action.Arguments -match '\.ps1') {
+            $psMatch = [regex]::Match([string]$action.Arguments, '"([^"]+\.ps1)"')
+            if ($psMatch.Success) { $targetPs1 = $psMatch.Groups[1].Value }
+        }
+
+        if ($targetPs1) {
+            Add-Line ("  实际执行的主脚本：{0}" -f $targetPs1)
+            if (Test-Path -LiteralPath $targetPs1) {
+                $scriptText = [string](Get-Content -LiteralPath $targetPs1 -Raw -ErrorAction SilentlyContinue)
+                $verMatch = [regex]::Match($scriptText, "ScriptVersion\s*=\s*'([0-9]+\.[0-9]+\.[0-9]+)'")
+                if ($verMatch.Success) { Add-Line ("  主脚本版本：{0}" -f $verMatch.Groups[1].Value) }
+                $tempRoots = @([Environment]::GetFolderPath('Desktop'), (Join-Path $env:USERPROFILE 'Downloads'), $env:TEMP)
+                foreach ($tempRoot in $tempRoots) {
+                    if (-not [string]::IsNullOrWhiteSpace($tempRoot) -and $targetPs1.StartsWith($tempRoot.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+                        Add-Line '  [提示] 主脚本位于桌面/下载/临时目录：删掉那个文件夹后任务就会失效，建议移到 C:\CampusAutoLogin。'
+                        break
+                    }
+                }
+            } else {
+                Add-Line '  [警告] 主脚本不存在：计划任务唤醒后什么也做不了，请重新运行安装脚本。'
+            }
+        }
     }
 
     try {
@@ -281,7 +333,7 @@ try {
 }
 Add-Line ''
 
-# ---------- 6. 隐藏启动器 ----------
+# ---------- 7. 隐藏启动器 ----------
 Add-Line '【7】隐藏启动器'
 $launcherPath = Join-Path $DataDir 'run-hidden.vbs'
 if (Test-Path -LiteralPath $launcherPath) {

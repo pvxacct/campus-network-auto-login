@@ -20,7 +20,7 @@ param(
     [string]$ConfigPath = '',
     [switch]$Force,
     [switch]$DumpResponse,
-    [int]$RetryCount = 3,
+    [int]$RetryCount = 1,
     [int]$RetryDelaySec = 5
 )
 

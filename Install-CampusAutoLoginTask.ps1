@@ -159,6 +159,15 @@ function New-CampusTimeTrigger {
     return ('<TimeTrigger><StartBoundary>{0}</StartBoundary><Enabled>true</Enabled><Repetition>{1}</Repetition></TimeTrigger>' -f $StartBoundary, $repetition)
 }
 
+function ConvertTo-CampusXmlText {
+    # 路径里出现 & < > " 时，直接拼进 XML 会让任务注册失败（报“任务 XML 包含格式不正确…
+    # 或超出范围的值”），这里统一转义。
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    return ($Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;')
+}
+
 function New-CampusTaskXml {
     param(
         [Parameter(Mandatory = $true)][string]$UserId,
@@ -251,9 +260,9 @@ function New-CampusTaskXml {
         '  </Settings>',
         '  <Actions Context="Author">',
         '    <Exec>',
-        ('      <Command>{0}</Command>' -f $actionCommand),
-        ('      <Arguments>{0}</Arguments>' -f $actionArguments),
-        ('      <WorkingDirectory>{0}</WorkingDirectory>' -f $WorkingDirectory),
+        ('      <Command>{0}</Command>' -f (ConvertTo-CampusXmlText $actionCommand)),
+        ('      <Arguments>{0}</Arguments>' -f (ConvertTo-CampusXmlText $actionArguments)),
+        ('      <WorkingDirectory>{0}</WorkingDirectory>' -f (ConvertTo-CampusXmlText $WorkingDirectory)),
         '    </Exec>',
         '  </Actions>',
         '</Task>'
@@ -363,14 +372,36 @@ function Measure-CampusAutoRuns {
     $warmupSeconds = 8
     Start-Sleep -Seconds $warmupSeconds
     $baseline = Get-CampusRunCount
+    $baselineRunTime = Get-CampusTaskLastRunTime
 
     $deadline = (Get-Date).AddSeconds([Math]::Max(5, $Seconds - $warmupSeconds))
+    $lastRunTime = $baselineRunTime
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 5
+        $lastRunTime = Get-CampusTaskLastRunTime
         Write-Host ("  计划任务已自动触发 {0} 次" -f ((Get-CampusRunCount) - $baseline))
     }
 
-    return [int]((Get-CampusRunCount) - $baseline)
+    # 两条证据都说明“计划任务确实在跑”：
+    #   1) RunCount 增加   = 脚本真的被执行到了（最可靠）；
+    #   2) 任务的“最近一次运行时间”往后走 = 调度器真的把动作唤起来了
+    #      （即使脚本因为某些原因没能写状态文件，也能确认任务本身没问题）。
+    $fired = $false
+    if ($lastRunTime -and ((-not $baselineRunTime) -or ($lastRunTime -gt $baselineRunTime))) { $fired = $true }
+
+    return [pscustomobject]@{
+        RunDelta  = [int]((Get-CampusRunCount) - $baseline)
+        TaskFired = $fired
+        LastRun   = $lastRunTime
+    }
+}
+
+function Get-CampusTaskLastRunTime {
+    try {
+        return (Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop).LastRunTime
+    } catch {
+        return $null
+    }
 }
 
 Write-Host ''
@@ -380,6 +411,23 @@ Write-Host '========================================' -ForegroundColor Cyan
 Write-Host ("  主脚本  ：{0}" -f $ScriptPath)
 Write-Host ("  运行账号：{0}" -f $userId)
 Write-Host ("  检查间隔：每 {0} 秒" -f $IntervalSeconds)
+
+# 主脚本放在桌面 / 下载 / 临时目录时，用户很容易把那个文件夹删掉，
+# 于是计划任务会变成每次启动都失败（返回码 0x8007010B）的“死任务”，这里提前提醒。
+$riskyRoots = @()
+foreach ($known in @([Environment]::GetFolderPath('Desktop'), (Join-Path $env:USERPROFILE 'Downloads'), $env:TEMP)) {
+    if (-not [string]::IsNullOrWhiteSpace($known)) { $riskyRoots += $known.TrimEnd('\') }
+}
+$riskyFolder = $null
+foreach ($root in $riskyRoots) {
+    if ($workingDirectory.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { $riskyFolder = $root; break }
+}
+if ($riskyFolder) {
+    Write-Host ''
+    Write-Warning ("主脚本位于「{0}」，这是临时、容易被删掉的位置。" -f $workingDirectory)
+    Write-Warning '如果以后删掉这个文件夹，计划任务会每次都启动失败（返回码 0x8007010B），账号也就不会自动登录了。'
+    Write-Warning '建议把整个文件夹移动到 C:\CampusAutoLogin，再从那个目录重新运行一次安装脚本。'
+}
 
 # “能上网时”的兜底巡检间隔由主脚本内部判断，这里只为提示用户
 $onlineInterval = 300
@@ -497,6 +545,7 @@ if ($effectiveDurationSeconds -gt 0 -and $effectiveDurationSeconds -lt (86400 * 
 }
 
 $observedRuns = -1
+$taskFired = $false
 if ($VerifySeconds -gt 0) {
     Write-Host ''
     Write-Host ("正在启动任务并观察 {0} 秒，确认它会自己跑起来..." -f $VerifySeconds) -ForegroundColor Cyan
@@ -505,17 +554,21 @@ if ($VerifySeconds -gt 0) {
     $expectedAutoRuns = [Math]::Floor([Math]::Max(5, $VerifySeconds - 8) / $effectiveSeconds)
     $minAutoRuns = [Math]::Max(1, $expectedAutoRuns - 1)
 
-    $observedRuns = Measure-CampusAutoRuns -Seconds $VerifySeconds
+    $measured = Measure-CampusAutoRuns -Seconds $VerifySeconds
+    $observedRuns = $measured.RunDelta
+    $taskFired = $measured.TaskFired
 
     # 万一系统禁用了 Windows 脚本宿主，就换成直接调用 powershell.exe
-    if ($observedRuns -lt $minAutoRuns -and $actionKind -eq 'vbs') {
+    if ($observedRuns -lt $minAutoRuns -and -not $taskFired -and $actionKind -eq 'vbs') {
         Write-Host ''
         Write-Host '没有观察到预期的运行次数，可能系统禁用了 Windows 脚本宿主（wscript）。' -ForegroundColor Yellow
         Write-Host '正在改用“直接调用 powershell.exe”的方案重新注册，并再次自检...' -ForegroundColor Yellow
         try {
             $actionKind = 'direct'
             Install-CampusTaskNow -ActionKind $actionKind -UseDualTrigger $useDualTrigger -IndefiniteDuration $activeDuration
-            $observedRuns = Measure-CampusAutoRuns -Seconds $VerifySeconds
+            $measured = Measure-CampusAutoRuns -Seconds $VerifySeconds
+            $observedRuns = $measured.RunDelta
+            $taskFired = $measured.TaskFired
         } catch {
             Write-Warning ("改用直接调用方案失败：{0}" -f $_.Exception.Message)
         }
@@ -524,6 +577,12 @@ if ($VerifySeconds -gt 0) {
     Write-Host ''
     if ($observedRuns -ge $minAutoRuns) {
         Write-Host ("自检通过：{0} 秒内计划任务自动触发了 {1} 次（检查间隔约 {2} 秒，运行方式：{3}）。" -f $VerifySeconds, $observedRuns, $effectiveSeconds, $actionKind) -ForegroundColor Green
+    } elseif ($taskFired) {
+        Write-Host ("自检通过：计划任务确实被自动唤起了（检查间隔约 {0} 秒，运行方式：{1}）。" -f $effectiveSeconds, $actionKind) -ForegroundColor Green
+        if ($observedRuns -lt $minAutoRuns) {
+            Write-Host ("  说明：这 {0} 秒里脚本只多写入了 {1} 次状态文件。能上网时脚本只做本地判断、不查 Portal，" -f $VerifySeconds, $observedRuns)
+            Write-Host '  触发次数与状态写入次数对不上属于正常现象，只要任务在跑就没问题。'
+        }
     } else {
         Write-Host ("自检没有通过：{0} 秒内只自动触发了 {1} 次（预期至少 {2} 次）。" -f $VerifySeconds, $observedRuns, $minAutoRuns) -ForegroundColor Red
         Write-Host '请运行 Diagnose-CampusAutoLogin.ps1 生成诊断报告；常见原因是安全软件拦截，或计划任务服务被禁用。' -ForegroundColor Yellow
