@@ -380,6 +380,23 @@ Write-Host '========================================' -ForegroundColor Cyan
 Write-Host ("  主脚本  ：{0}" -f $ScriptPath)
 Write-Host ("  运行账号：{0}" -f $userId)
 Write-Host ("  检查间隔：每 {0} 秒" -f $IntervalSeconds)
+
+# 在线时的实际查询间隔由主脚本内部节流，这里只为提示用户
+$onlineInterval = 120
+if (Test-Path -LiteralPath $ConfigPath) {
+    try {
+        $onlineCfg = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -ne $onlineCfg.OnlineCheckIntervalSeconds) {
+            $onlineInterval = [int]$onlineCfg.OnlineCheckIntervalSeconds
+        }
+    } catch { }
+}
+if ($onlineInterval -gt 0) {
+    Write-Host ("  在线时查询：每 {0} 秒（掉线后按上面的触发间隔快速重试）" -f $onlineInterval)
+} else {
+    Write-Host '  在线时查询：每次触发都查询'
+}
+
 Write-Host ("  静默启动器：{0}" -f $launcherPath)
 Write-Host ''
 

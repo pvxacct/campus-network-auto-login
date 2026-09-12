@@ -41,10 +41,19 @@
     不向控制台输出（计划任务使用），仍然写日志与状态文件。
 
 .PARAMETER RetryCount
-    登录失败后的最大尝试次数，默认 3 次。
+    单次运行内登录失败后的最大尝试次数，默认 1 次（下一次检查就在 30 秒后，不必在一次运行里连打）。
 
 .PARAMETER RetryDelaySec
     每次重试之间的等待秒数，默认 8 秒。
+
+.PARAMETER OnlineIntervalSeconds
+    在线时的实际查询间隔（秒），默认读 drcom-config.json 的 OnlineCheckIntervalSeconds，缺省 120。
+    计划任务仍然每 30 秒触发，但脚本发现“上次确认在线、且还没到该间隔”时直接退出，不发任何请求。
+    用于减少无谓请求，避免 Portal 把高频查询当成异常；设为 0 表示每次触发都真的查询。
+
+.PARAMETER LoginHourlyLimit
+    最近 1 小时内最多发起多少次登录请求，默认读 drcom-config.json 的 LoginHourlyLimit，缺省 12。
+    超过上限时本次只跳过登录并记录日志，避免异常情况下反复撞 Portal 导致账号被风控；设为 0 表示不限制。
 
 .PARAMETER HeartbeatMinutes
     一切正常时日志的心跳间隔（分钟），默认 60；设为 0 表示不写心跳。
@@ -70,8 +79,10 @@ param(
     [switch]$Relogin,
     [switch]$Quiet,
     [int]$ReloginWaitSec = 5,
-    [int]$RetryCount = 3,
+    [int]$RetryCount = 1,
     [int]$RetryDelaySec = 8,
+    [int]$OnlineIntervalSeconds = -1,
+    [int]$LoginHourlyLimit = -1,
     [int]$HeartbeatMinutes = 60,
     [int]$StatusTimeoutSec = 8,
     [int]$LoginTimeoutSec = 15
@@ -80,7 +91,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:QuietMode = [bool]$Quiet
-$script:ScriptVersion = '1.1.0'
+$script:ScriptVersion = '1.3.0'
 
 # ===================== 路径解析 =====================
 $ScriptRoot = $PSScriptRoot
@@ -390,6 +401,26 @@ try {
         $IntervalSeconds = [int]$Config.CheckIntervalMinutes * 60
     }
 
+    # 在线时的实际查询间隔：计划任务照旧每 30 秒触发，由脚本自己决定要不要真的联网查询
+    if ($OnlineIntervalSeconds -lt 0) {
+        if ($null -ne $Config.OnlineCheckIntervalSeconds) {
+            $OnlineIntervalSeconds = [int]$Config.OnlineCheckIntervalSeconds
+        } else {
+            $OnlineIntervalSeconds = 120
+        }
+    }
+    if ($OnlineIntervalSeconds -lt 0) { $OnlineIntervalSeconds = 0 }
+
+    # 最近 1 小时内允许的登录请求次数上限，防止异常情况下把账号撞进风控
+    if ($LoginHourlyLimit -lt 0) {
+        if ($null -ne $Config.LoginHourlyLimit) {
+            $LoginHourlyLimit = [int]$Config.LoginHourlyLimit
+        } else {
+            $LoginHourlyLimit = 12
+        }
+    }
+    if ($LoginHourlyLimit -lt 0) { $LoginHourlyLimit = 0 }
+
     $StatusUrl = 'http://{0}{1}' -f $PortalHost, $StatusPath
     $LoginUrl  = 'http://{0}{1}' -f $PortalHost, $LoginPath
     $LogoutUrl = 'http://{0}{1}' -f $PortalHost, $LogoutPath
@@ -421,7 +452,19 @@ try {
 
     # ---------- 读取凭据与状态 ----------
     $state = Read-DrcomState
+
+    # 在线时降频：计划任务仍然每 30 秒触发，但上次刚确认过在线、又还没到间隔时，
+    # 本次直接静默退出，一个请求都不发（避免高频查询被 Portal 当成异常）。
+    if ((-not ($Force -or $Relogin)) -and $OnlineIntervalSeconds -gt 0) {
+        $lastProbe = Get-DrcomLastTime -State $state -Key 'LastProbe'
+        $lastResult = [string]$state['LastResult']
+        if ($lastProbe -and $lastResult -eq 'online') {
+            if (((Get-Date) - $lastProbe).TotalSeconds -lt $OnlineIntervalSeconds) { exit 0 }
+        }
+    }
+
     $state['RunCount'] = [int]$state['RunCount'] + 1
+    $state['LastProbe'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 
     if (-not (Test-Path -LiteralPath $CredentialPath)) {
         Write-Log "找不到凭据文件：$CredentialPath" 'ERROR'
@@ -506,7 +549,9 @@ try {
             Write-Log 'Portal 状态：已在线（连接已恢复）。'
             $state['LastHeartbeat'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         } elseif ($beatDue) {
-            Write-Log ("运行正常：Portal 在线（累计执行 {0} 次，检查间隔约 {1} 秒）。" -f $state['RunCount'], $IntervalSeconds)
+            $effectiveInterval = $IntervalSeconds
+            if ($OnlineIntervalSeconds -gt 0) { $effectiveInterval = $OnlineIntervalSeconds }
+            Write-Log ("运行正常：Portal 在线（累计执行 {0} 次，任务每 {1} 秒触发，在线时实际每 {2} 秒查询一次）。" -f $state['RunCount'], $IntervalSeconds, $effectiveInterval)
             $state['LastHeartbeat'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         }
 
@@ -532,6 +577,29 @@ try {
         Write-Log 'Portal 状态：已在线，但因为指定了 -Force / -Relogin，继续执行登录。' 'WARN'
     } else {
         Write-Log 'Portal 状态：未在线，开始自动登录。'
+    }
+
+    # 登录频率硬上限：任何异常情况下都不要反复撞 Portal，避免账号被风控
+    if ($LoginHourlyLimit -gt 0) {
+        $windowStart = Get-DrcomLastTime -State $state -Key 'LoginWindowStart'
+        $windowCount = 0
+        if ($state.ContainsKey('LoginWindowCount')) { $windowCount = [int]$state['LoginWindowCount'] }
+        if ((-not $windowStart) -or (((Get-Date) - $windowStart).TotalHours -ge 1)) {
+            $windowStart = Get-Date
+            $windowCount = 0
+        }
+        if ($windowCount -ge $LoginHourlyLimit) {
+            $waitMin = [int][Math]::Ceiling(60 - ((Get-Date) - $windowStart).TotalMinutes)
+            if ($waitMin -lt 1) { $waitMin = 1 }
+            Write-Log ("最近 1 小时已发起 {0} 次登录（上限 {1} 次），为避免账号被风控，本次不登录，约 {2} 分钟后自动恢复。" -f $windowCount, $LoginHourlyLimit, $waitMin) 'WARN'
+            $state['Online'] = $false
+            $state['LastResult'] = 'login-throttled'
+            $state['LastError'] = '触发登录频率上限，已主动跳过'
+            Save-DrcomState -State $state
+            exit 1
+        }
+        $state['LoginWindowStart'] = $windowStart.ToString('yyyy-MM-dd HH:mm:ss')
+        $state['LoginWindowCount'] = $windowCount + 1
     }
 
     $state['LastLoginAttempt'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')

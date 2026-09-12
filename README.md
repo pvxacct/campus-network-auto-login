@@ -21,6 +21,7 @@ Windows 下的校园网 Portal 自动登录工具。**每 30 秒**检查一次�
 - **错误翻译**：调用 Portal 的错误码接口，把 `userid error2` 之类的代码翻译成可读提示；
 - **一键安装 / 一键诊断**：双击 `一键安装.cmd` 即可完成；出问题跑一次诊断脚本生成报告。
 - **一键暂停 / 恢复**：双击 `暂停-校园网自动登录.cmd` 随时停掉自动检查，双击 `恢复-校园网自动登录.cmd` 一键恢复并立即检查一次。
+- **请求量可控**：在线时自动降频（默认每 120 秒才真的查询一次），掉线后仍然每 30 秒快速重试；登录请求还有每小时上限，避免账号被 Portal 风控。
 
 ## 工作原理
 
@@ -161,6 +162,8 @@ powershell -ExecutionPolicy Bypass -File .\Diagnose-CampusAutoLogin.ps1
 | `LogoutPath` | 注销路径，默认 `/drcom/logout` |
 | `ErrorPromptPath` | 错误码翻译接口路径 |
 | `CheckIntervalSeconds` | 计划任务检查间隔，默认 30 秒（改成 60 等数值后重新运行安装脚本） |
+| `OnlineCheckIntervalSeconds` | **在线时**的实际查询间隔，默认 120 秒；计划任务照旧每 30 秒触发，由脚本自己决定要不要真的联网查询。改成 `0` 表示每次触发都查询，改成 `300` 更省 |
+| `LoginHourlyLimit` | 最近 1 小时内最多发起多少次登录请求，默认 12 次；超过就跳过登录并等下一个小时窗口，防止账号被风控。改成 `0` 表示不限制 |
 | `StaticFields` | 登录时必须一起提交的固定字段 |
 
 ## 计划任务
@@ -176,6 +179,8 @@ powershell -ExecutionPolicy Bypass -File .\Diagnose-CampusAutoLogin.ps1
 | 电源策略 | 电池供电时也运行、不因为切换电源而停止、错过的触发会尽快补上 |
 
 > Windows 的任务计划管理器对触发器写法有两条硬性限制：重复间隔**最小 1 分钟**（写 `PT30S` 会直接注册失败），表示“无限期重复”时必须**省略 `<Duration>` 元素**（写 `PT0S` 或超大数值都会被判为 out of range）。所以安装脚本默认用 **两条各 1 分钟、彼此错开 30 秒的触发器**来实现 30 秒检查，并在安装时打印实际生效的间隔。如果某台机器连这种写法都不接受，脚本会自动降级（先补 30 天时长，再退化成每分钟一次），并把结果打印出来。
+
+> **注意：触发器频率 ≠ 实际请求频率。** 任务每 30 秒被唤起一次，但脚本会先看一眼状态文件：如果上次刚确认在线、又还没到 `OnlineCheckIntervalSeconds`（默认 120 秒），就直接退出，**一个请求都不发**。只有掉线、Portal 不可达、刚登录成功这几种情况才维持 30 秒快速检查。
 
 常用命令：
 
@@ -280,6 +285,15 @@ powershell -ExecutionPolicy Bypass -File .\CampusAutoLoginTaskState.ps1 -Action 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1
 ```
+
+### 8. 请求太多会不会被 Portal 风控
+
+现在有两道保险：
+
+- **在线时降频**：`OnlineCheckIntervalSeconds` 默认 120 秒。任务虽然每 30 秒被唤起一次，但脚本发现「上次刚确认在线、又没到间隔」就直接退出，**不发任何请求**。在线稳定时每天约 720 次查询（原先是 2880 次）；改成 `300` 就只剩约 288 次。
+- **登录请求限速**：`LoginHourlyLimit` 默认 12 次/小时，超过就跳过登录、等下一个小时窗口，日志里会写明原因。单次运行内也只登录 1 次（`-RetryCount` 默认 1），登录失败后按 2 → 30 分钟逐级退避。
+
+如果已经被风控，先双击 `暂停-校园网自动登录.cmd` 让脚本停下来，等账号恢复正常后，把 `drcom-config.json` 里的 `OnlineCheckIntervalSeconds` 调成 `300` 或更大再恢复。
 
 更多问题见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
 
