@@ -47,9 +47,10 @@
     每次重试之间的等待秒数，默认 8 秒。
 
 .PARAMETER OnlineIntervalSeconds
-    在线时的实际查询间隔（秒），默认读 drcom-config.json 的 OnlineCheckIntervalSeconds，缺省 120。
-    计划任务仍然每 30 秒触发，但脚本发现“上次确认在线、且还没到该间隔”时直接退出，不发任何请求。
-    用于减少无谓请求，避免 Portal 把高频查询当成异常；设为 0 表示每次触发都真的查询。
+    “已经能上网”时的兜底巡检间隔（秒），默认读 drcom-config.json 的 OnlineCheckIntervalSeconds，缺省 300。
+    平时脚本只用本地方式判断能不能上网（不发请求）：能上网就直接退出，连不上网才去查 Portal、必要时登录。
+    这个值决定“能上网时”每隔多久仍然去查一次 Portal，防止系统的联网状态判断滞后导致漏掉真正的掉线。
+    设为 0 表示能上网时完全不查（请求最少）；设为负数表示每次触发都查（旧行为）。
 
 .PARAMETER LoginHourlyLimit
     最近 1 小时内最多发起多少次登录请求，默认读 drcom-config.json 的 LoginHourlyLimit，缺省 12。
@@ -193,6 +194,49 @@ function Get-DrcomLastTime {
     $raw = [string]$State[$Key]
     if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
     try { return [datetime]::Parse($raw) } catch { return $null }
+}
+
+# ===================== 本地网络状态（不发任何请求） =====================
+function Test-LocalConnectivity {
+    <#
+      纯本地判断，不会向 Portal 或外网发出任何请求：
+        HasAdapter  = 是否有已连接的网络适配器
+        HasInternet = Windows 认为当前能否访问外网（能上网说明校园网会话正常）
+        Method      = 判断方式：nlm = 系统网络列表 COM；cim = Get-NetConnectionProfile；
+                      fallback = 都读不到，按“有网”处理（退化成 Portal 兜底巡检）
+    #>
+    $info = @{ HasAdapter = $true; HasInternet = $true; Method = 'nlm' }
+
+    try {
+        $info.HasAdapter = [bool][System.Net.NetworkInformation.NetworkInterface]::GetIsNetworkAvailable()
+    } catch {
+        $info.HasAdapter = $true
+    }
+
+    try {
+        $nlm = New-Object -ComObject Microsoft.Windows.NetworkListManager
+        $info.HasInternet = [bool]$nlm.IsConnectedToInternet
+        try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($nlm) } catch { }
+    } catch {
+        # 备用方案：网络连接配置文件里是否有 Internet 连通性
+        try {
+            $online = $false
+            foreach ($profile in (Get-NetConnectionProfile -ErrorAction Stop)) {
+                if ($profile.IPv4Connectivity -eq 'Internet' -or $profile.IPv6Connectivity -eq 'Internet') {
+                    $online = $true
+                    break
+                }
+            }
+            $info.HasInternet = $online
+            $info.Method = 'cim'
+        } catch {
+            # 实在判断不了就不要激进跳过，交给 Portal 兜底巡检
+            $info.HasInternet = $true
+            $info.Method = 'fallback'
+        }
+    }
+
+    return $info
 }
 
 # ===================== Portal 接口 =====================
@@ -401,15 +445,14 @@ try {
         $IntervalSeconds = [int]$Config.CheckIntervalMinutes * 60
     }
 
-    # 在线时的实际查询间隔：计划任务照旧每 30 秒触发，由脚本自己决定要不要真的联网查询
+    # 能上网时的兜底巡检间隔：平时靠本地网络状态判断，只有连不上网才真的去查 Portal
     if ($OnlineIntervalSeconds -lt 0) {
         if ($null -ne $Config.OnlineCheckIntervalSeconds) {
             $OnlineIntervalSeconds = [int]$Config.OnlineCheckIntervalSeconds
         } else {
-            $OnlineIntervalSeconds = 120
+            $OnlineIntervalSeconds = 300
         }
     }
-    if ($OnlineIntervalSeconds -lt 0) { $OnlineIntervalSeconds = 0 }
 
     # 最近 1 小时内允许的登录请求次数上限，防止异常情况下把账号撞进风控
     if ($LoginHourlyLimit -lt 0) {
@@ -453,14 +496,26 @@ try {
     # ---------- 读取凭据与状态 ----------
     $state = Read-DrcomState
 
-    # 在线时降频：计划任务仍然每 30 秒触发，但上次刚确认过在线、又还没到间隔时，
-    # 本次直接静默退出，一个请求都不发（避免高频查询被 Portal 当成异常）。
-    if ((-not ($Force -or $Relogin)) -and $OnlineIntervalSeconds -gt 0) {
+    # 触发闸门：计划任务仍然每 30 秒把脚本唤起，但会先在本地判断要不要真的动手。
+    #   1) 本机没有可用网络连接   -> 直接退出，不发任何请求；
+    #   2) Windows 认为现在能上网 -> 说明校园网会话正常，直接退出，不发任何请求
+    #      （除非到了兜底巡检时间，避免系统的联网状态判断滞后导致漏掉真正的掉线）；
+    #   3) 连不上网               -> 往下走，查 Portal，必要时自动登录。
+    if (-not ($Force -or $Relogin)) {
         $lastProbe = Get-DrcomLastTime -State $state -Key 'LastProbe'
-        $lastResult = [string]$state['LastResult']
-        if ($lastProbe -and $lastResult -eq 'online') {
-            if (((Get-Date) - $lastProbe).TotalSeconds -lt $OnlineIntervalSeconds) { exit 0 }
+
+        # 兜底巡检：OnlineIntervalSeconds = 0 表示有网时完全不查；>0 表示每 N 秒查一次；<0 表示每次触发都查
+        $probeDue = $true
+        if ($OnlineIntervalSeconds -eq 0) {
+            $probeDue = $false
+        } elseif (($OnlineIntervalSeconds -gt 0) -and $lastProbe) {
+            if (((Get-Date) - $lastProbe).TotalSeconds -lt $OnlineIntervalSeconds) { $probeDue = $false }
         }
+
+        $conn = Test-LocalConnectivity
+        $state['Connectivity'] = $conn.Method
+        if (-not $conn.HasAdapter) { exit 0 }
+        if ($conn.HasInternet -and -not $probeDue) { exit 0 }
     }
 
     $state['RunCount'] = [int]$state['RunCount'] + 1
@@ -525,7 +580,10 @@ try {
 
     # Portal 本身不可达（比如还没连上校园网）：不尝试登录，等下一次触发
     if (-not $status.Reachable) {
-        Write-Log "Portal 无法访问，本次不尝试登录：$($status.Error)" 'WARN'
+        # 只在“状态变化”时记一条，避免一直连不上网时每 30 秒刷屏
+        if ([string]$state['LastResult'] -ne 'unreachable') {
+            Write-Log "Portal 无法访问，本次不尝试登录：$($status.Error)" 'WARN'
+        }
         $state['Online'] = $false
         $state['LastResult'] = 'unreachable'
         $state['LastError'] = $status.Error
@@ -549,9 +607,14 @@ try {
             Write-Log 'Portal 状态：已在线（连接已恢复）。'
             $state['LastHeartbeat'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         } elseif ($beatDue) {
-            $effectiveInterval = $IntervalSeconds
-            if ($OnlineIntervalSeconds -gt 0) { $effectiveInterval = $OnlineIntervalSeconds }
-            Write-Log ("运行正常：Portal 在线（累计执行 {0} 次，任务每 {1} 秒触发，在线时实际每 {2} 秒查询一次）。" -f $state['RunCount'], $IntervalSeconds, $effectiveInterval)
+            if ($OnlineIntervalSeconds -gt 0) {
+                $probeText = ("能上网时每 {0} 秒兜底查询一次" -f $OnlineIntervalSeconds)
+            } elseif ($OnlineIntervalSeconds -eq 0) {
+                $probeText = '能上网时完全不查，只有连不上网络时才自动登录'
+            } else {
+                $probeText = ("每次触发都查询（每 {0} 秒）" -f $IntervalSeconds)
+            }
+            Write-Log ("运行正常：Portal 在线（累计执行 {0} 次；任务每 {1} 秒触发，{2}）。" -f $state['RunCount'], $IntervalSeconds, $probeText)
             $state['LastHeartbeat'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         }
 

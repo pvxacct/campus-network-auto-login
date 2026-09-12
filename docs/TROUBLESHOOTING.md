@@ -174,20 +174,34 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1 -Relogin
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `OnlineCheckIntervalSeconds` | `120` | **在线时**真正联网查询的间隔。任务照旧每 30 秒触发，但脚本发现上次刚确认在线、又没到间隔时直接退出，一个请求都不发 |
+| `OnlineCheckIntervalSeconds` | `300` | 能上网时的**兜底巡检**间隔。平时靠本地网络状态判断，只有连不上网才查 Portal；这个值决定“能上网时”多久仍然查一次。设 `0` = 能上网时完全不查 |
 | `LoginHourlyLimit` | `12` | 最近 1 小时允许的登录请求次数上限，超出就跳过登录 |
 
-被风控过的账号建议先放宽成 `OnlineCheckIntervalSeconds: 300`、`LoginHourlyLimit: 6`。改完保存即可，**不需要重新运行安装脚本**（这两个值由主脚本每次运行时读取）。
+被风控过的账号建议先放宽成 `OnlineCheckIntervalSeconds: 0`、`LoginHourlyLimit: 6`。改完保存即可，**不需要重新运行安装脚本**（这两个值由主脚本每次运行时读取）。
 
 对比一下查询量：
 
 | `OnlineCheckIntervalSeconds` | 在线稳定时每天查询次数 |
 | --- | --- |
 | `30`（v1.2.0 及更早的行为） | 约 2880 次 |
-| `120`（当前默认） | 约 720 次 |
-| `300` | 约 288 次 |
+| `120`（v1.3.0 的行为） | 约 720 次 |
+| `300`（当前默认） | 约 288 次 |
+| `0` | 能上网时 **0 次**，只有断网才请求 |
 
-注意：**掉线后仍然是每 30 秒快速重试**，降频只作用于“已经在线”的平静期，所以自动重连速度不受影响。
+注意：**只要检测到连不上网，就会立刻去查 Portal 并登录**（每 30 秒重试一次，受 `LoginHourlyLimit` 限制），所以自动重连速度不受影响。
+
+## 脚本好像“不工作了”（不登录了）
+
+从 v1.4.0 起脚本改成“**连不上网才动手**”，所以如果当前能正常上网，脚本本来就什么都不做、也不会写日志——这是预期行为。
+
+想确认它到底有没有在工作，打开 `%LOCALAPPDATA%\CampusAutoLogin\state.json` 看两个字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `LastProbe` | 最近一次真的去查 Portal 的时间 |
+| `Connectivity` | 判断“能不能上网”用的是哪种方式：`nlm`（系统网络列表，正常）、`cim`（网络连接配置文件，正常）、`fallback`（两种都读不到，退化成都市按“有网”处理 + 兜底巡检） |
+
+如果 `Connectivity` 长时间是 `fallback`，说明这台机器读不到系统联网状态，脚本会退化成“每 `OnlineCheckIntervalSeconds` 秒查一次 Portal”，功能仍然正常，只是请求多一些。这种情况可以把该值设小一点，或者运行 `Diagnose-CampusAutoLogin.ps1` 看详细报告。
 
 ## 凭据无法解密
 

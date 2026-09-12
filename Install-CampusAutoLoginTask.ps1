@@ -381,8 +381,8 @@ Write-Host ("  主脚本  ：{0}" -f $ScriptPath)
 Write-Host ("  运行账号：{0}" -f $userId)
 Write-Host ("  检查间隔：每 {0} 秒" -f $IntervalSeconds)
 
-# 在线时的实际查询间隔由主脚本内部节流，这里只为提示用户
-$onlineInterval = 120
+# “能上网时”的兜底巡检间隔由主脚本内部判断，这里只为提示用户
+$onlineInterval = 300
 if (Test-Path -LiteralPath $ConfigPath) {
     try {
         $onlineCfg = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -392,9 +392,11 @@ if (Test-Path -LiteralPath $ConfigPath) {
     } catch { }
 }
 if ($onlineInterval -gt 0) {
-    Write-Host ("  在线时查询：每 {0} 秒（掉线后按上面的触发间隔快速重试）" -f $onlineInterval)
+    Write-Host ("  触发条件：连不上网时自动登录；能上网时每 {0} 秒兜底查一次" -f $onlineInterval)
+} elseif ($onlineInterval -eq 0) {
+    Write-Host '  触发条件：连不上网时自动登录；能上网时完全不查询'
 } else {
-    Write-Host '  在线时查询：每次触发都查询'
+    Write-Host '  触发条件：每次触发都查询（未启用本地网络状态判断）'
 }
 
 Write-Host ("  静默启动器：{0}" -f $launcherPath)

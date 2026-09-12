@@ -6,7 +6,7 @@
   "LogoutPath": "/drcom/logout",
   "ErrorPromptPath": "/eportal/portal/err_code/loadErrorPrompt",
   "CheckIntervalSeconds": 30,
-  "OnlineCheckIntervalSeconds": 120,
+  "OnlineCheckIntervalSeconds": 300,
   "LoginHourlyLimit": 12,
   "UserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   "StaticFields": {
