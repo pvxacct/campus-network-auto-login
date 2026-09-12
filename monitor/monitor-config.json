@@ -1,0 +1,8 @@
+{
+  "RefreshSeconds": 5,
+  "StatsWindowHours": 24,
+  "PortalHost": "",
+  "StatusPath": "/drcom/chkstatus",
+  "StatusTimeoutSec": 8,
+  "DataDir": ""
+}

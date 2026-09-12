@@ -43,8 +43,20 @@ jobs:
           mkdir -p dist
           zip="dist/campus-network-auto-login-$tag.zip"
           git -c core.autocrlf=true archive --format=zip --prefix="campus-network-auto-login-$tag/" -o "$zip" "$tag" -- . ':(exclude).github'
+          # 监控面板：单独打包，解压后第一层直接就是面板自己的文件（外加 LICENSE）
+          staging="$(mktemp -d)"
+          git -c core.autocrlf=true archive --format=zip -o "$staging/panel.zip" "$tag" -- monitor LICENSE
+          (
+            cd "$staging"
+            unzip -q panel.zip
+            mv monitor/* .
+            rmdir monitor
+            rm -f panel.zip
+            zip -q -r "$GITHUB_WORKSPACE/dist/campus-network-monitor-$tag.zip" .
+          )
+          rm -rf "$staging"
           ls -l dist
-          sha256sum "$zip"
+          sha256sum dist/*.zip
 
       - name: Publish release
         env:
@@ -57,6 +69,7 @@ jobs:
           if [ -z "$tag" ]; then tag="$(git describe --tags --abbrev=0)"; fi
           ver="${tag#v}"
           zip="dist/campus-network-auto-login-$tag.zip"
+          panel_zip="dist/campus-network-monitor-$tag.zip"
           echo "tag=$tag"
 
           create_flags=(--latest)
@@ -80,5 +93,5 @@ jobs:
             gh release create "$tag" --title "$title" --verify-tag "${create_flags[@]}" "${notes[@]}"
           fi
 
-          gh release upload "$tag" "$zip" --clobber
+          gh release upload "$tag" "$zip" "$panel_zip" --clobber
           gh release view "$tag" --json tagName,name,isPrerelease,url,assets

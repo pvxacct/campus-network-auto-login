@@ -152,6 +152,22 @@ powershell -ExecutionPolicy Bypass -File .\Diagnose-CampusAutoLogin.ps1
 它会检查运行环境、Portal 连通性、凭据、日志、计划任务、隐藏启动器，并把结果保存成
 `%LOCALAPPDATA%\CampusAutoLogin\diagnose-<时间>.txt`。
 
+## 监控面板（可选）
+
+不想每次都去翻 `state.json` 和日志？下载 Release 里的 **`campus-network-monitor-<版本>.zip`**，解压后双击
+**`启动监控面板.vbs`**，就会打开一个小窗口，把所有状态一眼看完：
+
+- **顶部横幅**用颜色直接给结论：绿＝正常在线，黄＝正在重连，橙＝冷却中（限流/重复认证冲突），红＝凭据问题或脚本没在跑；
+- **指标区**显示最近触发时间、最近真实查询、在线状态、连续失败次数、冷却到点与原因、计划任务状态与返回码、下次运行时间、已安装脚本版本（低于 1.5.1 会标黄提示升级）；
+- **路径体检**顺着「计划任务 → 隐藏启动器 → 主脚本」逐个检查，任意一环的文件或起始目录不见了，就会红字提示**僵尸任务（返回码 0x8007010B）**——上次 D 盘目录被删掉的那种故障，一眼可见；
+- **日志区**显示 `login.log` 最近 200 行，警告橙色、错误红色，可勾选「只看警告和错误」；
+- **按钮**：立即检查一次（只发一次状态查询，不登录、不写文件）、刷新、打开数据目录、复制诊断信息、关闭。
+
+面板**只读**：不写任何文件、不注册任务、不常驻托盘；只有你手动点「立即检查一次」时才会向 Portal 发一次
+`chkstatus` 查询。它打包在单独的 zip 里，和自动登录包互不依赖，可以放在任意目录。
+
+详细说明见 [`monitor/README.md`](monitor/README.md)。
+
 ## 配置说明
 
 `drcom-config.json`：
@@ -240,6 +256,12 @@ powershell -ExecutionPolicy Bypass -File .\CampusAutoLoginTaskState.ps1 -Action 
 ├── CampusAutoLoginTaskState.ps1        # 暂停 / 恢复 / 查看状态的实现
 ├── drcom-config.json                   # Portal 配置
 ├── CHANGELOG.md                        # 更新日志
+├── monitor/                            # 只读监控面板（单独打包，见下面「监控面板」）
+│   ├── CampusNetworkMonitor.ps1        # 面板本体（WinForms，零依赖）
+│   ├── 启动监控面板.vbs                 # 双击启动（完全无黑框，推荐）
+│   ├── 启动监控面板.cmd                 # 双击启动（留一个命令行窗口）
+│   ├── monitor-config.json             # 面板配置（可选）
+│   └── README.md                       # 面板使用说明
 ├── docs/
 │   ├── DRCOM-PROTOCOL.md               # 抓包与协议说明
 │   └── TROUBLESHOOTING.md              # 常见问题
@@ -368,7 +390,7 @@ powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1 -Scri
 
 ## 更新日志
 
-各版本的改动记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本：**1.5.1**（2026-09-12）。
+各版本的改动记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本：**1.6.0**（2026-09-12）。
 
 ## License
 
