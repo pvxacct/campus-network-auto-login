@@ -215,3 +215,26 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall-CampusAutoLoginTask.ps1 -Re
 
 不加 `-RemoveData` 时只删除计划任务和隐藏启动器，凭据、日志、状态文件会保留。
 
+## 如何临时暂停 / 恢复自动登录
+
+不需要卸载，也不用手动敲命令，双击两个 `.cmd` 就行：
+
+| 双击这个文件 | 作用 |
+| --- | --- |
+| `暂停-校园网自动登录.cmd` | 计划任务变成“已禁用”，不再自动检查、不再自动登录 |
+| `恢复-校园网自动登录.cmd` | 重新启用，并立刻触发一次检查（掉线会马上登录） |
+
+两个文件都会自动弹出 UAC 授权窗口，点“是”即可。暂停后账号密码（DPAPI 加密）、日志、状态文件全部原样保留，随时可以恢复。
+
+命令行等效写法（暂停 / 恢复需要管理员权限，查看状态不需要）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\CampusAutoLoginTaskState.ps1 -Action Status   # 看当前状态
+powershell -ExecutionPolicy Bypass -File .\CampusAutoLoginTaskState.ps1 -Action Pause    # 暂停
+powershell -ExecutionPolicy Bypass -File .\CampusAutoLoginTaskState.ps1 -Action Resume   # 恢复
+```
+
+图形界面等效操作：任务计划程序（`taskschd.msc`）里找到 `CampusAutoLogin`，右键 → “禁用” / “启用”。
+
+如果双击后提示“没有找到计划任务”，说明本机还没有安装，先运行一次 `一键安装.cmd`。
+

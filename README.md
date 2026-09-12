@@ -20,6 +20,7 @@ Windows 下的校园网 Portal 自动登录工具。**每 30 秒**检查一次�
 - **可观测**：每次运行都会写入 `state.json`（运行次数、当前状态、最近结果），一眼就能看出脚本有没有在跑；
 - **错误翻译**：调用 Portal 的错误码接口，把 `userid error2` 之类的代码翻译成可读提示；
 - **一键安装 / 一键诊断**：双击 `一键安装.cmd` 即可完成；出问题跑一次诊断脚本生成报告。
+- **一键暂停 / 恢复**：双击 `暂停-校园网自动登录.cmd` 随时停掉自动检查，双击 `恢复-校园网自动登录.cmd` 一键恢复并立即检查一次。
 
 ## 工作原理
 
@@ -185,6 +186,27 @@ Get-ScheduledTask -TaskName CampusAutoLogin | Select-Object -ExpandProperty Trig
 Unregister-ScheduledTask -TaskName CampusAutoLogin -Confirm:$false
 ```
 
+### 暂停 / 恢复
+
+不想让脚本继续跑（例如回家、换网络、想手动登录）时，直接双击：
+
+| 双击这个文件 | 作用 |
+| --- | --- |
+| `暂停-校园网自动登录.cmd` | 暂停：计划任务变成“已禁用”，不再自动检查、不再自动登录 |
+| `恢复-校园网自动登录.cmd` | 恢复：重新启用，并立刻触发一次检查（掉线会马上登录） |
+
+两个文件都会自动弹出 UAC 授权窗口，点“是”即可，不需要手动开管理员 PowerShell。
+
+暂停只是把计划任务禁用，**账号密码（DPAPI 加密）、日志、状态文件全部原样保留**，随时可以恢复；想彻底删除请用 `Uninstall-CampusAutoLoginTask.ps1`。
+
+也可以直接看当前状态（不需要管理员权限）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\CampusAutoLoginTaskState.ps1 -Action Status
+```
+
+图形界面等效操作：打开“任务计划程序”，右键 `CampusAutoLogin` → “禁用” / “启用”。
+
 ## 目录结构
 
 ```text
@@ -196,6 +218,9 @@ Unregister-ScheduledTask -TaskName CampusAutoLogin -Confirm:$false
 ├── Install-CampusAutoLoginTask.ps1     # 注册计划任务（每 30 秒、自检）
 ├── Uninstall-CampusAutoLoginTask.ps1   # 卸载计划任务
 ├── Diagnose-CampusAutoLogin.ps1        # 生成诊断报告
+├── 暂停-校园网自动登录.cmd              # 双击暂停（自动申请管理员权限）
+├── 恢复-校园网自动登录.cmd              # 双击恢复（自动申请管理员权限）
+├── CampusAutoLoginTaskState.ps1        # 暂停 / 恢复 / 查看状态的实现
 ├── drcom-config.json                   # Portal 配置
 ├── CHANGELOG.md                        # 更新日志
 ├── docs/
