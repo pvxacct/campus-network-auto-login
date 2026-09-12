@@ -8,6 +8,9 @@
   "CheckIntervalSeconds": 30,
   "OnlineCheckIntervalSeconds": 300,
   "LoginHourlyLimit": 12,
+  "LoginConfirmDelaySec": 3,
+  "LoginMinIntervalSeconds": 60,
+  "LoginCooldownMinutes": 30,
   "UserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   "StaticFields": {
     "0MKKey": "123456",

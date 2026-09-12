@@ -399,6 +399,19 @@ if ($onlineInterval -gt 0) {
     Write-Host '  触发条件：每次触发都查询（未启用本地网络状态判断）'
 }
 
+$confirmDelay = 3
+$minInterval = 60
+$cooldownMin = 30
+if (Test-Path -LiteralPath $ConfigPath) {
+    try {
+        $guardCfg = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -ne $guardCfg.LoginConfirmDelaySec)  { $confirmDelay = [int]$guardCfg.LoginConfirmDelaySec }
+        if ($null -ne $guardCfg.LoginMinIntervalSeconds) { $minInterval = [int]$guardCfg.LoginMinIntervalSeconds }
+        if ($null -ne $guardCfg.LoginCooldownMinutes) { $cooldownMin = [int]$guardCfg.LoginCooldownMinutes }
+    } catch { }
+}
+Write-Host ("  登录保险：二次确认 {0} 秒 / 两次登录至少间隔 {1} 秒 / 限流或冲突冷却 {2} 分钟" -f $confirmDelay, $minInterval, $cooldownMin)
+
 Write-Host ("  静默启动器：{0}" -f $launcherPath)
 Write-Host ''
 

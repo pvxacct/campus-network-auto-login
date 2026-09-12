@@ -153,8 +153,55 @@ if (Test-Path -LiteralPath $logPath) {
 }
 Add-Line ''
 
-# ---------- 5. 计划任务 ----------
-Add-Line '【5】计划任务'
+# ---------- 5. 触发闸门与冷却 ----------
+Add-Line '【5】触发闸门与冷却'
+
+try {
+    $nlm = New-Object -ComObject Microsoft.Windows.NetworkListManager
+    $onlineNow = [bool]$nlm.IsConnectedToInternet
+    try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($nlm) } catch { }
+    Add-Line ("  现在能否上网：{0}" -f $(if ($onlineNow) { '能（脚本会跳过 Portal 查询，只做兜底巡检）' } else { '不能（脚本会去查 Portal 并自动登录）' }))
+} catch {
+    Add-Line '  现在能否上网：读不到系统状态（会退化成都市按“有网”处理 + 兜底巡检）'
+}
+
+$gateState = $null
+if (Test-Path -LiteralPath $statePath) {
+    try { $gateState = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+}
+
+if ($gateState) {
+    $methodText = [string]$gateState.Connectivity
+    switch ($methodText) {
+        'nlm'      { $methodText = 'nlm（系统网络列表 COM，正常）' }
+        'cim'      { $methodText = 'cim（Get-NetConnectionProfile，正常）' }
+        'fallback' { $methodText = 'fallback（读不到系统联网状态，退化为按兜底间隔查询）' }
+        ''         { $methodText = '（还没记录）' }
+    }
+    Add-Line ("  本地联网判断：{0}" -f $methodText)
+    if ($gateState.LastProbe)  { Add-Line ("  最近一次真实查询：{0}" -f $gateState.LastProbe) }
+    if ($gateState.LastResult) { Add-Line ("  最近一次结果：{0}" -f $gateState.LastResult) }
+    if ($gateState.ConsecutiveFailures) { Add-Line ("  连续失败次数：{0}" -f $gateState.ConsecutiveFailures) }
+
+    $cooldownUntil = $null
+    if ($gateState.CooldownUntil) {
+        try { $cooldownUntil = [datetime]::Parse([string]$gateState.CooldownUntil) } catch { }
+    }
+    if ($cooldownUntil -and $cooldownUntil -gt (Get-Date)) {
+        $leftMin = [int][Math]::Ceiling(($cooldownUntil - (Get-Date)).TotalMinutes)
+        Add-Line ("  冷却中：是（{0}），约 {1} 分钟后恢复" -f $gateState.CooldownReason, $leftMin)
+    } elseif ($cooldownUntil) {
+        Add-Line ("  冷却中：否（上次原因：{0}，已于 {1} 结束）" -f $gateState.CooldownReason, $gateState.CooldownUntil)
+    } else {
+        Add-Line '  冷却中：否'
+    }
+} else {
+    Add-Line '  还没有 state.json，无法判断闸门与冷却状态。'
+}
+Add-Line ''
+
+# ---------- 6. 计划任务 ----------
+Add-Line '【6】计划任务'
 
 function ConvertTo-DurationSeconds {
     param($Value)
@@ -235,7 +282,7 @@ try {
 Add-Line ''
 
 # ---------- 6. 隐藏启动器 ----------
-Add-Line '【6】隐藏启动器'
+Add-Line '【7】隐藏启动器'
 $launcherPath = Join-Path $DataDir 'run-hidden.vbs'
 if (Test-Path -LiteralPath $launcherPath) {
     Add-Line ("  存在：{0}" -f $launcherPath)

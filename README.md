@@ -22,6 +22,7 @@ Windows 下的校园网 Portal 自动登录工具。**每 30 秒**检查一次�
 - **一键安装 / 一键诊断**：双击 `一键安装.cmd` 即可完成；出问题跑一次诊断脚本生成报告。
 - **一键暂停 / 恢复**：双击 `暂停-校园网自动登录.cmd` 随时停掉自动检查，双击 `恢复-校园网自动登录.cmd` 一键恢复并立即检查一次。
 - **断网才触发**：平时只用本地方式判断能不能上网（**不发任何请求**），发现连不上网才去查 Portal、自动登录；登录请求还有每小时上限，避免账号被 Portal 风控。
+- **登录侧保险**：登录前二次确认、两次登录至少间隔 60 秒、遇到限流或「账号已在线」冲突立刻冷却 30 分钟——不会因为一次误判就把你正在用的会话顶掉。
 
 ## 工作原理
 
@@ -166,6 +167,9 @@ powershell -ExecutionPolicy Bypass -File .\Diagnose-CampusAutoLogin.ps1
 | `CheckIntervalSeconds` | 计划任务检查间隔，默认 30 秒（改成 60 等数值后重新运行安装脚本） |
 | `OnlineCheckIntervalSeconds` | 能上网时的**兜底巡检**间隔，默认 300 秒。平时脚本靠本地网络状态判断，只有连不上网才会去查 Portal；这个值决定“能上网时”每隔多久仍然查一次，防止系统联网状态判断滞后。设 `0` = 能上网时完全不查（请求最少），设负数 = 每次触发都查 |
 | `LoginHourlyLimit` | 最近 1 小时内最多发起多少次登录请求，默认 12 次；超过就跳过登录并等下一个小时窗口，防止账号被风控。改成 `0` 表示不限制 |
+| `LoginConfirmDelaySec` | 判定“离线”后先等几秒再复检，**两次都离线才登录**，默认 3 秒。避免抓到瞬时/陈旧的离线结果就把正在使用的会话顶掉 |
+| `LoginMinIntervalSeconds` | 两次登录请求之间的硬性最小间隔，默认 60 秒。网络抖动、开机触发、网络变化事件连续触发时也不会连打登录 |
+| `LoginCooldownMinutes` | Portal 明确限流（`error5 waitsec` / `Error code 205`）或「账号已在别处在线」冲突后的冷却时长，默认 30 分钟；冷却期间只查状态、不登录 |
 | `StaticFields` | 登录时必须一起提交的固定字段 |
 
 ## 计划任务
@@ -300,8 +304,12 @@ powershell -ExecutionPolicy Bypass -File .\DrcomAutoLogin.ps1
 
 - **断网才触发**：脚本每次先用**纯本地**方式判断能不能上网（读 Windows 网络状态，不发请求）。能上网就直接退出，连不上网才去查 Portal。能上网时只剩兜底巡检，默认 `OnlineCheckIntervalSeconds: 300`，约 288 次/天；改成 `0` 可以做到**能上网时一次都不查**。
 - **登录请求限速**：`LoginHourlyLimit` 默认 12 次/小时，超过就跳过登录、等下一个小时窗口，日志里会写明原因。单次运行内也只登录 1 次（`-RetryCount` 默认 1），登录失败后按 2 → 30 分钟逐级退避。
+- **登录前三道闸门**：先做一次“等 3 秒再复检”的二次确认（两次都离线才登录），再检查 60 秒最小登录间隔，最后检查每小时次数上限；任一道没过都不会发登录请求。
+- **撞上限流就长冷却**：Portal 一旦明确说“太频繁”（`error5 waitsec` / `Error code 205`），或返回“账号已在别处在线”而本机复检仍不在线，脚本会立刻进入 30 分钟冷却，期间只查询状态、绝不再登录——这正是会把正在使用的会话顶掉的场景。
 
 如果已经被风控，先双击 `暂停-校园网自动登录.cmd` 让脚本停下来，等账号恢复正常后，把 `drcom-config.json` 里的 `OnlineCheckIntervalSeconds` 调成 `300` 或更大再恢复。
+
+如果症状是**被踢下线**（而不是提示“太频繁”），那多半是脚本在瞬时判离线时又提交了一次登录，把正在使用的会话顶掉了。v1.5.0 之后的默认值已经防住这种情况：`LoginConfirmDelaySec`（二次确认）、`LoginMinIntervalSeconds`（最小登录间隔）、`LoginCooldownMinutes`（限流/冲突冷却）。真要更保守，可以把 `LoginMinIntervalSeconds` 调到 `180`、`LoginCooldownMinutes` 调到 `60`。
 
 更多问题见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)。
 
