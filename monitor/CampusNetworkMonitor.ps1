@@ -37,8 +37,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$script:MonitorVersion = '1.0.0'
-$script:ExpectedAssistVersion = '1.6.0'
+$script:MonitorVersion = '1.0.1'
+$script:ExpectedAssistVersion = '1.6.1'
 $script:TaskName = 'CampusAutoLogin'
 
 $ScriptRoot = $PSScriptRoot
@@ -130,6 +130,7 @@ function Read-StateFile {
         Data          = $null
         Raw           = ''
         Error         = ''
+        Denied        = $false
         LastWriteTime = $null
     }
 
@@ -143,6 +144,27 @@ function Read-StateFile {
         $result.Ok = $true
     } catch {
         $result.Error = $_.Exception.Message
+        $inner = $_.Exception
+        while ($null -ne $inner) {
+            if ($inner -is [System.UnauthorizedAccessException]) { $result.Denied = $true; break }
+            $inner = $inner.InnerException
+        }
+    }
+    return $result
+}
+
+function Get-DataDirAccess {
+    param([string]$DataDir)
+
+    $result = [ordered]@{ Exists = $false; Readable = $false; Denied = $false; Error = '' }
+    if (-not (Test-PathSafe $DataDir)) { return $result }
+    $result.Exists = $true
+    try {
+        [void][System.IO.Directory]::GetFileSystemEntries($DataDir)
+        $result.Readable = $true
+    } catch {
+        $result.Error = $_.Exception.Message
+        $result.Denied = $true
     }
     return $result
 }
@@ -581,6 +603,7 @@ function Get-MonitorSnapshot {
     $now = Get-Date
     $statePath = Join-Path $DataDir 'state.json'
     $stateInfo = Read-StateFile -Path $statePath
+    $dirAccess = Get-DataDirAccess -DataDir $DataDir
     $state = $stateInfo.Data
     $lastResult = ConvertTo-Text (Get-StateValue $state 'LastResult')
     $cooldown = Get-CooldownInfo $state
@@ -613,8 +636,14 @@ function Get-MonitorSnapshot {
 
     # ---- 顶部横幅：按优先级取第一条命中 ----
     $banner = [ordered]@{ Kind = 'gray'; Color = '#666666'; Text = '' }
-    if (-not $stateInfo.Exists) {
+    if ($dirAccess.Denied -or $stateInfo.Denied) {
+        $banner.Kind = 'red'; $banner.Color = '#C00000'
+        $banner.Text = '读不到数据目录（权限不足）：请用安装自动登录时的那个 Windows 用户打开面板，不要换用户或换权限运行。'
+    } elseif (-not $stateInfo.Exists -and -not $dirAccess.Exists) {
         $banner.Text = '未检测到自动登录：还没有生成 state.json，自动登录可能没装或被删掉了。'
+    } elseif (-not $stateInfo.Exists) {
+        $banner.Kind = 'red'; $banner.Color = '#C00000'
+        $banner.Text = '数据目录里没有 state.json：自动登录可能没装好，或者计划任务从未成功运行过。'
     } elseif (-not $stateInfo.Ok) {
         $banner.Kind = 'red'; $banner.Color = '#C00000'
         $banner.Text = ('state.json 损坏，读不出内容：{0}' -f $stateInfo.Error)
