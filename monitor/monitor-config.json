@@ -10,5 +10,7 @@
   "PingTimeoutMs": 1000,
   "PingTargets": "gateway,portal",
   "LatencySamples": 10,
-  "NetworkInfoSeconds": 20
+  "NetworkInfoSeconds": 20,
+  "SparklinePoints": 60,
+  "TimelinePoints": 60
 }

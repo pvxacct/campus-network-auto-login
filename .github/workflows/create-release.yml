@@ -74,7 +74,10 @@ jobs:
 
           create_flags=(--latest)
           edit_flags=(--prerelease=false --latest)
-          if [ "${INPUT_PRERELEASE:-}" = "true" ]; then
+          # 标签名里带 “-”（例如 v1.8.0-pre.1）自动按预发布处理；手动运行时的勾选框优先
+          prerelease="${INPUT_PRERELEASE:-}"
+          if [ -z "$prerelease" ] && [[ "$tag" == *-* ]]; then prerelease=true; fi
+          if [ "$prerelease" = "true" ]; then
             create_flags=(--prerelease)
             edit_flags=(--prerelease)
           fi

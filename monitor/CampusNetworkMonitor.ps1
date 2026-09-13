@@ -1,13 +1,16 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    校园网自动登录 - 只读监控面板（Windows 桌面窗口）。
+    校园网自动登录 - 只读监控面板（Windows 桌面窗口，WPF 浅色现代界面）。
 
 .DESCRIPTION
     配合 campus-network-auto-login 使用，但完全独立运行：
       * 只读取 state.json、login.log 与计划任务状态；
       * 不创建、不修改任何文件；
       * 除了手动点击“立即检查一次”，不发出任何网络请求。
+
+    界面用 WPF（Windows Presentation Foundation）绘制：圆角卡片、自绘标题栏、
+    延迟迷你折线图与连通状态时间线。图表数据只存在内存里，退出即消失。
 
 .PARAMETER DataDir
     数据目录，默认 %LOCALAPPDATA%\CampusAutoLogin。
@@ -19,7 +22,7 @@
     不打开窗口，把当前状态打印到控制台后退出（供自动化测试使用）。
 
 .PARAMETER SelfTest
-    构建窗口、刷新一次后立即退出（GUI 冒烟测试）。
+    构建窗口、刷新一次后立即退出（GUI 冒烟测试，需要以 -STA 运行）。
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\CampusNetworkMonitor.ps1
@@ -37,8 +40,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$script:MonitorVersion = '1.1.0'
-$script:ExpectedAssistVersion = '1.7.0'
+$script:MonitorVersion = '2.0.0'
+$script:ExpectedAssistVersion = '1.8.0'
 $script:TaskName = 'CampusAutoLogin'
 
 $ScriptRoot = $PSScriptRoot
@@ -61,6 +64,8 @@ $script:Settings = [ordered]@{
     PingTargets         = 'gateway,portal'
     LatencySamples      = 10
     NetworkInfoSeconds  = 20
+    SparklinePoints     = 60
+    TimelinePoints      = 60
 }
 
 if ([string]::IsNullOrEmpty($ConfigPath)) {
@@ -1268,7 +1273,7 @@ if ($DumpOnce) {
     exit 0
 }
 
-# WinForms 需要 STA 线程：PowerShell 7 默认是 MTA，这时用 Windows PowerShell 5.1 重新拉起自己
+# WPF 需要 STA 线程：PowerShell 7 默认是 MTA，这时用 Windows PowerShell 5.1 重新拉起自己
 if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
     $argLine = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $MyInvocation.MyCommand.Path
     if (-not [string]::IsNullOrWhiteSpace($DataDir)) { $argLine += (' -DataDir "{0}"' -f $DataDir) }
@@ -1280,258 +1285,789 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Thr
     exit 0
 }
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-[System.Windows.Forms.Application]::EnableVisualStyles()
+# ===================== WPF 初始化 =====================
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+
+# 高分屏下文字更清晰；窗口圆角交给桌面窗口管理器（拿不到就按系统默认来）
+if (-not ('CampusPanel.Native' -as [type])) {
+    try {
+        Add-Type -Namespace CampusPanel -Name Native -MemberDefinition '
+        [DllImport("user32.dll")]
+        public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+' -ErrorAction Stop
+    } catch { }
+}
+try { [void][CampusPanel.Native]::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch { }
+
+# ---- 浅色主题配色 ----
+$script:StatusStyle = @{
+    gray   = @{ Bg = '#F3F4F6'; Border = '#E5E7EB'; Text = '#4B5563'; Dot = '#9CA3AF' }
+    green  = @{ Bg = '#ECFDF5'; Border = '#A7F3D0'; Text = '#047857'; Dot = '#16A34A' }
+    yellow = @{ Bg = '#FFFBEB'; Border = '#FDE68A'; Text = '#B45309'; Dot = '#D97706' }
+    orange = @{ Bg = '#FFF7ED'; Border = '#FED7AA'; Text = '#C2410C'; Dot = '#EA580C' }
+    red    = @{ Bg = '#FEF2F2'; Border = '#FECACA'; Text = '#B91C1C'; Dot = '#DC2626' }
+}
+$script:SeriesColor = @{ '网关' = '#2563EB'; 'Portal' = '#7C3AED' }
+$script:GroupTitle = @{
+    '运行' = '运行状态'
+    '任务' = '计划任务与路径体检'
+    '网络' = '网络'
+    '数据' = '数据与统计'
+}
+$script:BrushCache = @{}
+
+function Get-Brush {
+    param([string]$Value, [string]$Fallback = '#6B7280')
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { $Value = $Fallback }
+    if ($script:BrushCache.ContainsKey($Value)) { return $script:BrushCache[$Value] }
+    $brush = $null
+    try { $brush = [System.Windows.Media.BrushConverter]::new().ConvertFromString($Value) } catch { $brush = $null }
+    if ($null -eq $brush) { $brush = [System.Windows.Media.Brushes]::Gray }
+    $script:BrushCache[$Value] = $brush
+    return $brush
+}
+
+function Get-StatusStyle {
+    param($Kind)
+
+    $key = [string]$Kind
+    if ([string]::IsNullOrWhiteSpace($key) -or -not $script:StatusStyle.ContainsKey($key)) { $key = 'gray' }
+    return $script:StatusStyle[$key]
+}
+
+# ---- 界面：内嵌 XAML（浅色现代风，零第三方依赖）----
+$script:XamlHead = '
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="校园网监控面板"
+        Width="1160" Height="840" MinWidth="900" MinHeight="620"
+        WindowStartupLocation="CenterScreen" WindowStyle="None" ResizeMode="CanResize"
+        UseLayoutRounding="True" SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display"
+        Background="#F5F6F8"
+        FontFamily="Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI">
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="0" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
+    <Window.Resources>
+        <Style x:Key="BaseButton" TargetType="Button">
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="MinWidth" Value="84"/>
+            <Setter Property="Padding" Value="14,0"/>
+            <Setter Property="Margin" Value="0,0,8,0"/>
+            <Setter Property="FontSize" Value="12.5"/>
+            <Setter Property="Foreground" Value="#374151"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="BorderBrush" Value="#D1D5DB"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" CornerRadius="8" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#F3F4F6"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#E5E7EB"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="PrimaryButton" TargetType="Button">
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="MinWidth" Value="84"/>
+            <Setter Property="Padding" Value="14,0"/>
+            <Setter Property="Margin" Value="0,0,8,0"/>
+            <Setter Property="FontSize" Value="12.5"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="Background" Value="#2563EB"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" CornerRadius="8" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#1D4ED8"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#1E40AF"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="IconButton" TargetType="Button">
+            <Setter Property="Width" Value="40"/>
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="Margin" Value="0"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Foreground" Value="#6B7280"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" CornerRadius="6" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#F3F4F6"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+'
+
+$script:XamlTail = '
+    <Border x:Name="RootBorder" Background="#F5F6F8" BorderBrush="#DDE1E6" BorderThickness="1">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="42"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="1.35*"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <Border Grid.Row="0" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+                <Grid x:Name="TitleBar" Background="Transparent">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="14,0,0,0">
+                        <Border Width="22" Height="22" CornerRadius="6" Background="#2563EB">
+                            <TextBlock Text="网" FontSize="12" FontWeight="SemiBold" Foreground="#FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <TextBlock x:Name="TitleText" Text="校园网监控面板" FontSize="13" FontWeight="SemiBold" Foreground="#111827" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="TitleVersion" Text="" FontSize="11.5" Foreground="#6B7280" Margin="8,1,0,0" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button x:Name="BtnMin" Content="—" Style="{StaticResource IconButton}"/>
+                        <Button x:Name="BtnMax" Content="□" Style="{StaticResource IconButton}"/>
+                        <Button x:Name="BtnClose" Content="✕" Style="{StaticResource IconButton}"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border x:Name="Banner" Grid.Row="1" Margin="14,12,14,0" Padding="16,14" CornerRadius="12" BorderThickness="1" Background="#F3F4F6" BorderBrush="#E5E7EB">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Border x:Name="BannerDot" Grid.Column="0" Width="10" Height="10" CornerRadius="5" Background="#9CA3AF" VerticalAlignment="Top" Margin="2,5,12,0"/>
+                    <StackPanel Grid.Column="1">
+                        <TextBlock x:Name="BannerText" Text="正在读取状态…" FontSize="14.5" FontWeight="SemiBold" Foreground="#4B5563" TextWrapping="Wrap"/>
+                        <TextBlock x:Name="BannerSub" Text="" FontSize="11.5" Foreground="#6B7280" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <TextBlock x:Name="BannerRight" Grid.Column="2" Text="" FontSize="11.5" Foreground="#6B7280" Margin="12,4,0,0" VerticalAlignment="Top"/>
+                </Grid>
+            </Border>
+
+            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="14,12,2,0">
+                <WrapPanel x:Name="CardHost" Orientation="Horizontal"/>
+            </ScrollViewer>
+
+            <Grid Grid.Row="3" Margin="14,12,14,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Border Grid.Column="0" Margin="0,0,12,0" Padding="14,12" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="12">
+                    <StackPanel>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="延迟趋势" FontSize="13" FontWeight="SemiBold" Foreground="#111827"/>
+                            <TextBlock x:Name="SparkText" Grid.Column="1" Text="" FontSize="11.5" Foreground="#6B7280" HorizontalAlignment="Right" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                        <Canvas x:Name="SparkCanvas" Height="58" Margin="0,8,0,0" ClipToBounds="True"/>
+                    </StackPanel>
+                </Border>
+                <Border Grid.Column="1" Padding="14,12" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="12">
+                    <StackPanel>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="连通状态" FontSize="13" FontWeight="SemiBold" Foreground="#111827"/>
+                            <TextBlock x:Name="TimelineText" Grid.Column="1" Text="" FontSize="11.5" Foreground="#6B7280" HorizontalAlignment="Right" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                        <WrapPanel x:Name="TimelineHost" Margin="0,11,0,0"/>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Grid Grid.Row="4" Margin="14,12,14,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Grid Grid.Row="0" Margin="2,0,2,8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <CheckBox x:Name="ChkProblems" Grid.Column="0" Content="只看警告和错误" FontSize="12.5" Foreground="#374151" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="LogHint" Grid.Column="1" Text="只读显示 login.log 末尾 200 行" FontSize="11.5" Foreground="#6B7280" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                </Grid>
+                <Border Grid.Row="1" Padding="8,6" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="12">
+                    <ScrollViewer x:Name="LogScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+                        <ItemsControl x:Name="LogHost"/>
+                    </ScrollViewer>
+                </Border>
+            </Grid>
+
+            <Border Grid.Row="5" Margin="0,12,0,0" Padding="14,10" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" Orientation="Horizontal">
+                        <Button x:Name="BtnCheck" Content="立即检查一次" Style="{StaticResource PrimaryButton}" MinWidth="120"/>
+                        <Button x:Name="BtnRefresh" Content="刷新" Style="{StaticResource BaseButton}"/>
+                        <Button x:Name="BtnOpenDir" Content="打开数据目录" Style="{StaticResource BaseButton}"/>
+                        <Button x:Name="BtnCopy" Content="复制诊断信息" Style="{StaticResource BaseButton}"/>
+                        <Button x:Name="BtnExit" Content="关闭" Style="{StaticResource BaseButton}"/>
+                    </StackPanel>
+                    <TextBlock x:Name="FootText" Grid.Column="1" Text="" FontSize="11.5" Foreground="#6B7280" VerticalAlignment="Center" Margin="14,0,10,0" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock x:Name="FootRight" Grid.Column="2" Text="" FontSize="11.5" Foreground="#6B7280" VerticalAlignment="Center"/>
+                </Grid>
+            </Border>
+        </Grid>
+    </Border>
+</Window>
+'
+
+# ---- 创建窗口并取回控件 ----
+$window = [Windows.Markup.XamlReader]::Parse(($script:XamlHead + $script:XamlTail))
+$window.Title = ('校园网监控面板 {0}（适配自动登录 {1}）' -f $script:MonitorVersion, $script:ExpectedAssistVersion)
+try {
+    $iconPath = Join-Path $ScriptRoot 'panel.ico'
+    if (Test-Path -LiteralPath $iconPath) {
+        $iconImage = New-Object System.Windows.Media.Imaging.BitmapImage
+        $iconImage.BeginInit()
+        $iconImage.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $iconImage.UriSource = New-Object System.Uri($iconPath)
+        $iconImage.EndInit()
+        $window.Icon = $iconImage
+    }
+} catch { }
+
+$script:Ui = @{}
+foreach ($name in @('RootBorder', 'TitleBar', 'TitleVersion', 'BtnMin', 'BtnMax', 'BtnClose', 'Banner', 'BannerDot', 'BannerText', 'BannerSub', 'BannerRight', 'CardHost', 'SparkCanvas', 'SparkText', 'TimelineHost', 'TimelineText', 'ChkProblems', 'LogHint', 'LogScroll', 'LogHost', 'BtnCheck', 'BtnRefresh', 'BtnOpenDir', 'BtnCopy', 'BtnExit', 'FootText', 'FootRight')) {
+    $script:Ui[$name] = $window.FindName($name)
+}
+$script:Ui['TitleVersion'].Text = ('{0} · 适配自动登录 {1}' -f $script:MonitorVersion, $script:ExpectedAssistVersion)
 
 $script:LastCheckText = '还没有手动检查过。'
 $script:UiError = ''
+$script:Trend = @{}
+$script:Timeline = New-Object System.Collections.ArrayList
+$script:CardWidth = 500.0
 
-# ---- 窗口 ----
-$form = New-Object System.Windows.Forms.Form
-$form.Text = ('校园网监控面板 {0}（适配自动登录 {1}）' -f $script:MonitorVersion, $script:ExpectedAssistVersion)
-$form.ClientSize = New-Object System.Drawing.Size(1060, 780)
-$form.MinimumSize = New-Object System.Drawing.Size(880, 640)
-$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
-$form.BackColor = [System.Drawing.Color]::White
+# ---- 指标卡片 ----
+function New-MonitorCard {
+    param([string]$Title, $Rows, [double]$Width)
 
-$root = New-Object System.Windows.Forms.TableLayoutPanel
-$root.Dock = [System.Windows.Forms.DockStyle]::Fill
-$root.ColumnCount = 1
-$root.RowCount = 3
-[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 58)))
-[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 44)))
-[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-$form.Controls.Add($root)
+    $card = New-Object System.Windows.Controls.Border
+    $card.Width = $Width
+    $card.Margin = New-Object System.Windows.Thickness(0, 0, 12, 12)
+    $card.Padding = New-Object System.Windows.Thickness(16, 13, 16, 13)
+    $card.CornerRadius = New-Object System.Windows.CornerRadius(12)
+    $card.Background = Get-Brush '#FFFFFF'
+    $card.BorderBrush = Get-Brush '#E5E7EB'
+    $card.BorderThickness = New-Object System.Windows.Thickness(1)
 
-# ---- 顶部状态横幅 ----
-$banner = New-Object System.Windows.Forms.Label
-$banner.Dock = [System.Windows.Forms.DockStyle]::Fill
-$banner.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-$banner.Padding = New-Object System.Windows.Forms.Padding(14, 0, 14, 0)
-$banner.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)
-$banner.Text = '正在读取状态…'
-$banner.BackColor = [System.Drawing.Color]::WhiteSmoke
-[void]$root.Controls.Add($banner, 0, 0)
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $head = New-Object System.Windows.Controls.TextBlock
+    $head.Text = $Title
+    $head.FontSize = 13
+    $head.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $head.Foreground = Get-Brush '#111827'
+    $head.Margin = New-Object System.Windows.Thickness(0, 0, 0, 7)
+    [void]$stack.Children.Add($head)
 
-# ---- 按钮区 ----
-$buttonBar = New-Object System.Windows.Forms.FlowLayoutPanel
-$buttonBar.Dock = [System.Windows.Forms.DockStyle]::Fill
-$buttonBar.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 6)
-$buttonBar.WrapContents = $false
-[void]$root.Controls.Add($buttonBar, 0, 1)
+    foreach ($row in @($Rows)) {
+        $grid = New-Object System.Windows.Controls.Grid
+        $grid.Margin = New-Object System.Windows.Thickness(0, 3, 0, 3)
 
-function New-MonitorButton {
-    param([string]$Text, [int]$Width = 132)
+        $columnLabel = New-Object System.Windows.Controls.ColumnDefinition
+        $columnLabel.Width = New-Object System.Windows.GridLength(116)
+        $columnValue = New-Object System.Windows.Controls.ColumnDefinition
+        $columnValue.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+        [void]$grid.ColumnDefinitions.Add($columnLabel)
+        [void]$grid.ColumnDefinitions.Add($columnValue)
 
-    $button = New-Object System.Windows.Forms.Button
-    $button.Text = $Text
-    $button.Width = $Width
-    $button.Height = 30
-    $button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
-    $button.FlatStyle = [System.Windows.Forms.FlatStyle]::System
-    return $button
+        $label = New-Object System.Windows.Controls.TextBlock
+        $label.Text = [string]$row.Label
+        $label.FontSize = 12
+        $label.Foreground = Get-Brush '#6B7280'
+        $label.TextWrapping = [System.Windows.TextWrapping]::Wrap
+        [System.Windows.Controls.Grid]::SetColumn($label, 0)
+
+        $value = New-Object System.Windows.Controls.TextBlock
+        $value.Text = [string]$row.Value
+        $value.FontSize = 12.5
+        $value.TextWrapping = [System.Windows.TextWrapping]::Wrap
+        $value.Foreground = Get-Brush ([string]$row.Color) '#111827'
+        [System.Windows.Controls.Grid]::SetColumn($value, 1)
+
+        [void]$grid.Children.Add($label)
+        [void]$grid.Children.Add($value)
+        [void]$stack.Children.Add($grid)
+    }
+
+    $card.Child = $stack
+    return $card
 }
 
-$btnCheck = New-MonitorButton '立即检查一次' 132
-$btnRefresh = New-MonitorButton '刷新' 90
-$btnOpenDir = New-MonitorButton '打开数据目录' 132
-$btnCopy = New-MonitorButton '复制诊断信息' 132
-$btnClose = New-MonitorButton '关闭' 90
-[void]$buttonBar.Controls.Add($btnCheck)
-[void]$buttonBar.Controls.Add($btnRefresh)
-[void]$buttonBar.Controls.Add($btnOpenDir)
-[void]$buttonBar.Controls.Add($btnCopy)
-[void]$buttonBar.Controls.Add($btnClose)
+function Update-MonitorCards {
+    param($Snapshot, [double]$Width)
 
-# ---- 内容区：上半指标，下半日志 ----
-$content = New-Object System.Windows.Forms.SplitContainer
-$content.Dock = [System.Windows.Forms.DockStyle]::Fill
-$content.Orientation = [System.Windows.Forms.Orientation]::Horizontal
-$content.Panel1MinSize = 160
-$content.Panel2MinSize = 150
-try { $content.SplitterDistance = 400 } catch { }
-[void]$root.Controls.Add($content, 0, 2)
+    # 变量不能叫 $host：那是 PowerShell 的只读自动变量
+    $panel = $script:Ui['CardHost']
+    $panel.Children.Clear()
 
-$grid = New-Object System.Windows.Forms.DataGridView
-$grid.Dock = [System.Windows.Forms.DockStyle]::Fill
-$grid.AllowUserToAddRows = $false
-$grid.AllowUserToDeleteRows = $false
-$grid.AllowUserToResizeRows = $false
-$grid.AllowUserToOrderColumns = $false
-$grid.ReadOnly = $true
-$grid.RowHeadersVisible = $false
-$grid.MultiSelect = $false
-$grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
-$grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::None
-$grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::AllCells
-$grid.BackgroundColor = [System.Drawing.Color]::White
-$grid.GridColor = [System.Drawing.Color]::Gainsboro
-$grid.CellBorderStyle = [System.Windows.Forms.DataGridViewCellBorderStyle]::SingleHorizontal
-$grid.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize
-$grid.EnableHeadersVisualStyles = $false
-$grid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::WhiteSmoke
-$grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::WhiteSmoke
-$grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::Black
-$grid.RowTemplate.Height = 26
-$colGroup = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colGroup.HeaderText = '分类'
-$colGroup.Width = 64
-$colGroup.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
-$colLabel = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colLabel.HeaderText = '项目'
-$colLabel.Width = 190
-$colLabel.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
-$colValue = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colValue.HeaderText = '值'
-$colValue.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
-$colValue.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
-[void]$grid.Columns.Add($colGroup)
-[void]$grid.Columns.Add($colLabel)
-[void]$grid.Columns.Add($colValue)
-$content.Panel1.Controls.Add($grid)
-
-# ---- 日志区 ----
-$logPanel = New-Object System.Windows.Forms.TableLayoutPanel
-$logPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
-$logPanel.ColumnCount = 1
-$logPanel.RowCount = 2
-[void]$logPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 30)))
-[void]$logPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-$content.Panel2.Controls.Add($logPanel)
-
-$logBar = New-Object System.Windows.Forms.FlowLayoutPanel
-$logBar.Dock = [System.Windows.Forms.DockStyle]::Fill
-$logBar.Padding = New-Object System.Windows.Forms.Padding(10, 4, 10, 0)
-$logBar.WrapContents = $false
-[void]$logPanel.Controls.Add($logBar, 0, 0)
-
-$chkProblems = New-Object System.Windows.Forms.CheckBox
-$chkProblems.Text = '只看警告和错误'
-$chkProblems.AutoSize = $true
-$chkProblems.Margin = New-Object System.Windows.Forms.Padding(0, 3, 16, 0)
-[void]$logBar.Controls.Add($chkProblems)
-
-$logHint = New-Object System.Windows.Forms.Label
-$logHint.Text = '只读显示 login.log 的末尾内容，最近 200 行。'
-$logHint.AutoSize = $true
-$logHint.ForeColor = [System.Drawing.Color]::Gray
-$logHint.Margin = New-Object System.Windows.Forms.Padding(0, 7, 0, 0)
-[void]$logBar.Controls.Add($logHint)
-
-$logBox = New-Object System.Windows.Forms.RichTextBox
-$logBox.Dock = [System.Windows.Forms.DockStyle]::Fill
-$logBox.ReadOnly = $true
-$logBox.WordWrap = $false
-$logBox.DetectUrls = $false
-$logBox.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Both
-$logBox.Font = New-Object System.Drawing.Font('Consolas', 9)
-$logBox.BackColor = [System.Drawing.Color]::White
-$logBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-[void]$logPanel.Controls.Add($logBox, 0, 1)
-
-$tip = New-Object System.Windows.Forms.ToolTip
-$tip.AutoPopDelay = 15000
-
-# ---- 刷新逻辑 ----
-function Get-BannerTint {
-    param([string]$Kind)
-
-    switch ($Kind) {
-        'red'    { return [System.Drawing.Color]::FromArgb(253, 236, 236) }
-        'orange' { return [System.Drawing.Color]::FromArgb(255, 244, 229) }
-        'green'  { return [System.Drawing.Color]::FromArgb(234, 247, 239) }
-        'yellow' { return [System.Drawing.Color]::FromArgb(255, 251, 230) }
-        default  { return [System.Drawing.Color]::FromArgb(242, 242, 242) }
+    $groups = [ordered]@{}
+    foreach ($row in (Get-MonitorMetricRows -Snapshot $Snapshot)) {
+        $groupName = [string]$row.Group
+        if (-not $groups.Contains($groupName)) { $groups[$groupName] = (New-Object System.Collections.ArrayList) }
+        [void]$groups[$groupName].Add($row)
+    }
+    foreach ($groupName in $groups.Keys) {
+        $title = $groupName
+        if ($script:GroupTitle.ContainsKey($groupName)) { $title = $script:GroupTitle[$groupName] }
+        [void]$panel.Children.Add((New-MonitorCard -Title $title -Rows $groups[$groupName].ToArray() -Width $Width))
     }
 }
 
-function Update-MonitorGrid {
-    param($Snapshot)
+# ---- 连通状态时间线 ----
+function Update-MonitorTimeline {
+    param([string]$Kind)
 
-    $grid.SuspendLayout()
-    try {
-        $grid.Rows.Clear()
-        foreach ($row in (Get-MonitorMetricRows -Snapshot $Snapshot)) {
-            $index = $grid.Rows.Add($row.Group, $row.Label, $row.Value)
-            $cell = $grid.Rows[$index].Cells[2]
-            $cell.Style.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
-            if (-not [string]::IsNullOrWhiteSpace([string]$row.Color)) {
-                $color = [System.Drawing.ColorTranslator]::FromHtml([string]$row.Color)
-                $cell.Style.ForeColor = $color
-                $cell.Style.SelectionForeColor = $color
-            }
-        }
-    } finally { $grid.ResumeLayout() }
+    $limit = [int]$script:Settings.TimelinePoints
+    if ($limit -lt 10) { $limit = 10 }
+    [void]$script:Timeline.Add([string]$Kind)
+    while ($script:Timeline.Count -gt $limit) { $script:Timeline.RemoveAt(0) }
+
+    # 变量不能叫 $host：那是 PowerShell 的只读自动变量
+    $panel = $script:Ui['TimelineHost']
+    $panel.Children.Clear()
+    $counts = @{}
+    $index = 0
+    foreach ($item in $script:Timeline) {
+        $style = Get-StatusStyle $item
+        $cell = New-Object System.Windows.Controls.Border
+        $cell.Width = 13
+        $cell.Height = 13
+        $cell.CornerRadius = New-Object System.Windows.CornerRadius(3)
+        $cell.Margin = New-Object System.Windows.Thickness(0, 0, 3, 3)
+        $cell.Background = Get-Brush $style.Dot
+        $cell.ToolTip = ('第 {0} 格（从左到右由早到晚）' -f ($index + 1))
+        [void]$panel.Children.Add($cell)
+        if ($counts.ContainsKey($item)) { $counts[$item] = $counts[$item] + 1 } else { $counts[$item] = 1 }
+        $index++
+    }
+
+    $normal = 0
+    if ($counts.ContainsKey('green')) { $normal = $counts['green'] }
+    $refreshSeconds = [int][double]$script:Settings.RefreshSeconds
+    if ($refreshSeconds -lt 1) { $refreshSeconds = 5 }
+    $script:Ui['TimelineText'].Text = ('最近 {0} 次刷新：正常 {1} 次｜每格 {2} 秒' -f $script:Timeline.Count, $normal, $refreshSeconds)
 }
 
-function Update-MonitorLog {
-    param($Snapshot)
+# ---- 延迟趋势：只存在内存里，面板退出即消失，不落盘 ----
+function Update-TrendBuffer {
+    param($Summary)
 
-    $entries = Get-MonitorLogTail -Entries $Snapshot.LogEntries -Count 200 -OnlyProblems:([bool]$chkProblems.Checked)
-    $logBox.SuspendLayout()
-    try {
-        $logBox.Clear()
-        if (@($entries).Count -eq 0) {
-            $logBox.SelectionColor = [System.Drawing.Color]::Gray
-            $logBox.AppendText('（没有日志内容）')
-        } else {
-            foreach ($entry in @($entries)) {
-                $color = [System.Drawing.Color]::FromArgb(60, 60, 60)
-                if ($entry.Level -eq 'WARN') { $color = [System.Drawing.Color]::FromArgb(176, 104, 0) }
-                elseif ($entry.Level -eq 'ERROR') { $color = [System.Drawing.Color]::FromArgb(192, 0, 0) }
-                $logBox.SelectionStart = $logBox.TextLength
-                $logBox.SelectionLength = 0
-                $logBox.SelectionColor = $color
-                $logBox.AppendText([string]$entry.Raw + "`r`n")
-            }
-        }
-        $logBox.SelectionStart = $logBox.TextLength
-        $logBox.SelectionLength = 0
-        $logBox.ScrollToCaret()
-    } finally { $logBox.ResumeLayout() }
+    $limit = [int]$script:Settings.SparklinePoints
+    if ($limit -lt 10) { $limit = 10 }
+    foreach ($item in @($Summary)) {
+        $label = [string]$item.Label
+        if ([string]::IsNullOrWhiteSpace($label)) { continue }
+        if (-not $script:Trend.ContainsKey($label)) { $script:Trend[$label] = New-Object System.Collections.ArrayList }
+        $list = $script:Trend[$label]
+        [void]$list.Add([pscustomobject]@{ Ok = [bool]$item.Ok; Rtt = [int]$item.Current })
+        while ($list.Count -gt $limit) { $list.RemoveAt(0) }
+    }
 }
 
+function Update-MonitorSparkline {
+    param($Summary)
+
+    $canvas = $script:Ui['SparkCanvas']
+    $canvas.Children.Clear()
+
+    $width = [double]$canvas.ActualWidth
+    if ($width -le 40) { $width = 460.0 }
+    $height = 58.0
+
+    $series = New-Object System.Collections.ArrayList
+    foreach ($item in @($Summary)) {
+        $label = [string]$item.Label
+        if ([string]::IsNullOrWhiteSpace($label)) { continue }
+        if (-not $script:Trend.ContainsKey($label)) { continue }
+        $points = @($script:Trend[$label])
+        if ($points.Count -eq 0) { continue }
+        [void]$series.Add([pscustomobject]@{
+            Label   = $label
+            Host    = [string]$item.Host
+            Points  = $points
+            Current = [int]$item.Current
+            Ok      = [bool]$item.Ok
+        })
+    }
+
+    if ($series.Count -eq 0) {
+        $hint = New-Object System.Windows.Controls.TextBlock
+        $hint.Text = '（还没有延迟采样）'
+        $hint.FontSize = 11.5
+        $hint.Foreground = Get-Brush '#9CA3AF'
+        [System.Windows.Controls.Canvas]::SetTop($hint, 18)
+        [void]$canvas.Children.Add($hint)
+        Set-MonitorSparkLegend -Series @()
+        return
+    }
+
+    foreach ($ratio in @(0.25, 0.75)) {
+        $guide = New-Object System.Windows.Shapes.Line
+        $guide.X1 = 0
+        $guide.X2 = [Math]::Round($width, 1)
+        $guide.Y1 = [Math]::Round($height * $ratio, 1)
+        $guide.Y2 = $guide.Y1
+        $guide.Stroke = Get-Brush '#F1F3F5'
+        $guide.StrokeThickness = 1
+        [void]$canvas.Children.Add($guide)
+    }
+
+    $peak = 60
+    foreach ($item in $series) {
+        foreach ($point in $item.Points) {
+            if ($point.Ok -and [int]$point.Rtt -gt $peak) { $peak = [int]$point.Rtt }
+        }
+    }
+    $peak = [int][Math]::Ceiling($peak * 1.15)
+
+    $columns = [int]$script:Settings.SparklinePoints
+    if ($columns -lt 10) { $columns = 10 }
+
+    foreach ($item in $series) {
+        $color = '#2563EB'
+        if ($script:SeriesColor.ContainsKey($item.Label)) { $color = $script:SeriesColor[$item.Label] }
+        $brush = Get-Brush $color
+
+        $points = @($item.Points)
+        $offset = $columns - $points.Count
+        $segments = New-Object System.Collections.ArrayList
+        $segment = New-Object System.Collections.ArrayList
+        $lastX = 0.0
+        $lastY = 0.0
+        $hasLast = $false
+
+        for ($i = 0; $i -lt $points.Count; $i++) {
+            $x = 0.0
+            if ($columns -gt 1) { $x = [Math]::Round($width * ($offset + $i) / ($columns - 1), 1) }
+
+            if (-not $points[$i].Ok) {
+                if ($segment.Count -gt 0) {
+                    [void]$segments.Add($segment.ToArray())
+                    $segment = New-Object System.Collections.ArrayList
+                }
+                $lost = New-Object System.Windows.Shapes.Ellipse
+                $lost.Width = 4
+                $lost.Height = 4
+                $lost.Fill = Get-Brush '#EF4444'
+                $lost.Opacity = 0.8
+                [System.Windows.Controls.Canvas]::SetLeft($lost, [Math]::Round($x - 2, 1))
+                [System.Windows.Controls.Canvas]::SetTop($lost, $height - 6)
+                [void]$canvas.Children.Add($lost)
+                continue
+            }
+
+            $y = $height - 6 - ([double][int]$points[$i].Rtt / $peak) * ($height - 14)
+            $y = [Math]::Round($y, 1)
+            [void]$segment.Add((New-Object System.Windows.Point($x, $y)))
+            $lastX = $x
+            $lastY = $y
+            $hasLast = $true
+        }
+        if ($segment.Count -gt 0) { [void]$segments.Add($segment.ToArray()) }
+
+        foreach ($one in $segments) {
+            $group = @($one)
+            if ($group.Count -eq 1) {
+                $single = New-Object System.Windows.Shapes.Ellipse
+                $single.Width = 5
+                $single.Height = 5
+                $single.Fill = $brush
+                [System.Windows.Controls.Canvas]::SetLeft($single, [Math]::Round($group[0].X - 2.5, 1))
+                [System.Windows.Controls.Canvas]::SetTop($single, [Math]::Round($group[0].Y - 2.5, 1))
+                [void]$canvas.Children.Add($single)
+                continue
+            }
+
+            $polyline = New-Object System.Windows.Shapes.Polyline
+            $polyline.Stroke = $brush
+            $polyline.StrokeThickness = 2
+            $polyline.StrokeLineJoin = [System.Windows.Media.PenLineJoin]::Round
+            $polyline.Points = New-Object System.Windows.Media.PointCollection
+            foreach ($point in $group) { [void]$polyline.Points.Add($point) }
+            [void]$canvas.Children.Add($polyline)
+        }
+
+        if ($hasLast) {
+            $halo = New-Object System.Windows.Shapes.Ellipse
+            $halo.Width = 9
+            $halo.Height = 9
+            $halo.Fill = $brush
+            $halo.Opacity = 0.18
+            [System.Windows.Controls.Canvas]::SetLeft($halo, [Math]::Round($lastX - 4.5, 1))
+            [System.Windows.Controls.Canvas]::SetTop($halo, [Math]::Round($lastY - 4.5, 1))
+            [void]$canvas.Children.Add($halo)
+
+            $dot = New-Object System.Windows.Shapes.Ellipse
+            $dot.Width = 5
+            $dot.Height = 5
+            $dot.Fill = $brush
+            [System.Windows.Controls.Canvas]::SetLeft($dot, [Math]::Round($lastX - 2.5, 1))
+            [System.Windows.Controls.Canvas]::SetTop($dot, [Math]::Round($lastY - 2.5, 1))
+            [void]$canvas.Children.Add($dot)
+        }
+    }
+
+    Set-MonitorSparkLegend -Series $series
+}
+
+# 折线图右上角的图例：每个目标一个圆点加当前延迟
+function Set-MonitorSparkLegend {
+    param($Series)
+
+    $block = $script:Ui['SparkText']
+    $block.Inlines.Clear()
+
+    if (@($Series).Count -eq 0) {
+        $pingSeconds = [int][double]$script:Settings.PingIntervalSeconds
+        if ($pingSeconds -lt 3) { $pingSeconds = 10 }
+        $note = New-Object System.Windows.Documents.Run(('每 {0} 秒 ICMP 探测一次' -f $pingSeconds))
+        $note.Foreground = Get-Brush '#9CA3AF'
+        [void]$block.Inlines.Add($note)
+        return
+    }
+
+    $first = $true
+    foreach ($item in @($Series)) {
+        if (-not $first) {
+            $gap = New-Object System.Windows.Documents.Run('    ')
+            [void]$block.Inlines.Add($gap)
+        }
+        $first = $false
+
+        $color = '#2563EB'
+        if ($script:SeriesColor.ContainsKey($item.Label)) { $color = $script:SeriesColor[$item.Label] }
+
+        $dot = New-Object System.Windows.Documents.Run('● ')
+        $dot.Foreground = Get-Brush $color
+        [void]$block.Inlines.Add($dot)
+
+        $text = ('{0} 无响应' -f $item.Label)
+        if ($item.Ok) { $text = ('{0} {1} ms' -f $item.Label, $item.Current) }
+        $run = New-Object System.Windows.Documents.Run($text)
+        $run.Foreground = Get-Brush '#374151'
+        [void]$block.Inlines.Add($run)
+    }
+}
+
+# ---- 日志区 ----
+function Update-MonitorLogView {
+    param($Snapshot)
+
+    # 变量不能叫 $host：那是 PowerShell 的只读自动变量
+    $panel = $script:Ui['LogHost']
+    $panel.Items.Clear()
+    $onlyProblems = [bool]$script:Ui['ChkProblems'].IsChecked
+    $entries = @(Get-MonitorLogTail -Entries $Snapshot.LogEntries -Count 200 -OnlyProblems:$onlyProblems)
+
+    if ($entries.Count -eq 0) {
+        $hint = New-Object System.Windows.Controls.TextBlock
+        $hint.Text = '（没有日志内容）'
+        $hint.FontSize = 12
+        $hint.Foreground = Get-Brush '#9CA3AF'
+        [void]$panel.Items.Add($hint)
+    } else {
+        $mono = New-Object System.Windows.Media.FontFamily('Consolas, Cascadia Mono, Microsoft YaHei UI')
+        foreach ($entry in $entries) {
+            $line = New-Object System.Windows.Controls.TextBlock
+            $line.Text = [string]$entry.Raw
+            $line.FontFamily = $mono
+            $line.FontSize = 12
+            $line.TextWrapping = [System.Windows.TextWrapping]::NoWrap
+            $line.Foreground = Get-Brush '#3C3C3C'
+            if ($entry.Level -eq 'WARN') { $line.Foreground = Get-Brush '#B06800' }
+            elseif ($entry.Level -eq 'ERROR') { $line.Foreground = Get-Brush '#C00000' }
+            [void]$panel.Items.Add($line)
+        }
+    }
+    try { $script:Ui['LogScroll'].ScrollToEnd() } catch { }
+}
+
+# ---- 状态横幅下面那行小字 ----
+function Get-MonitorBannerSub {
+    param($Snapshot)
+
+    $parts = New-Object System.Collections.ArrayList
+    if ($Snapshot.Task.Exists) {
+        [void]$parts.Add(('计划任务：{0}｜上次返回码 {1}' -f $Snapshot.Task.State, (Format-TaskResult $Snapshot.Task.LastTaskResult)))
+    } else {
+        [void]$parts.Add('计划任务：没有找到')
+    }
+    [void]$parts.Add(('最近查询：{0}' -f (Format-Age $Snapshot.LastProbe)))
+    [void]$parts.Add(('最近触发：{0}' -f (Format-Age $Snapshot.LastTrigger)))
+    [void]$parts.Add(('在线状态：{0}' -f $Snapshot.OnlineText))
+    if ($Snapshot.Cooldown.Active) {
+        [void]$parts.Add(('冷却到 {0}（{1}）' -f $Snapshot.Cooldown.Until.ToString('HH:mm:ss'), $Snapshot.Cooldown.Reason))
+    }
+    if ($Snapshot.VersionOutdated) {
+        [void]$parts.Add(('已安装脚本 {0}，建议重新运行安装脚本升级' -f $Snapshot.InstalledVersion))
+    }
+    return ($parts -join '｜')
+}
+
+# ---- 统一刷新 ----
 function Update-MonitorUi {
     try {
         $script:Snapshot = Get-MonitorSnapshot -DataDir $DataDir
         $snapshot = $script:Snapshot
+        $style = Get-StatusStyle $snapshot.Banner.Kind
 
-        $banner.Text = $snapshot.Banner.Text
-        $banner.ForeColor = [System.Drawing.ColorTranslator]::FromHtml([string]$snapshot.Banner.Color)
-        $banner.BackColor = Get-BannerTint $snapshot.Banner.Kind
+        $script:Ui['Banner'].Background = Get-Brush $style.Bg
+        $script:Ui['Banner'].BorderBrush = Get-Brush $style.Border
+        $script:Ui['BannerDot'].Background = Get-Brush $style.Dot
+        $script:Ui['BannerText'].Foreground = Get-Brush $style.Text
+        $script:Ui['BannerText'].Text = $snapshot.Banner.Text
+        $script:Ui['BannerSub'].Text = (Get-MonitorBannerSub -Snapshot $snapshot)
+        $script:Ui['BannerRight'].Text = ('刷新于 {0}' -f $snapshot.Now.ToString('HH:mm:ss'))
 
-        Update-MonitorGrid -Snapshot $snapshot
-        Update-MonitorLog -Snapshot $snapshot
+        Update-MonitorCards -Snapshot $snapshot -Width $script:CardWidth
+        Update-MonitorSparkline -Summary $snapshot.Latency
+        Update-MonitorTimeline -Kind $snapshot.Banner.Kind
+        Update-MonitorLogView -Snapshot $snapshot
 
+        $check = $script:Ui['BtnCheck']
         if ($snapshot.Portal.Available) {
-            $btnCheck.Enabled = $true
-            $tip.SetToolTip($btnCheck, ('向 {0} 发一次只读的状态查询（chkstatus），不会登录、不会写任何文件。' -f $snapshot.Portal.Host))
+            $check.IsEnabled = $true
+            $check.ToolTip = ('向 {0} 发一次只读的状态查询（chkstatus），不会登录、不会写任何文件。' -f $snapshot.Portal.Host)
         } else {
-            $btnCheck.Enabled = $false
-            $tip.SetToolTip($btnCheck, ('没有可用的 Portal 地址，无法查询：{0}' -f $snapshot.Portal.Reason))
+            $check.IsEnabled = $false
+            $check.ToolTip = ('没有可用的 Portal 地址，无法查询：{0}' -f $snapshot.Portal.Reason)
         }
+        if ([string]$check.Content -ne '检查中…') { $check.Content = '立即检查一次' }
+
+        $stateText = 'state.json 不存在'
+        if ($snapshot.StateExists) { $stateText = ('state.json {0}更新' -f (Format-Age $snapshot.StateMtime)) }
+        $script:Ui['FootText'].Text = ('数据目录：{0}｜{1}｜Portal：{2}' -f $snapshot.DataDir, $stateText, $snapshot.Portal.Host)
+        $script:Ui['FootRight'].Text = ('面板 {0}｜自动登录 {1}' -f $script:MonitorVersion, $script:ExpectedAssistVersion)
         $script:UiError = ''
     } catch {
         $script:UiError = $_.Exception.Message
-        $banner.ForeColor = [System.Drawing.Color]::FromArgb(192, 0, 0)
-        $banner.BackColor = [System.Drawing.Color]::FromArgb(253, 236, 236)
-        $banner.Text = ('刷新状态失败：{0}' -f $_.Exception.Message)
+        $script:Ui['Banner'].Background = Get-Brush '#FEF2F2'
+        $script:Ui['Banner'].BorderBrush = Get-Brush '#FECACA'
+        $script:Ui['BannerDot'].Background = Get-Brush '#DC2626'
+        $script:Ui['BannerText'].Foreground = Get-Brush '#B91C1C'
+        $script:Ui['BannerText'].Text = ('刷新状态失败：{0}' -f $_.Exception.Message)
     }
 }
 
-# ---- 按钮与定时器 ----
-$btnCheck.Add_Click({
+# ---- 定时器与事件 ----
+$refreshSeconds = [double]$script:Settings.RefreshSeconds
+if ($refreshSeconds -lt 1) { $refreshSeconds = 5 }
+$pingSeconds = [double]$script:Settings.PingIntervalSeconds
+if ($pingSeconds -lt 3) { $pingSeconds = 10 }
+
+$refreshTimer = New-Object System.Windows.Threading.DispatcherTimer
+$refreshTimer.Interval = [TimeSpan]::FromSeconds($refreshSeconds)
+
+$pingTimer = New-Object System.Windows.Threading.DispatcherTimer
+$pingTimer.Interval = [TimeSpan]::FromSeconds($pingSeconds)
+
+$disableTimer = New-Object System.Windows.Threading.DispatcherTimer
+$disableTimer.Interval = [TimeSpan]::FromSeconds(5)
+
+function Invoke-MonitorRender {
+    try { [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [action]{}) } catch { }
+}
+
+$refreshTimer.Add_Tick({ try { Update-MonitorUi } catch { } })
+
+# 延迟探测单独一个更慢的节奏：只发 ICMP，不碰 Portal 的登录接口
+$pingTimer.Add_Tick({
+    try {
+        if ($script:Latency.Running) { Complete-LatencyProbe }
+        else {
+            $targets = Get-LatencyTargets -Network (Get-NetworkInfo) -Portal $script:Snapshot.Portal
+            if (@($targets).Count -gt 0) { Start-LatencyProbe -Targets $targets -TimeoutMs ([int][double]$script:Settings.PingTimeoutMs) }
+        }
+    } catch {
+        $script:Latency.Error = $_.Exception.Message
+        $script:Latency.Running = $false
+    }
+    if (-not $script:Latency.Running) {
+        Update-TrendBuffer -Summary (Get-LatencySummary)
+        try { Update-MonitorSparkline -Summary (Get-LatencySummary) } catch { }
+    }
+})
+
+$disableTimer.Add_Tick({
+    $disableTimer.Stop()
+    $script:Ui['BtnCheck'].Content = '立即检查一次'
+    $script:Ui['BtnCheck'].IsEnabled = $true
+})
+
+$script:Ui['BtnCheck'].Add_Click({
     $snapshot = $script:Snapshot
-    if (-not $snapshot.Portal.Available) {
-        [void][System.Windows.Forms.MessageBox]::Show('没有可用的 Portal 地址，无法查询。', '立即检查一次', 'OK', 'Warning')
+    if ($null -eq $snapshot -or -not $snapshot.Portal.Available) {
+        [void][System.Windows.MessageBox]::Show('没有可用的 Portal 地址，无法查询。', '立即检查一次', 'OK', 'Warning')
         return
     }
 
-    $btnCheck.Enabled = $false
-    $btnCheck.Text = '检查中…'
-    $buttonBar.Refresh()
+    $button = $script:Ui['BtnCheck']
+    $button.IsEnabled = $false
+    $button.Content = '检查中…'
+    Invoke-MonitorRender
 
     $result = $null
     try {
@@ -1545,78 +2081,79 @@ $btnCheck.Add_Click({
     } else {
         $script:LastCheckText = ('{0}（地址：{1}，耗时 {2} 毫秒）' -f $result.Message, $result.Url, $result.ElapsedMs)
     }
-    [void][System.Windows.Forms.MessageBox]::Show($script:LastCheckText, '立即检查一次', 'OK', 'Information')
+    [void][System.Windows.MessageBox]::Show($script:LastCheckText, '立即检查一次', 'OK', 'Information')
 
     # 按钮禁用 5 秒，避免手快连点、对 Portal 造成无谓的压力
-    $disableTimer.Interval = 5000
+    $disableTimer.Interval = [TimeSpan]::FromSeconds(5)
     $disableTimer.Start()
 })
 
-$btnRefresh.Add_Click({ Update-MonitorUi })
+$script:Ui['BtnRefresh'].Add_Click({ Update-MonitorUi })
+$script:Ui['ChkProblems'].Add_Click({ Update-MonitorLogView -Snapshot $script:Snapshot })
 
-$btnOpenDir.Add_Click({
+$script:Ui['BtnOpenDir'].Add_Click({
     try {
-        if (Test-PathSafe $DataDir) {
-            Start-Process -FilePath $DataDir | Out-Null
-        } else {
-            [void][System.Windows.Forms.MessageBox]::Show(('目录不存在：{0}' -f $DataDir), '打开数据目录', 'OK', 'Warning')
-        }
+        if (Test-PathSafe $DataDir) { Start-Process -FilePath $DataDir | Out-Null }
+        else { [void][System.Windows.MessageBox]::Show(('目录不存在：{0}' -f $DataDir), '打开数据目录', 'OK', 'Warning') }
     } catch {
-        [void][System.Windows.Forms.MessageBox]::Show(('打开失败：{0}' -f $_.Exception.Message), '打开数据目录', 'OK', 'Warning')
+        [void][System.Windows.MessageBox]::Show(('打开失败：{0}' -f $_.Exception.Message), '打开数据目录', 'OK', 'Warning')
     }
 })
 
-$btnCopy.Add_Click({
+$script:Ui['BtnCopy'].Add_Click({
     try {
         $text = Format-MonitorText -Snapshot $script:Snapshot -LogLines 30
         if (-not [string]::IsNullOrWhiteSpace($script:LastCheckText)) {
             $text = $text + "`r`n" + ('【手动检查】{0}' -f $script:LastCheckText)
         }
-        [System.Windows.Forms.Clipboard]::SetText($text)
-        [void][System.Windows.Forms.MessageBox]::Show('诊断信息已复制到剪贴板，可以直接粘贴给别人。', '复制诊断信息', 'OK', 'Information')
+        [System.Windows.Clipboard]::SetText($text)
+        [void][System.Windows.MessageBox]::Show('诊断信息已复制到剪贴板，可以直接粘贴给别人。', '复制诊断信息', 'OK', 'Information')
     } catch {
-        [void][System.Windows.Forms.MessageBox]::Show(('复制失败：{0}' -f $_.Exception.Message), '复制诊断信息', 'OK', 'Warning')
+        [void][System.Windows.MessageBox]::Show(('复制失败：{0}' -f $_.Exception.Message), '复制诊断信息', 'OK', 'Warning')
     }
 })
 
-$btnClose.Add_Click({ $form.Close() })
-
-$chkProblems.Add_CheckedChanged({ Update-MonitorLog -Snapshot $script:Snapshot })
-
-$disableTimer = New-Object System.Windows.Forms.Timer
-$disableTimer.Interval = 5000
-$disableTimer.Add_Tick({
-    $disableTimer.Stop()
-    $btnCheck.Text = '立即检查一次'
-    $btnCheck.Enabled = $true
+$script:Ui['BtnExit'].Add_Click({ $window.Close() })
+$script:Ui['BtnClose'].Add_Click({ $window.Close() })
+$script:Ui['BtnMin'].Add_Click({ $window.WindowState = [System.Windows.WindowState]::Minimized })
+$script:Ui['BtnMax'].Add_Click({
+    if ($window.WindowState -eq [System.Windows.WindowState]::Maximized) { $window.WindowState = [System.Windows.WindowState]::Normal }
+    else { $window.WindowState = [System.Windows.WindowState]::Maximized }
 })
 
-$refreshTimer = New-Object System.Windows.Forms.Timer
-$refreshSeconds = [double]$script:Settings.RefreshSeconds
-if ($refreshSeconds -lt 1) { $refreshSeconds = 5 }
-$refreshTimer.Interval = [int]($refreshSeconds * 1000)
-$refreshTimer.Add_Tick({ Update-MonitorUi })
+$script:Ui['TitleBar'].Add_MouseLeftButtonDown({
+    param($sender, $eventArgs)
 
-# 延迟探测单独一个更慢的节奏：只发 ICMP，不碰 Portal 的登录接口
-$pingTimer = New-Object System.Windows.Forms.Timer
-$pingSeconds = [double]$script:Settings.PingIntervalSeconds
-if ($pingSeconds -lt 3) { $pingSeconds = 10 }
-$pingTimer.Interval = [int]($pingSeconds * 1000)
-$pingTimer.Add_Tick({
+    if ($eventArgs.ClickCount -eq 2) {
+        if ($window.WindowState -eq [System.Windows.WindowState]::Maximized) { $window.WindowState = [System.Windows.WindowState]::Normal }
+        else { $window.WindowState = [System.Windows.WindowState]::Maximized }
+        return
+    }
+    try { $window.DragMove() } catch { }
+})
+
+$window.Add_SizeChanged({
     try {
-        if ($script:Latency.Running) { Complete-LatencyProbe }
-        else {
-            $targets = Get-LatencyTargets -Network (Get-NetworkInfo) -Portal $script:Snapshot.Portal
-            if (@($targets).Count -gt 0) { Start-LatencyProbe -Targets $targets -TimeoutMs ([int][double]$script:Settings.PingTimeoutMs) }
+        # 预留两边的留白、卡片间距和滚动条宽度，正好排成两列
+        $width = [Math]::Max(360, [int](($window.ActualWidth - 64) / 2))
+        if ($width -ne [int]$script:CardWidth) {
+            $script:CardWidth = [double]$width
+            foreach ($child in $script:Ui['CardHost'].Children) { $child.Width = $script:CardWidth }
         }
-    } catch {
-        $script:Latency.Error = $_.Exception.Message
-        $script:Latency.Running = $false
-    }
+        if ($null -ne $script:Snapshot) { Update-MonitorSparkline -Summary $script:Snapshot.Latency }
+    } catch { }
 })
 
-$form.Add_Shown({
-    try { $content.SplitterDistance = [int]($content.Height * 0.55) } catch { }
+$window.Add_SourceInitialized({
+    try {
+        $helper = New-Object System.Windows.Interop.WindowInteropHelper($window)
+        $round = 2
+        [void][CampusPanel.Native]::DwmSetWindowAttribute($helper.Handle, 33, [ref]$round, 4)
+    } catch { }
+})
+
+$window.Add_Loaded({
+    try { $script:CardWidth = [Math]::Max(360.0, [double][int](($window.ActualWidth - 64) / 2)) } catch { }
     Update-MonitorUi
     $refreshTimer.Start()
     try {
@@ -1626,7 +2163,7 @@ $form.Add_Shown({
     $pingTimer.Start()
 })
 
-$form.Add_FormClosing({
+$window.Add_Closing({
     try { $refreshTimer.Stop() } catch { }
     try { $disableTimer.Stop() } catch { }
     try { $pingTimer.Stop() } catch { }
@@ -1635,24 +2172,25 @@ $form.Add_FormClosing({
 # ---- 显示窗口 ----
 if ($SelfTest) {
     try {
-        $form.Show()
-        [System.Windows.Forms.Application]::DoEvents()
+        $window.Show()
+        Invoke-MonitorRender
         # 顺带跑一次真实的延迟探测，确保这条链路在冒烟测试里也被覆盖
         try {
             $targets = Get-LatencyTargets -Network (Get-NetworkInfo -NoCache) -Portal $script:Snapshot.Portal
             Invoke-LatencyProbeSync -Targets $targets -TimeoutMs ([int][double]$script:Settings.PingTimeoutMs)
+            Update-TrendBuffer -Summary (Get-LatencySummary)
         } catch { }
         Update-MonitorUi
-        [System.Windows.Forms.Application]::DoEvents()
-        $form.Close()
-        $form.Dispose()
-        Write-Host ('[SelfTest] 监控面板构建与刷新成功。')
+        Invoke-MonitorRender
+        $window.Close()
+        Write-Host ('[SelfTest] 监控面板（WPF）构建与刷新成功。')
         if (-not [string]::IsNullOrWhiteSpace($script:UiError)) {
             Write-Host ('[SelfTest] 注意：刷新时报错 {0}' -f $script:UiError)
             exit 2
         }
         Write-Host ('[SelfTest] 数据目录：{0}' -f $DataDir)
         Write-Host ('[SelfTest] 状态：{0}' -f $script:Snapshot.Banner.Text)
+        Write-Host ('[SelfTest] 指标卡片：{0} 个｜时间线：{1} 格｜日志：{2} 行｜折线图元：{3} 个' -f $script:Ui['CardHost'].Children.Count, $script:Timeline.Count, $script:Ui['LogHost'].Items.Count, $script:Ui['SparkCanvas'].Children.Count)
         exit 0
     } catch {
         Write-Host ('[SelfTest] 失败：{0}' -f $_.Exception.Message)
@@ -1660,6 +2198,7 @@ if ($SelfTest) {
     }
 }
 
-[void]$form.ShowDialog()
-$form.Dispose()
+[void]$window.ShowDialog()
+$window.Close()
 exit 0
+
