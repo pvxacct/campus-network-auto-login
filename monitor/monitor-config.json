@@ -4,5 +4,11 @@
   "PortalHost": "",
   "StatusPath": "/drcom/chkstatus",
   "StatusTimeoutSec": 8,
-  "DataDir": ""
+  "DataDir": "",
+  "PingEnabled": true,
+  "PingIntervalSeconds": 10,
+  "PingTimeoutMs": 1000,
+  "PingTargets": "gateway,portal",
+  "LatencySamples": 10,
+  "NetworkInfoSeconds": 20
 }

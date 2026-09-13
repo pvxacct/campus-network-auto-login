@@ -37,8 +37,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$script:MonitorVersion = '1.0.1'
-$script:ExpectedAssistVersion = '1.6.1'
+$script:MonitorVersion = '1.1.0'
+$script:ExpectedAssistVersion = '1.7.0'
 $script:TaskName = 'CampusAutoLogin'
 
 $ScriptRoot = $PSScriptRoot
@@ -55,6 +55,12 @@ $script:Settings = [ordered]@{
     StatusPath       = '/drcom/chkstatus'
     StatusTimeoutSec = 8
     DataDir          = ''
+    PingEnabled         = $true
+    PingIntervalSeconds = 10
+    PingTimeoutMs       = 1000
+    PingTargets         = 'gateway,portal'
+    LatencySamples      = 10
+    NetworkInfoSeconds  = 20
 }
 
 if ([string]::IsNullOrEmpty($ConfigPath)) {
@@ -86,6 +92,18 @@ if ([string]::IsNullOrWhiteSpace($DataDir)) {
 
 $script:LogStatsWindowHours = [int]$script:Settings.StatsWindowHours
 if ($script:LogStatsWindowHours -le 0) { $script:LogStatsWindowHours = 24 }
+
+$script:PingEnabled = [bool]$script:Settings.PingEnabled
+
+# 延迟探测的运行时状态（只在内存里，不落盘）
+$script:Latency = [ordered]@{
+    History  = @{}
+    Pending  = @()
+    Running  = $false
+    LastRun  = $null
+    Error    = ''
+    Targets  = @()
+}
 
 # ===================== 基础工具 =====================
 function ConvertTo-Text {
@@ -550,6 +568,318 @@ function Resolve-MonitorPortal {
 }
 
 # ===================== 只读状态查询（点“立即检查一次”才会用到） =====================
+function Get-NetworkInfoRaw {
+    $info = [ordered]@{
+        Adapter    = ''
+        IPv4       = ''
+        PrefixLen  = 0
+        Gateway    = ''
+        Dns        = ''
+        SpeedText  = ''
+        Profile    = ''
+        Category   = ''
+        Connectivity = ''
+        Others     = @()
+        Error      = ''
+    }
+
+    $primary = $null
+    $candidates = New-Object System.Collections.ArrayList
+    try {
+        foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            if ($nic.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
+            if ($nic.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback) { continue }
+            if ($nic.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Tunnel) { continue }
+
+            $props = $null
+            try { $props = $nic.GetIPProperties() } catch { continue }
+
+            $addresses = @($props.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork })
+            $ipv4 = ''
+            foreach ($address in $addresses) {
+                $text = $address.Address.IPAddressToString
+                if ($text -like '169.254.*') { continue }
+                $ipv4 = $text
+                break
+            }
+            $gateway = ''
+            foreach ($gw in @($props.GatewayAddresses)) {
+                if ($gw.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { $gateway = $gw.Address.IPAddressToString; break }
+            }
+            if ([string]::IsNullOrWhiteSpace($ipv4)) { continue }
+
+            $dnsList = New-Object System.Collections.ArrayList
+            foreach ($dns in @($props.DnsAddresses)) {
+                if ($dns.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { [void]$dnsList.Add($dns.IPAddressToString) }
+            }
+
+            $item = [pscustomobject]@{
+                Name      = [string]$nic.Name
+                IPv4      = $ipv4
+                Gateway   = $gateway
+                Dns       = ($dnsList -join '、')
+                SpeedMbps = [int][Math]::Round([double]$nic.Speed / 1000000)
+                HasGateway = (-not [string]::IsNullOrWhiteSpace($gateway))
+            }
+            [void]$candidates.Add($item)
+            if ($null -eq $primary -and $item.HasGateway) { $primary = $item }
+        }
+    } catch {
+        $info.Error = $_.Exception.Message
+    }
+
+    if ($null -eq $primary) {
+        foreach ($item in $candidates) { if ($null -eq $primary) { $primary = $item } }
+    }
+    if ($null -ne $primary) {
+        $info.Adapter = $primary.Name
+        $info.IPv4 = $primary.IPv4
+        $info.Gateway = $primary.Gateway
+        $info.Dns = $primary.Dns
+        if ($primary.SpeedMbps -gt 0) { $info.SpeedText = ('{0} Mbps' -f $primary.SpeedMbps) }
+    }
+    $others = New-Object System.Collections.ArrayList
+    foreach ($item in $candidates) {
+        if ($null -ne $primary -and $item.Name -eq $primary.Name) { continue }
+        [void]$others.Add(('{0} {1}' -f $item.IPv4, $item.Name))
+    }
+    $info.Others = $others.ToArray()
+
+    # 网络名称 / 类别（普通权限下有时读不到，读不到就空着）
+    try {
+        $profile = Get-NetConnectionProfile -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $profile) {
+            $info.Profile = [string]$profile.Name
+            $info.Category = [string]$profile.NetworkCategory
+            $info.Connectivity = [string]$profile.IPv4Connectivity
+        }
+    } catch { }
+
+    return $info
+}
+
+function Get-NetworkInfo {
+    param([switch]$NoCache)
+
+    $ttl = [double]$script:Settings.NetworkInfoSeconds
+    if ($ttl -lt 5) { $ttl = 5 }
+    if (-not $NoCache -and $null -ne $script:NetworkCache -and $null -ne $script:NetworkCacheTime) {
+        if (((Get-Date) - $script:NetworkCacheTime).TotalSeconds -lt $ttl) { return $script:NetworkCache }
+    }
+    $script:NetworkCache = Get-NetworkInfoRaw
+    $script:NetworkCacheTime = Get-Date
+    return $script:NetworkCache
+}
+
+# ===================== 延迟探测（ICMP ping，不碰 Portal 的登录接口） =====================
+function Get-PingStatusText {
+    param($Status)
+
+    switch ([string]$Status) {
+        'Success'                    { return '正常' }
+        'TimedOut'                   { return '无响应（超时）' }
+        'DestinationHostUnreachable' { return '目标不可达' }
+        'DestinationNetUnreachable'  { return '网络不可达' }
+        'DestinationPortUnreachable' { return '端口不可达' }
+        'DestinationProhibited'      { return '被目标拒绝' }
+        'TtlExpired'                 { return 'TTL 过期' }
+        'BadDestination'             { return '地址无效' }
+        default {
+            if ([string]::IsNullOrWhiteSpace([string]$Status)) { return '无响应' }
+            return [string]$Status
+        }
+    }
+}
+
+function Get-LatencyTargets {
+    param($Network, $Portal)
+
+    $targets = New-Object System.Collections.ArrayList
+    $mode = [string]$script:Settings.PingTargets
+    if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'gateway,portal' }
+
+    if ($mode -match 'gateway' -and $null -ne $Network -and -not [string]::IsNullOrWhiteSpace($Network.Gateway)) {
+        [void]$targets.Add([pscustomobject]@{ Label = '网关'; Host = [string]$Network.Gateway })
+    }
+    if ($mode -match 'portal' -and $null -ne $Portal -and $Portal.Available -and -not [string]::IsNullOrWhiteSpace($Portal.Host)) {
+        $portalHost = [string]$Portal.Host
+        if ($portalHost -notmatch ':' -or $portalHost -match '^\[.*\]$') {
+            [void]$targets.Add([pscustomobject]@{ Label = 'Portal'; Host = $portalHost })
+        }
+    }
+    return $targets.ToArray()
+}
+
+function Add-LatencySample {
+    # 参数不能叫 $Host：那是 PowerShell 的只读自动变量
+    param([string]$Label, [string]$TargetHost, [bool]$Ok, [int]$RttMs)
+
+    if ([string]::IsNullOrWhiteSpace($Label)) { return }
+    if (-not $script:Latency.History.ContainsKey($Label)) {
+        $script:Latency.History[$Label] = [ordered]@{
+            Host    = $TargetHost
+            Samples = (New-Object System.Collections.ArrayList)
+        }
+    }
+    $entry = $script:Latency.History[$Label]
+    if (-not [string]::IsNullOrWhiteSpace($TargetHost)) { $entry.Host = $TargetHost }
+    [void]$entry.Samples.Add([pscustomobject]@{ Time = (Get-Date); Ok = $Ok; RttMs = $RttMs })
+
+    $limit = [int]$script:Settings.LatencySamples
+    if ($limit -lt 3) { $limit = 3 }
+    while ($entry.Samples.Count -gt $limit) { $entry.Samples.RemoveAt(0) }
+}
+
+function Get-LatencySummary {
+    $list = New-Object System.Collections.ArrayList
+    foreach ($label in $script:Latency.History.Keys) {
+        $entry = $script:Latency.History[$label]
+        $samples = @($entry.Samples)
+        if ($samples.Count -eq 0) { continue }
+        $okSamples = @($samples | Where-Object { $_.Ok })
+        $rtts = @($okSamples | ForEach-Object { [int]$_.RttMs })
+        $summary = [ordered]@{
+            Label     = $label
+            Host      = $entry.Host
+            Total     = $samples.Count
+            OkCount   = $okSamples.Count
+            LostCount = $samples.Count - $okSamples.Count
+            Current   = -1
+            Min       = 0
+            Max       = 0
+            Avg       = 0
+            Ok        = $false
+        }
+        $last = $samples[$samples.Count - 1]
+        if ($last.Ok) { $summary.Current = [int]$last.RttMs; $summary.Ok = $true }
+        if ($rtts.Count -gt 0) {
+            $summary.Min = ($rtts | Measure-Object -Minimum).Minimum
+            $summary.Max = ($rtts | Measure-Object -Maximum).Maximum
+            $summary.Avg = [int][Math]::Round((($rtts | Measure-Object -Average).Average))
+        }
+        [void]$list.Add([pscustomobject]$summary)
+    }
+    return @($list | Sort-Object -Property @{ Expression = { if ($_.Label -eq '网关') { 0 } else { 1 } } })
+}
+
+function Format-LatencyCurrent {
+    param($Summary)
+
+    if (-not $script:PingEnabled) { return '已关闭（PingEnabled=false）' }
+    $items = @($Summary)
+    if ($items.Count -eq 0) { return '（还没有采样）' }
+    $parts = New-Object System.Collections.ArrayList
+    foreach ($item in $items) {
+        if ($item.Ok) { [void]$parts.Add(('{0} {1}：{2} ms' -f $item.Label, $item.Host, $item.Current)) }
+        else { [void]$parts.Add(('{0} {1}：无响应' -f $item.Label, $item.Host)) }
+    }
+    return ($parts -join '｜')
+}
+
+function Format-LatencyStats {
+    param($Summary)
+
+    $items = @($Summary)
+    if ($items.Count -eq 0) { return '（还没有采样）' }
+    $parts = New-Object System.Collections.ArrayList
+    foreach ($item in $items) {
+        $loss = [int][Math]::Round(100.0 * $item.LostCount / [Math]::Max(1, $item.Total))
+        if ($item.OkCount -gt 0) {
+            [void]$parts.Add(('{0}：平均 {1} ms／最小 {2}／最大 {3}，丢包 {4}%（{5}/{6}）' -f $item.Label, $item.Avg, $item.Min, $item.Max, $loss, $item.LostCount, $item.Total))
+        } else {
+            [void]$parts.Add(('{0}：全部无响应，丢包 100%（{1}/{2}）' -f $item.Label, $item.LostCount, $item.Total))
+        }
+    }
+    return ($parts -join '｜')
+}
+
+function Invoke-LatencyProbeSync {
+    param($Targets, [int]$TimeoutMs)
+
+    if (-not $script:PingEnabled) { return }
+    if ($TimeoutMs -le 0) { $TimeoutMs = 1000 }
+    foreach ($target in @($Targets)) {
+        $ok = $false
+        $rtt = -1
+        try {
+            $ping = New-Object System.Net.NetworkInformation.Ping
+            try {
+                $reply = $ping.Send($target.Host, $TimeoutMs)
+                if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                    $ok = $true
+                    $rtt = [int]$reply.RoundtripTime
+                }
+            } finally { $ping.Dispose() }
+        } catch { }
+        Add-LatencySample -Label $target.Label -TargetHost $target.Host -Ok $ok -RttMs $rtt
+    }
+    $script:Latency.LastRun = Get-Date
+}
+
+function Start-LatencyProbe {
+    param($Targets, [int]$TimeoutMs)
+
+    if (-not $script:PingEnabled) { return }
+    if ($script:Latency.Running) { return }
+    if ($TimeoutMs -le 0) { $TimeoutMs = 1000 }
+
+    $pending = New-Object System.Collections.ArrayList
+    foreach ($target in @($Targets)) {
+        try {
+            $ping = New-Object System.Net.NetworkInformation.Ping
+            $task = $ping.SendPingAsync($target.Host, $TimeoutMs)
+            [void]$pending.Add([pscustomobject]@{
+                Label     = $target.Label
+                Host      = $target.Host
+                Ping      = $ping
+                Task      = $task
+                StartedAt = (Get-Date)
+            })
+        } catch {
+            Add-LatencySample -Label $target.Label -TargetHost $target.Host -Ok $false -RttMs -1
+        }
+    }
+    $script:Latency.Pending = $pending.ToArray()
+    $script:Latency.Running = ($pending.Count -gt 0)
+    $script:Latency.Error = ''
+}
+
+function Complete-LatencyProbe {
+    if (-not $script:Latency.Running) { return }
+
+    $timeout = [double]$script:Settings.PingTimeoutMs
+    if ($timeout -le 0) { $timeout = 1000 }
+
+    $stillPending = New-Object System.Collections.ArrayList
+    foreach ($item in @($script:Latency.Pending)) {
+        $elapsed = ((Get-Date) - $item.StartedAt).TotalMilliseconds
+        if ($item.Task.IsCompleted) {
+            $ok = $false
+            $rtt = -1
+            if ($item.Task.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) {
+                try {
+                    $reply = $item.Task.Result
+                    if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                        $ok = $true
+                        $rtt = [int]$reply.RoundtripTime
+                    }
+                } catch { }
+            }
+            Add-LatencySample -Label $item.Label -TargetHost $item.Host -Ok $ok -RttMs $rtt
+            try { $item.Ping.Dispose() } catch { }
+        } elseif ($elapsed -gt ($timeout + 5000)) {
+            Add-LatencySample -Label $item.Label -TargetHost $item.Host -Ok $false -RttMs -1
+            try { $item.Ping.Dispose() } catch { }
+        } else {
+            [void]$stillPending.Add($item)
+        }
+    }
+    $script:Latency.Pending = $stillPending.ToArray()
+    if ($stillPending.Count -eq 0) {
+        $script:Latency.Running = $false
+        $script:Latency.LastRun = Get-Date
+    }
+}
 function Invoke-MonitorStatusCheck {
     # 注意：PowerShell 里 $Host 是只读的自动变量，不能用作参数名
     param([string]$PortalHost, [string]$StatusPath, [int]$TimeoutSec)
@@ -610,6 +940,7 @@ function Get-MonitorSnapshot {
     $task = Get-MonitorTask -TaskName $script:TaskName
     $audit = Get-MonitorPathAudit -Task $task
     $portal = Resolve-MonitorPortal -Audit $audit
+    $network = Get-NetworkInfo
     $entries = Read-MonitorLog -DataDir $DataDir
     $stats = Get-MonitorLogStats -Entries $entries -WindowHours $script:LogStatsWindowHours
 
@@ -688,6 +1019,8 @@ function Get-MonitorSnapshot {
         Task              = $task
         Audit             = $audit
         Portal            = $portal
+        Network           = $network
+        Latency           = (Get-LatencySummary)
         Stats             = $stats
         LogEntries        = $entries
         InstalledVersion  = $installedVersion
@@ -816,6 +1149,36 @@ function Get-MonitorMetricRows {
     $statsText = ('最近 {0} 小时：登录 {1} 次｜成功 {2}｜失败 {3}｜Portal 限流 {4}｜重复认证冲突 {5}｜掉线 {6}' -f `
         $stats.WindowHours, $stats.LoginAttempts, $stats.LoginSuccess, $stats.LoginFailed, $stats.Throttled, $stats.Conflicts, $stats.Offline)
 
+    $network = $Snapshot.Network
+    $ipText = '（读不到网卡信息）'
+    if ($null -ne $network -and -not [string]::IsNullOrWhiteSpace($network.IPv4)) {
+        $ipText = $network.IPv4
+        if (-not [string]::IsNullOrWhiteSpace($network.Adapter)) { $ipText = ('{0}｜{1}' -f $network.IPv4, $network.Adapter) }
+        if (-not [string]::IsNullOrWhiteSpace($network.SpeedText)) { $ipText = ('{0}（{1}）' -f $ipText, $network.SpeedText) }
+        if ($network.Others.Count -gt 0) { $ipText = ('{0}；其它：{1}' -f $ipText, ($network.Others -join '，')) }
+    }
+
+    $gatewayText = '（没有默认网关）'
+    if ($null -ne $network -and -not [string]::IsNullOrWhiteSpace($network.Gateway)) { $gatewayText = $network.Gateway }
+
+    $profileText = '（读不到网络名称，普通权限下可能取不到）'
+    if ($null -ne $network -and -not [string]::IsNullOrWhiteSpace($network.Profile)) {
+        $profileText = $network.Profile
+        $extras = @()
+        if (-not [string]::IsNullOrWhiteSpace($network.Category)) { $extras += $network.Category }
+        if (-not [string]::IsNullOrWhiteSpace($network.Connectivity)) { $extras += $network.Connectivity }
+        if ($extras.Count -gt 0) { $profileText = ('{0}（{1}）' -f $profileText, ($extras -join '，')) }
+    }
+
+    $dnsText = '（无记录）'
+    if ($null -ne $network -and -not [string]::IsNullOrWhiteSpace($network.Dns)) { $dnsText = $network.Dns }
+
+    $latency = @($Snapshot.Latency)
+    $latencyText = Format-LatencyCurrent -Summary $latency
+    if ($script:Latency.Running) { $latencyText = $latencyText + '（正在探测…）' }
+    $latencyStatsText = Format-LatencyStats -Summary $latency
+    if (-not $script:PingEnabled) { $latencyStatsText = '延迟探测已关闭（monitor-config.json 里把 PingEnabled 设回 true 即可打开）' }
+
     $add = {
         param([string]$Group, [string]$Label, [string]$Value, $Color)
         [void]$rows.Add([pscustomobject]@{ Group = $Group; Label = $Label; Value = $Value; Color = $Color })
@@ -836,6 +1199,12 @@ function Get-MonitorMetricRows {
     & $add '任务' '路径体检·隐藏启动器' $vbsText $vbsColor
     & $add '任务' '路径体检·主脚本' $ps1Text $ps1Color
     & $add '任务' '已安装脚本版本' $versionText $versionColor
+    & $add '网络' '本机地址' $ipText $null
+    & $add '网络' '默认网关' $gatewayText $null
+    & $add '网络' '网络类型' $profileText $null
+    & $add '网络' 'DNS 服务器' $dnsText $null
+    & $add '网络' '网络延迟' $latencyText $(if ($latency.Count -gt 0 -and -not $latency[0].Ok) { '#C87800' } else { $null })
+    & $add '网络' '延迟统计' $latencyStatsText $null
     & $add '数据' '数据目录' $Snapshot.DataDir $null
     & $add '数据' 'state.json 修改时间' $stateMtimeText $null
     & $add '数据' '统计' $statsText $null
@@ -884,6 +1253,14 @@ function Format-MonitorText {
 }
 
 # ===================== 入口 =====================
+# -DumpOnce 是先探一次延迟，这样命令行输出里也有 IP 与延迟信息
+if ($DumpOnce) {
+    if ($script:PingEnabled) {
+        $latencyTargets = Get-LatencyTargets -Network (Get-NetworkInfo -NoCache) -Portal (Resolve-MonitorPortal -Audit (Get-MonitorPathAudit -Task (Get-MonitorTask -TaskName $script:TaskName)))
+        Invoke-LatencyProbeSync -Targets $latencyTargets -TimeoutMs ([int][double]$script:Settings.PingTimeoutMs)
+    }
+}
+
 $script:Snapshot = Get-MonitorSnapshot -DataDir $DataDir
 
 if ($DumpOnce) {
@@ -1220,15 +1597,39 @@ if ($refreshSeconds -lt 1) { $refreshSeconds = 5 }
 $refreshTimer.Interval = [int]($refreshSeconds * 1000)
 $refreshTimer.Add_Tick({ Update-MonitorUi })
 
+# 延迟探测单独一个更慢的节奏：只发 ICMP，不碰 Portal 的登录接口
+$pingTimer = New-Object System.Windows.Forms.Timer
+$pingSeconds = [double]$script:Settings.PingIntervalSeconds
+if ($pingSeconds -lt 3) { $pingSeconds = 10 }
+$pingTimer.Interval = [int]($pingSeconds * 1000)
+$pingTimer.Add_Tick({
+    try {
+        if ($script:Latency.Running) { Complete-LatencyProbe }
+        else {
+            $targets = Get-LatencyTargets -Network (Get-NetworkInfo) -Portal $script:Snapshot.Portal
+            if (@($targets).Count -gt 0) { Start-LatencyProbe -Targets $targets -TimeoutMs ([int][double]$script:Settings.PingTimeoutMs) }
+        }
+    } catch {
+        $script:Latency.Error = $_.Exception.Message
+        $script:Latency.Running = $false
+    }
+})
+
 $form.Add_Shown({
     try { $content.SplitterDistance = [int]($content.Height * 0.55) } catch { }
     Update-MonitorUi
     $refreshTimer.Start()
+    try {
+        $targets = Get-LatencyTargets -Network (Get-NetworkInfo -NoCache) -Portal $script:Snapshot.Portal
+        if (@($targets).Count -gt 0) { Start-LatencyProbe -Targets $targets -TimeoutMs ([int][double]$script:Settings.PingTimeoutMs) }
+    } catch { }
+    $pingTimer.Start()
 })
 
 $form.Add_FormClosing({
     try { $refreshTimer.Stop() } catch { }
     try { $disableTimer.Stop() } catch { }
+    try { $pingTimer.Stop() } catch { }
 })
 
 # ---- 显示窗口 ----
@@ -1236,6 +1637,11 @@ if ($SelfTest) {
     try {
         $form.Show()
         [System.Windows.Forms.Application]::DoEvents()
+        # 顺带跑一次真实的延迟探测，确保这条链路在冒烟测试里也被覆盖
+        try {
+            $targets = Get-LatencyTargets -Network (Get-NetworkInfo -NoCache) -Portal $script:Snapshot.Portal
+            Invoke-LatencyProbeSync -Targets $targets -TimeoutMs ([int][double]$script:Settings.PingTimeoutMs)
+        } catch { }
         Update-MonitorUi
         [System.Windows.Forms.Application]::DoEvents()
         $form.Close()
