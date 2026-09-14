@@ -6,6 +6,10 @@ Windows 下的校园网 Portal 自动登录工具。**每 30 秒**检查一次�
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6)](https://www.microsoft.com/windows/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
+> **1.9.0 是 1.x 系列的最终版本（功能冻结）。** 新用户建议直接使用 2.0 的单文件程序
+> `CampusNet.exe`（见 [Releases](../../releases)）：不需要 PowerShell、不需要计划任务、不需要管理员权限。
+> 1.x 会继续可用，但不再添加新功能。
+
 ---
 
 ## 功能
@@ -173,9 +177,13 @@ powershell -ExecutionPolicy Bypass -File .\Diagnose-CampusAutoLogin.ps1
 
 详细说明见 [`monitor/README.md`](monitor/README.md)。
 
-### 以后会和主包合并吗
+### 会和主包合并吗
 
-会——这一版（`v1.8.0-pre.1`）先把面板重写好、把约定写清楚，真正合并留到后面的正式版本。约定是：
+**已经合并了**——2.0 把自动登录与监控面板合成了一个单文件 `CampusNet.exe`（不需要 PowerShell、
+不注册计划任务），那一版就是合并的最终形态。
+
+1.9.0 是 1.x 线的收官版本，仍然保持「自动登录包 + 监控面板包」两个 zip 分开下载，不再做合并，
+也不再添加新功能。当初为合并定下的约定（1.x 仍然遵守，细则见 [`monitor/README.md`](monitor/README.md)）是：
 
 - 面板文件整体放在主包的 `monitor\` 目录下，入口固定为 `monitor\启动监控面板.vbs`；
 - 面板不依赖自己的路径：Portal 地址按「计划任务动作链指向的主脚本目录 → 面板自己的 `monitor-config.json` → 内置默认值」解析，所以放在哪个目录都能用；
@@ -407,7 +415,7 @@ powershell -ExecutionPolicy Bypass -File .\Install-CampusAutoLoginTask.ps1 -Scri
 
 ## 更新日志
 
-各版本的改动记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本：**1.8.0-pre.1**（2026-09-13，预发布）。
+各版本的改动记录见 [CHANGELOG.md](CHANGELOG.md)，当前版本：**1.9.0**（2026-09-14，1.x 系列的最终正式版）。
 
 ## License
 

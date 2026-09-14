@@ -41,7 +41,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:MonitorVersion = '2.0.0'
-$script:ExpectedAssistVersion = '1.8.0'
+$script:ExpectedAssistVersion = '1.9.0'
 $script:TaskName = 'CampusAutoLogin'
 
 $ScriptRoot = $PSScriptRoot

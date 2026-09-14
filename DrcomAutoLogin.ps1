@@ -109,7 +109,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:QuietMode = [bool]$Quiet
-$script:ScriptVersion = '1.8.0'
+$script:ScriptVersion = '1.9.0'
 
 # ===================== 路径解析 =====================
 $ScriptRoot = $PSScriptRoot
