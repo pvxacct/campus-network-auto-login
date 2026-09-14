@@ -48,6 +48,11 @@
 - 数据目录变化：`%LOCALAPPDATA%\CampusAutoLogin`（旧）→ `%LOCALAPPDATA%\CampusNet`（新）。
 - 2.0 不再使用计划任务；如果你之前用「暂停 / 恢复」.cmd 停过脚本，那两个文件也随旧版一起清理。
 
+### 说明
+
+- 发布附件只提供 `CampusNet.exe` 一个文件：源码在仓库 `main` 分支，使用说明见 `docs/使用说明.md`。
+- 1.x 的收官版本 **1.9.0** 仍在 Releases 里，供继续使用 PowerShell 版的同学下载。
+
 ## [1.8.0-pre.1] - 2026-09-13
 
 **预发布（Pre-release）**：监控面板从头重写成 WPF 浅色现代界面。自动登录脚本只有版本号变化，

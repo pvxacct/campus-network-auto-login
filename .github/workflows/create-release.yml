@@ -1,4 +1,5 @@
-# 为 v* 标签创建 GitHub Release，附上打包好的单文件 exe（解压即用）与源码包。
+# 为 v* 标签创建 GitHub Release，只附上一个文件：单文件 exe（CampusNet.exe）。
+# 源码在仓库 main 分支，使用说明见 docs/使用说明.md。
 # 触发方式：
 #   1) 推送 v* 标签（例如 git push origin v2.0.0-pre.1）时自动运行，发布该标签；
 #   2) 在 Actions 页面点 “Run workflow” 手动运行（可指定标签、可勾选 Pre-release）。
@@ -33,7 +34,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build assets
+      - name: Check executable
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
@@ -42,32 +43,13 @@ jobs:
           if [ -z "$tag" ]; then tag="$(git describe --tags --abbrev=0)"; fi
           echo "tag=$tag" >> "$GITHUB_ENV"
 
+          # 发布只提供单个 exe；源码在仓库 main 分支，使用说明在 docs/使用说明.md。
           if [ ! -f dist/CampusNet.exe ]; then
             echo "缺少 dist/CampusNet.exe —— 请先运行 build/Build-CampusNet.ps1 并提交产物。" >&2
             exit 1
           fi
-          mkdir -p dist
-
-          # 1) 解压即用的单文件 exe（exe + 使用说明 + LICENSE + 校验和）
-          staging="$(mktemp -d)"
-          cp dist/CampusNet.exe "$staging/CampusNet.exe"
-          cp "docs/使用说明.md" "$staging/使用说明.md"
-          cp LICENSE "$staging/LICENSE"
-          (
-            cd "$staging"
-            sha256sum CampusNet.exe "使用说明.md" LICENSE > SHA256SUMS.txt
-            zip -q -r "$GITHUB_WORKSPACE/dist/campus-net-$tag.zip" .
-          )
-          rm -rf "$staging"
-
-          # 2) 源码包（不含 .github 与 dist 产物目录）
-          git -c core.autocrlf=true archive --format=zip \
-            --prefix="campus-net-$tag/" \
-            -o "dist/campus-net-source-$tag.zip" "$tag" \
-            -- . ':(exclude).github' ':(exclude)dist'
-
-          ls -l dist
-          sha256sum dist/*.zip
+          ls -l dist/CampusNet.exe
+          sha256sum dist/CampusNet.exe
 
       - name: Publish release
         env:
@@ -79,8 +61,7 @@ jobs:
           tag="${INPUT_TAG:-}"
           if [ -z "$tag" ]; then tag="$(git describe --tags --abbrev=0)"; fi
           ver="${tag#v}"
-          zip="dist/campus-net-$tag.zip"
-          source_zip="dist/campus-net-source-$tag.zip"
+          exe="dist/CampusNet.exe"
           echo "tag=$tag"
 
           create_flags=(--latest)
@@ -107,5 +88,14 @@ jobs:
             gh release create "$tag" --title "$title" --verify-tag "${create_flags[@]}" "${notes[@]}"
           fi
 
-          gh release upload "$tag" "$zip" "$source_zip" dist/CampusNet.exe --clobber
+          gh release upload "$tag" "$exe" --clobber
+
+          # 只保留 CampusNet.exe：清掉这个 Release 里其它附件（例如历史版本留下的源码包 / 解压包）
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            echo "删除多余附件：$name"
+            gh release delete-asset "$tag" "$name" --yes
+          done < <(gh release view "$tag" --json assets -q '.assets[].name | select(. != "CampusNet.exe")')
+
+          echo "=== 最终附件列表 ==="
           gh release view "$tag" --json tagName,name,isPrerelease,url,assets

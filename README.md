@@ -20,7 +20,7 @@ Windows 下的校园网 Portal 自动登录工具。2.0 把「自动登录」和
 
 ## 下载与首次使用
 
-1. 到 [Releases](../../releases) 下载 `campus-net-2.0.0-pre.1.zip`，解压得到 `CampusNet.exe`（也可以直接下载单独的 exe）。
+1. 到 [Releases](../../releases) 下载 `CampusNet.exe`（2.0 的发布只有这一个文件；源码在仓库 `main` 分支，详细说明见 [docs/使用说明.md](docs/使用说明.md)）。
 2. 双击 `CampusNet.exe`。首次运行可能出现 Windows SmartScreen 提示（程序没有花钱买数字签名），
    点「更多信息 → 仍要运行」即可。
 3. 在窗口右上「账号」卡片里填校园网账号和密码，点 **保存账号密码**。
@@ -130,7 +130,7 @@ CampusNet.exe --version
 - 1.x 的计划任务 `CampusAutoLogin`、脚本目录 `C:\CampusAutoLogin`、旧数据目录
   `%LOCALAPPDATA%\CampusAutoLogin` 都可以由 2.0 的「清理旧版残留」处理（旧数据目录默认保留，可手动删除）。
 - 账号密码不会自动迁移，重新输入一次即可。
-- 1.x 的历史版本仍在 Releases 里，可以随时回退。
+- 1.x 的历史版本仍在 Releases 里，可以随时回退；1.x 的收官版本是 **1.9.0**（功能冻结，仍可下载）。
 
 ## 源码与构建
 
