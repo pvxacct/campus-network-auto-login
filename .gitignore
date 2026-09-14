@@ -1,4 +1,5 @@
 # 凭据与日志，绝不能提交
+credentials.dat
 credential.xml
 *.log
 *.log.old
@@ -8,6 +9,12 @@ id_ed25519
 id_ed25519.pub
 *.pem
 *.ppk
+
+# 编译中间产物（dist\CampusNet.exe 是要提交的发布产物，不要忽略）
+bin/
+obj/
+src/CampusNet/bin/
+src/CampusNet/obj/
 
 # 临时文件
 work/

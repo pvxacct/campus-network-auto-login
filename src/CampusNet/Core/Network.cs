@@ -1,0 +1,507 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace CampusNet.Core
+{
+    /// <summary>一个探测目标：tcp:host:port 或 icmp:host。</summary>
+    public sealed class ProbeTarget
+    {
+        public string Kind = "tcp";
+        public string Host = string.Empty;
+        public int Port;
+
+        public string Display
+        {
+            get { return Kind == "icmp" ? Host : Host + ":" + Port.ToString(CultureInfo.InvariantCulture); }
+        }
+
+        public static ProbeTarget Parse(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) { return null; }
+            string value = text.Trim();
+            var target = new ProbeTarget();
+            if (value.StartsWith("icmp:", StringComparison.OrdinalIgnoreCase))
+            {
+                target.Kind = "icmp";
+                target.Host = value.Substring(5).Trim();
+                return string.IsNullOrEmpty(target.Host) ? null : target;
+            }
+            if (value.StartsWith("tcp:", StringComparison.OrdinalIgnoreCase)) { value = value.Substring(4).Trim(); }
+            int separator = value.LastIndexOf(':');
+            if (separator <= 0 || separator == value.Length - 1) { return null; }
+            target.Kind = "tcp";
+            target.Host = value.Substring(0, separator).Trim();
+            int port;
+            if (!int.TryParse(value.Substring(separator + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out port)) { return null; }
+            target.Port = port;
+            return string.IsNullOrEmpty(target.Host) ? null : target;
+        }
+    }
+
+    public sealed class ProbeOutcome
+    {
+        public bool Online;
+        public int Successes;
+        public int Attempts;
+        public int LatencyMs = -1;
+        public int LossPercent = 100;
+        public readonly List<string> Failures = new List<string>();
+
+        public string Summary
+        {
+            get
+            {
+                if (Attempts == 0) { return "没有可用的探测目标"; }
+                if (Online) { return "连通（" + Successes + "/" + Attempts + "，延迟 " + LatencyMs + " ms）"; }
+                return "不通（" + Successes + "/" + Attempts + "）" + (Failures.Count > 0 ? "：" + Failures[0] : string.Empty);
+            }
+        }
+    }
+
+    public sealed class NetworkInfo
+    {
+        public string AdapterName = string.Empty;
+        public string AdapterType = string.Empty;
+        public string IPv4 = string.Empty;
+        public string Gateway = string.Empty;
+        public string Dns = string.Empty;
+        public bool HasAdapter;
+    }
+
+    /// <summary>纯本地网络探测：不发任何 Portal 请求，只做 TCP 连接与 ICMP。</summary>
+    public static class NetworkProbe
+    {
+        public static ProbeOutcome Probe(AppConfig config, int rounds, int gapMs)
+        {
+            var outcome = new ProbeOutcome();
+            var targets = new List<ProbeTarget>();
+            foreach (string text in config.ProbeTargets)
+            {
+                ProbeTarget target = ProbeTarget.Parse(text);
+                if (target != null) { targets.Add(target); }
+            }
+            if (targets.Count == 0) { outcome.Online = true; outcome.LossPercent = 0; return outcome; }
+
+            int round = Math.Max(1, rounds);
+            for (int i = 0; i < round; i++)
+            {
+                if (i > 0 && gapMs > 0) { System.Threading.Thread.Sleep(gapMs); }
+                foreach (ProbeTarget target in targets)
+                {
+                    outcome.Attempts++;
+                    int latency;
+                    bool ok = target.Kind == "icmp"
+                        ? PingTarget(target.Host, config.ProbeTimeoutMs, out latency)
+                        : TcpTarget(target.Host, target.Port, config.ProbeTimeoutMs, out latency);
+                    if (ok)
+                    {
+                        outcome.Successes++;
+                        if (latency >= 0 && (outcome.LatencyMs < 0 || latency < outcome.LatencyMs)) { outcome.LatencyMs = latency; }
+                    }
+                    else if (!outcome.Failures.Contains(target.Display))
+                    {
+                        outcome.Failures.Add(target.Display);
+                    }
+                }
+                if (outcome.Successes > 0) { break; }
+            }
+
+            outcome.Online = outcome.Successes > 0;
+            outcome.LossPercent = outcome.Attempts == 0
+                ? 100
+                : (int)Math.Round(100.0 * (outcome.Attempts - outcome.Successes) / outcome.Attempts);
+            return outcome;
+        }
+
+        public static bool TcpTarget(string host, int port, int timeoutMs, out int latencyMs)
+        {
+            latencyMs = -1;
+            var client = new TcpClient();
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                IAsyncResult result = client.BeginConnect(host, port, null, null);
+                if (!result.AsyncWaitHandle.WaitOne(timeoutMs))
+                {
+                    return false;
+                }
+                client.EndConnect(result);
+                watch.Stop();
+                latencyMs = (int)watch.ElapsedMilliseconds;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                try { client.Close(); } catch { }
+            }
+        }
+
+        public static bool PingTarget(string host, int timeoutMs, out int latencyMs)
+        {
+            latencyMs = -1;
+            try
+            {
+                using (var ping = new Ping())
+                {
+                    PingReply reply = ping.Send(host, timeoutMs);
+                    if (reply != null && reply.Status == IPStatus.Success)
+                    {
+                        latencyMs = (int)reply.RoundtripTime;
+                        return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        public static NetworkInfo GetNetworkInfo()
+        {
+            var info = new NetworkInfo();
+            try
+            {
+                NetworkInterface best = null;
+                foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (nic.OperationalStatus != OperationalStatus.Up) { continue; }
+                    if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) { continue; }
+                    IPInterfaceProperties properties = nic.GetIPProperties();
+                    bool hasGateway = properties.GatewayAddresses.Count > 0;
+                    bool hasUnicast = false;
+                    foreach (UnicastIPAddressInformation address in properties.UnicastAddresses)
+                    {
+                        if (address.Address.AddressFamily != AddressFamily.InterNetwork) { continue; }
+                        string text = address.Address.ToString();
+                        if (text.StartsWith("169.254.", StringComparison.Ordinal)) { continue; }
+                        hasUnicast = true;
+                        break;
+                    }
+                    if (!hasUnicast) { continue; }
+                    if (best == null || (hasGateway && best.GetIPProperties().GatewayAddresses.Count == 0)) { best = nic; }
+                }
+
+                if (best == null) { return info; }
+                info.HasAdapter = true;
+                info.AdapterName = best.Name;
+                info.AdapterType = DescribeType(best.NetworkInterfaceType);
+                IPInterfaceProperties props = best.GetIPProperties();
+                foreach (UnicastIPAddressInformation address in props.UnicastAddresses)
+                {
+                    if (address.Address.AddressFamily != AddressFamily.InterNetwork) { continue; }
+                    string text = address.Address.ToString();
+                    if (text.StartsWith("169.254.", StringComparison.Ordinal)) { continue; }
+                    info.IPv4 = text;
+                    break;
+                }
+                foreach (GatewayIPAddressInformation gateway in props.GatewayAddresses)
+                {
+                    if (gateway.Address.AddressFamily != AddressFamily.InterNetwork) { continue; }
+                    info.Gateway = gateway.Address.ToString();
+                    break;
+                }
+                var dns = new List<string>();
+                foreach (IPAddress address in props.DnsAddresses)
+                {
+                    if (address.AddressFamily == AddressFamily.InterNetwork) { dns.Add(address.ToString()); }
+                }
+                info.Dns = string.Join(" / ", dns.ToArray());
+            }
+            catch { }
+            return info;
+        }
+
+        private static string DescribeType(NetworkInterfaceType type)
+        {
+            switch (type)
+            {
+                case NetworkInterfaceType.Wireless80211: return "无线";
+                case NetworkInterfaceType.Ethernet: return "有线";
+                case NetworkInterfaceType.GigabitEthernet: return "有线";
+                case NetworkInterfaceType.FastEthernetT: return "有线";
+                case NetworkInterfaceType.FastEthernetFx: return "有线";
+                case NetworkInterfaceType.Ppp: return "拨号";
+                case NetworkInterfaceType.Tunnel: return "隧道";
+                default: return type.ToString();
+            }
+        }
+    }
+
+    public sealed class StatusResult
+    {
+        public bool Reachable;
+        public bool Online;
+        public string Text = string.Empty;
+        public string Error = string.Empty;
+        public string UserId = string.Empty;
+    }
+
+    public sealed class PortalLoginResult
+    {
+        public bool Success;
+        public bool RateLimited;
+        public bool AlreadyOnline;
+        public string Message = string.Empty;
+    }
+
+    /// <summary>Dr.COM ePortal 接口客户端。所有请求都显式绕过系统代理，避免被本机代理软件劫持。</summary>
+    public sealed class PortalClient
+    {
+        private readonly AppConfig _config;
+
+        public PortalClient(AppConfig config) { _config = config; }
+
+        public StatusResult GetStatus()
+        {
+            var result = new StatusResult();
+            try
+            {
+                string callback = "dr" + new Random().Next(100, 9999).ToString(CultureInfo.InvariantCulture);
+                string url = _config.StatusUrl + "?callback=" + callback + "&v=" + callback + "&lang=zh&jsVersion=4.X";
+                string text = Get(url, _config.StatusTimeoutSec);
+                result.Text = text;
+                Dictionary<string, object> map = ParseJsonp(text);
+                if (map != null && map.ContainsKey("result"))
+                {
+                    result.Reachable = true;
+                    result.Online = Json.GetInt(map, "result", 0) == 1;
+                    result.UserId = Json.GetString(map, "uid", string.Empty);
+                }
+                else
+                {
+                    var match = Regex.Match(text ?? string.Empty, "\"result\"\\s*:\\s*(-?\\d+)");
+                    if (match.Success)
+                    {
+                        result.Reachable = true;
+                        result.Online = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture) == 1;
+                    }
+                    else
+                    {
+                        result.Error = "状态接口返回无法解析：" + Shorten(text);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                result.Error = Describe(ex);
+            }
+            return result;
+        }
+
+        public PortalLoginResult Login(string userName, string password)
+        {
+            var result = new PortalLoginResult();
+            var fields = new List<KeyValuePair<string, string>>();
+            fields.Add(new KeyValuePair<string, string>("DDDDD", userName));
+            fields.Add(new KeyValuePair<string, string>("upass", password));
+            foreach (var pair in _config.StaticFields)
+            {
+                fields.Add(new KeyValuePair<string, string>(pair.Key, pair.Value ?? string.Empty));
+            }
+
+            string text;
+            try
+            {
+                text = Post(_config.LoginUrl, fields, _config.LoginTimeoutSec);
+            }
+            catch (Exception ex)
+            {
+                result.Message = Describe(ex);
+                return result;
+            }
+
+            if (text == null) { text = string.Empty; }
+            if (text.IndexOf("Dr.COMWebLoginID_3.htm", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                result.Success = true;
+                result.Message = "登录成功";
+                return result;
+            }
+            if (text.IndexOf("Dr.COMWebLoginID_2.htm", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                string msg = Match(text, "Msg=(\\d+)");
+                string msga = Match(text, "msga='([^']*)'");
+                string prompt = Translate(msga);
+                result.AlreadyOnline = msga.IndexOf("userid error2", StringComparison.OrdinalIgnoreCase) >= 0;
+                result.RateLimited = msga.IndexOf("waitsec", StringComparison.OrdinalIgnoreCase) >= 0;
+                result.Message = "Msg=" + msg + ", " + msga + " -> " + prompt;
+                return result;
+            }
+            if (text.IndexOf("Error code:", StringComparison.OrdinalIgnoreCase) >= 0 && text.IndexOf("205", StringComparison.Ordinal) >= 0)
+            {
+                result.RateLimited = true;
+                result.Message = "请求过于频繁：" + Shorten(text);
+                return result;
+            }
+            if (text.IndexOf("waitsec", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                result.RateLimited = true;
+                result.Message = "请求过于频繁：" + Shorten(text);
+                return result;
+            }
+            result.Message = "未知响应：" + Shorten(text);
+            return result;
+        }
+
+        public bool Logout()
+        {
+            try
+            {
+                string callback = "dr" + new Random().Next(100, 9999).ToString(CultureInfo.InvariantCulture);
+                string url = _config.LogoutUrl + "?callback=" + callback + "&v=" + callback + "&lang=zh&jsVersion=4.X";
+                string text = Get(url, _config.StatusTimeoutSec);
+                Dictionary<string, object> map = ParseJsonp(text);
+                return map != null && Json.GetInt(map, "result", 0) == 1;
+            }
+            catch { return false; }
+        }
+
+        public string Translate(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code)) { return string.Empty; }
+            try
+            {
+                string url = _config.ErrorUrl + "?error_code=" + Uri.EscapeDataString(code) + "&callback=dr1&jsVersion=4.X&v=1&lang=zh";
+                string text = Get(url, _config.StatusTimeoutSec);
+                Dictionary<string, object> map = ParseJsonp(text);
+                if (map != null)
+                {
+                    string prompt = Json.GetString(map, "error_prompt_zh", string.Empty);
+                    if (!string.IsNullOrEmpty(prompt)) { return prompt; }
+                }
+            }
+            catch { }
+            return code;
+        }
+
+        private static Dictionary<string, object> ParseJsonp(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) { return null; }
+            int start = text.IndexOf('(');
+            int end = text.LastIndexOf(')');
+            string json = start >= 0 && end > start ? text.Substring(start + 1, end - start - 1) : text;
+            try { return Json.ReadObjectFromText(json); } catch { return null; }
+        }
+
+        private static string Match(string text, string pattern)
+        {
+            Match match = Regex.Match(text ?? string.Empty, pattern);
+            return match.Success ? match.Groups[1].Value : string.Empty;
+        }
+
+        private static string Shorten(string text)
+        {
+            if (string.IsNullOrEmpty(text)) { return string.Empty; }
+            string flat = Regex.Replace(text, "\\s+", " ").Trim();
+            return flat.Length > 200 ? flat.Substring(0, 200) : flat;
+        }
+
+        private static string Describe(Exception ex)
+        {
+            var web = ex as WebException;
+            if (web != null)
+            {
+                if (web.Status == WebExceptionStatus.Timeout) { return "请求超时"; }
+                if (web.Status == WebExceptionStatus.NameResolutionFailure) { return "域名解析失败"; }
+                if (web.Status == WebExceptionStatus.ConnectFailure) { return "无法连接到 Portal"; }
+                return web.Message;
+            }
+            return ex.Message;
+        }
+
+        private string Get(string url, int timeoutSec)
+        {
+            HttpWebRequest request = CreateRequest(url, timeoutSec, "GET");
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                return ReadText(response, request);
+            }
+        }
+
+        private string Post(string url, List<KeyValuePair<string, string>> fields, int timeoutSec)
+        {
+            HttpWebRequest request = CreateRequest(url, timeoutSec, "POST");
+            request.ContentType = "application/x-www-form-urlencoded";
+            request.Referer = "http://" + _config.PortalHost + "/";
+            var body = new StringBuilder();
+            foreach (var pair in fields)
+            {
+                if (body.Length > 0) { body.Append('&'); }
+                body.Append(Uri.EscapeDataString(pair.Key)).Append('=').Append(Uri.EscapeDataString(pair.Value));
+            }
+            byte[] payload = Encoding.UTF8.GetBytes(body.ToString());
+            request.ContentLength = payload.Length;
+            using (Stream stream = request.GetRequestStream())
+            {
+                stream.Write(payload, 0, payload.Length);
+            }
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                return ReadText(response, request);
+            }
+        }
+
+        private HttpWebRequest CreateRequest(string url, int timeoutSec, string method)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            request.Method = method;
+            request.Timeout = timeoutSec * 1000;
+            request.ReadWriteTimeout = timeoutSec * 1000;
+            request.AllowAutoRedirect = true;
+            request.UserAgent = _config.UserAgent;
+            request.KeepAlive = false;
+            request.Accept = "*/*";
+#pragma warning disable 618
+            request.Proxy = GlobalProxySelection.GetEmptyWebProxy();
+#pragma warning restore 618
+            return request;
+        }
+
+        private static string ReadText(HttpWebResponse response, HttpWebRequest request)
+        {
+            byte[] buffer;
+            using (Stream stream = response.GetResponseStream())
+            {
+                if (stream == null) { return string.Empty; }
+                using (var memory = new MemoryStream())
+                {
+                    var chunk = new byte[8192];
+                    int read;
+                    while ((read = stream.Read(chunk, 0, chunk.Length)) > 0)
+                    {
+                        memory.Write(chunk, 0, read);
+                        if (memory.Length > 2 * 1024 * 1024) { break; }
+                    }
+                    buffer = memory.ToArray();
+                }
+            }
+            string charset = null;
+            try { charset = response.CharacterSet; } catch { }
+            if (string.IsNullOrEmpty(charset))
+            {
+                string header = response.ContentType;
+                if (!string.IsNullOrEmpty(header))
+                {
+                    Match match = Regex.Match(header, "charset=([\\w-]+)", RegexOptions.IgnoreCase);
+                    if (match.Success) { charset = match.Groups[1].Value; }
+                }
+            }
+            if (!string.IsNullOrEmpty(charset))
+            {
+                try { return Encoding.GetEncoding(charset).GetString(buffer); } catch { }
+            }
+            try { return new UTF8Encoding(false, true).GetString(buffer); } catch { }
+            return Encoding.GetEncoding(28591).GetString(buffer);
+        }
+    }
+}

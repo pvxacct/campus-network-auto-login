@@ -1,0 +1,65 @@
+# 校验仓库里提交的 dist\CampusNet.exe 与源码一致：在 Windows 上重新编译，
+# 检查版本号、命令行自检，并和已提交的产物比对。
+name: Build & Verify
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build from source
+        shell: pwsh
+        run: |
+          dotnet build src\CampusNet\CampusNet.csproj -c Release --nologo
+          if ($LASTEXITCODE -ne 0) { throw '编译失败' }
+
+      - name: Smoke test built exe
+        shell: pwsh
+        run: |
+          $exe = 'src\CampusNet\bin\Release\net48\CampusNet.exe'
+          $version = (& $exe --version | Out-String).Trim()
+          Write-Host "版本：$version"
+          if ($version -ne '2.0.0') { throw "版本号不符合预期：$version" }
+          & $exe --status
+
+      - name: Verify committed exe
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist\CampusNet.exe')) { throw '仓库缺少 dist\CampusNet.exe' }
+          $built = (Get-FileHash 'src\CampusNet\bin\Release\net48\CampusNet.exe' -Algorithm SHA256).Hash
+          $committed = (Get-FileHash 'dist\CampusNet.exe' -Algorithm SHA256).Hash
+          Write-Host "构建产物：$built"
+          Write-Host "仓库产物：$committed"
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF -replace '^refs/tags/v', '' } else { '' }
+          $exeVersion = (& 'dist\CampusNet.exe' --version | Out-String).Trim()
+          Write-Host "exe 版本：$exeVersion"
+          if ($tag -and -not $tag.StartsWith($exeVersion)) { throw "标签 $tag 与 exe 版本 $exeVersion 不一致" }
+          if ($built -ne $committed) {
+            Write-Warning '已提交的 dist\CampusNet.exe 与本次构建的字节不一致（编译器版本差异）。发布前请用 build\Build-CampusNet.ps1 重新生成。'
+          }
+
+      - name: Run end-to-end tests
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'src\CampusNet\bin\Release\net48\CampusNet.exe').Path
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Test-CampusNet.ps1 -Exe $exe
+          if ($LASTEXITCODE -ne 0) { throw '端到端测试未通过' }

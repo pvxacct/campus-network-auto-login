@@ -1,6 +1,6 @@
-# 为 v* 标签创建 GitHub Release，并附上打包好的 zip（解压即用）。
+# 为 v* 标签创建 GitHub Release，附上打包好的单文件 exe（解压即用）与源码包。
 # 触发方式：
-#   1) 推送 v* 标签（例如 git push origin v1.2.0）时自动运行，发布该标签；
+#   1) 推送 v* 标签（例如 git push origin v2.0.0-pre.1）时自动运行，发布该标签；
 #   2) 在 Actions 页面点 “Run workflow” 手动运行（可指定标签、可勾选 Pre-release）。
 # 说明：GITHUB_TOKEN 由 GitHub 自动提供，不需要配置任何密钥。
 name: Create GitHub Release
@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的标签，例如 v1.1.0；留空则使用最新的 v* 标签'
+        description: '要发布的标签，例如 v2.0.0-pre.1；留空则使用最新的 v* 标签'
         required: false
         default: ''
       prerelease:
@@ -33,28 +33,39 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build zip archive
+      - name: Build assets
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-}"
           if [ -z "$tag" ]; then tag="$(git describe --tags --abbrev=0)"; fi
+          echo "tag=$tag" >> "$GITHUB_ENV"
+
+          if [ ! -f dist/CampusNet.exe ]; then
+            echo "缺少 dist/CampusNet.exe —— 请先运行 build/Build-CampusNet.ps1 并提交产物。" >&2
+            exit 1
+          fi
           mkdir -p dist
-          zip="dist/campus-network-auto-login-$tag.zip"
-          git -c core.autocrlf=true archive --format=zip --prefix="campus-network-auto-login-$tag/" -o "$zip" "$tag" -- . ':(exclude).github'
-          # 监控面板：单独打包，解压后第一层直接就是面板自己的文件（外加 LICENSE）
+
+          # 1) 解压即用的单文件 exe（exe + 使用说明 + LICENSE + 校验和）
           staging="$(mktemp -d)"
-          git -c core.autocrlf=true archive --format=zip -o "$staging/panel.zip" "$tag" -- monitor LICENSE
+          cp dist/CampusNet.exe "$staging/CampusNet.exe"
+          cp "docs/使用说明.md" "$staging/使用说明.md"
+          cp LICENSE "$staging/LICENSE"
           (
             cd "$staging"
-            unzip -q panel.zip
-            mv monitor/* .
-            rmdir monitor
-            rm -f panel.zip
-            zip -q -r "$GITHUB_WORKSPACE/dist/campus-network-monitor-$tag.zip" .
+            sha256sum CampusNet.exe "使用说明.md" LICENSE > SHA256SUMS.txt
+            zip -q -r "$GITHUB_WORKSPACE/dist/campus-net-$tag.zip" .
           )
           rm -rf "$staging"
+
+          # 2) 源码包（不含 .github 与 dist 产物目录）
+          git -c core.autocrlf=true archive --format=zip \
+            --prefix="campus-net-$tag/" \
+            -o "dist/campus-net-source-$tag.zip" "$tag" \
+            -- . ':(exclude).github' ':(exclude)dist'
+
           ls -l dist
           sha256sum dist/*.zip
 
@@ -68,13 +79,13 @@ jobs:
           tag="${INPUT_TAG:-}"
           if [ -z "$tag" ]; then tag="$(git describe --tags --abbrev=0)"; fi
           ver="${tag#v}"
-          zip="dist/campus-network-auto-login-$tag.zip"
-          panel_zip="dist/campus-network-monitor-$tag.zip"
+          zip="dist/campus-net-$tag.zip"
+          source_zip="dist/campus-net-source-$tag.zip"
           echo "tag=$tag"
 
           create_flags=(--latest)
           edit_flags=(--prerelease=false --latest)
-          # 标签名里带 “-”（例如 v1.8.0-pre.1）自动按预发布处理；手动运行时的勾选框优先
+          # 标签名里带 “-”（例如 v2.0.0-pre.1）自动按预发布处理；手动运行时的勾选框优先
           prerelease="${INPUT_PRERELEASE:-}"
           if [ -z "$prerelease" ] && [[ "$tag" == *-* ]]; then prerelease=true; fi
           if [ "$prerelease" = "true" ]; then
@@ -96,5 +107,5 @@ jobs:
             gh release create "$tag" --title "$title" --verify-tag "${create_flags[@]}" "${notes[@]}"
           fi
 
-          gh release upload "$tag" "$zip" "$panel_zip" --clobber
+          gh release upload "$tag" "$zip" "$source_zip" dist/CampusNet.exe --clobber
           gh release view "$tag" --json tagName,name,isPrerelease,url,assets
