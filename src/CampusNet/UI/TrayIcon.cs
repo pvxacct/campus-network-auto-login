@@ -107,7 +107,6 @@ namespace CampusNet.UI
             {
                 case "online":
                 case "login-ok": return "green";
-                case "cooldown": return "orange";
                 case "no-credential":
                 case "bad-credential":
                 case "login-failed":

@@ -293,9 +293,6 @@ namespace CampusNet.Core
             builder.AppendLine("最近登录  ：" + Display(snapshot.LastLoginAttempt));
             builder.AppendLine("登录成功  ：" + Display(snapshot.LastLoginSuccess));
             builder.AppendLine("连续失败  ：" + snapshot.ConsecutiveFailures + " 次；本小时登录 " + snapshot.LoginWindowCount + " 次");
-            builder.AppendLine("冷却      ：" + (snapshot.CooldownUntil.HasValue
-                ? Display(snapshot.CooldownUntil) + "（" + snapshot.CooldownReason + "）"
-                : "无"));
             builder.AppendLine("暂停      ：" + (snapshot.Paused ? "是" + (snapshot.PauseUntil.HasValue ? "，直到 " + Display(snapshot.PauseUntil) : string.Empty) : "否"));
             builder.AppendLine("最近错误  ：" + (string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError));
             builder.AppendLine("累计检查  ：" + snapshot.RunCount + " 次");
@@ -310,8 +307,10 @@ namespace CampusNet.Core
             builder.AppendLine();
             builder.AppendLine("---- 配置 ----");
             builder.AppendLine("Portal    ：" + config.PortalHost + config.StatusPath);
-            builder.AppendLine("探测节奏  ：在线每 " + config.OnlineProbeSeconds + " 秒；异常每 " + config.OfflineProbeSeconds + " 秒；确认 " + config.ConfirmAttempts + " 次");
-            builder.AppendLine("风控闸门  ：最小间隔 " + config.LoginMinIntervalSeconds + " 秒；每小时上限 " + config.LoginHourlyLimit + " 次；冷却 " + config.LoginCooldownMinutes + " 分钟");
+            builder.AppendLine("探测节奏  ：在线每 " + config.OnlineProbeSeconds + " 秒；异常每 " + config.OfflineProbeSeconds + " 秒；确认 "
+                + config.ConfirmAttempts + " 次；兜底巡检每 " + config.UpstreamProbeSeconds + " 秒");
+            builder.AppendLine("风控闸门  ：最小间隔 " + config.LoginMinIntervalSeconds + " 秒；每小时上限 "
+                + config.LoginHourlyLimit + " 次；登录前确认 " + config.LoginConfirmDelaySec + " 秒");
             builder.AppendLine("探测目标  ：" + string.Join(", ", config.ProbeTargets.ToArray()));
             builder.AppendLine();
             builder.AppendLine("---- 旧版残留 ----");

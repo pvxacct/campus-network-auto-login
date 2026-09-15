@@ -117,8 +117,8 @@
                         <TextBlock x:Name="StatCount" Grid.Row="1" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,6" />
                         <TextBlock Grid.Row="2" Grid.Column="0" Text="连续失败" Style="{StaticResource Caption}" Margin="0,0,10,6" />
                         <TextBlock x:Name="StatFail" Grid.Row="2" Grid.Column="1" Style="{StaticResource Value}" Margin="0,0,16,6" />
-                        <TextBlock Grid.Row="2" Grid.Column="2" Text="冷却" Style="{StaticResource Caption}" Margin="0,0,10,6" />
-                        <TextBlock x:Name="StatCooldown" Grid.Row="2" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,6" />
+                        <TextBlock Grid.Row="2" Grid.Column="2" Text="下次探测" Style="{StaticResource Caption}" Margin="0,0,10,6" />
+                        <TextBlock x:Name="StatNextProbe" Grid.Row="2" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,6" />
                         <TextBlock Grid.Row="3" Grid.Column="0" Text="最近错误" Style="{StaticResource Caption}" Margin="0,0,10,0" />
                         <TextBlock x:Name="StatError" Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="3" Style="{StaticResource Value}" TextWrapping="Wrap" />
                     </Grid>
@@ -174,6 +174,9 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
                             <TextBlock Grid.Row="0" Grid.Column="0" Text="正常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
                             <TextBox x:Name="OnlineProbeBox" Grid.Row="0" Grid.Column="1" Margin="0,0,0,6" />
@@ -183,6 +186,12 @@
                             <TextBox x:Name="HourlyLimitBox" Grid.Row="2" Grid.Column="1" Margin="0,0,0,6" />
                             <TextBlock Grid.Row="3" Grid.Column="0" Text="Portal 地址" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
                             <TextBox x:Name="PortalHostBox" Grid.Row="3" Grid.Column="1" />
+                            <TextBlock Grid.Row="4" Grid.Column="0" Text="登录最小间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,6,10,6" />
+                            <TextBox x:Name="MinIntervalBox" Grid.Row="4" Grid.Column="1" Margin="0,6,0,6" />
+                            <TextBlock Grid.Row="5" Grid.Column="0" Text="兜底巡检间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                            <TextBox x:Name="UpstreamProbeBox" Grid.Row="5" Grid.Column="1" Margin="0,0,0,6" />
+                            <TextBlock Grid.Row="6" Grid.Column="0" Text="探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
+                            <TextBox x:Name="ProbeTimeoutBox" Grid.Row="6" Grid.Column="1" />
                         </Grid>
                     </Expander>
                     <Button Content="保存高级设置" Click="SaveAdvanced_Click" Margin="0,10,0,0" HorizontalAlignment="Left" />

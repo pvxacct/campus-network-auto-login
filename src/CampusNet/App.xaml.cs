@@ -182,10 +182,8 @@ namespace CampusNet
             ConsoleBridge.Line("最近探测：" + Text(state.LastProbe) + Age(state.LastProbe));
             ConsoleBridge.Line("最近登录：" + Text(state.LastLoginSuccess));
             ConsoleBridge.Line("连续失败：" + state.ConsecutiveFailures + "；本小时登录 " + state.LoginWindowCount + " 次");
-            if (state.CooldownRemainingSeconds > 0)
-            {
-                ConsoleBridge.Line("冷却中：剩 " + state.CooldownRemainingSeconds + " 秒（" + state.CooldownReason + "）");
-            }
+            ConsoleBridge.Line("风控：" + "最小间隔 " + config.LoginMinIntervalSeconds + " 秒；每小时上限 "
+                + config.LoginHourlyLimit + " 次");
             ConsoleBridge.Line("暂停：" + (state.Paused ? "是" : "否"));
             ConsoleBridge.Line("开机自启：" + (SelfInstaller.IsAutoStartEnabled ? "已开启" : "已关闭"));
             ConsoleBridge.Line("Portal：" + config.PortalHost + config.StatusPath);
@@ -233,7 +231,9 @@ namespace CampusNet
             {
                 case "online": return "网络正常";
                 case "login-ok": return "自动登录成功";
-                case "cooldown": return "冷却中";
+                case "login-wait": return "等待下次登录";
+                case "login-throttled": return "已触发频率上限";
+                case "login-conflict": return "重复认证冲突";
                 case "paused": return "已暂停";
                 case "no-credential": return "未保存账号";
                 case "unreachable": return "无法连接校园网";

@@ -44,7 +44,6 @@ function Write-Config {
         LoginConfirmDelaySec   = 1
         LoginMinIntervalSeconds = 60
         LoginHourlyLimit       = $HourlyLimit
-        LoginCooldownMinutes   = 30
         StatusTimeoutSec       = 5
         LoginTimeoutSec        = 5
         RetryCount             = 1
@@ -92,7 +91,7 @@ function Invoke-Scenario {
     if (Test-Path -LiteralPath $stateFile) {
         $state = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
     } else {
-        $state = [pscustomobject]@{ LastResult = ''; CooldownReason = ''; CooldownUntil = ''; ConsecutiveFailures = 0; LoginWindowCount = 0 }
+        $state = [pscustomobject]@{ LastResult = ''; LastError = ''; ConsecutiveFailures = 0; LoginWindowCount = 0 }
     }
 
     return [pscustomobject]@{
@@ -131,18 +130,21 @@ $n = Invoke-Scenario -Name 's3-confirm' -Scenario 'confirm-online' -PortalHost "
     -Targets @('tcp:127.0.0.1:65002') -Seconds 12 -OnlineProbe 2 -OfflineProbe 2
 Assert '复检在线时不登录' ($n.Login -eq 0) "login=$($n.Login)"
 
-# 场景 4：Portal 限流 → 进入冷却且不再登录
+# 场景 4：Portal 限流 → 本次不再重试，原因写进状态（不再有冷却）
 $n = Invoke-Scenario -Name 's4-ratelimit' -Scenario 'rate-limited' -PortalHost "127.0.0.1:$Port" `
     -Targets @('tcp:127.0.0.1:65003') -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
 Assert '限流后只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
-$cooldownActive = ($n.State.PSObject.Properties.Name -contains 'CooldownUntil') -and ($n.State.CooldownUntil -ne '')
-Assert '限流后进入冷却' ($cooldownActive -and $n.State.CooldownReason -match '限流') "reason=$($n.State.CooldownReason)"
+Assert '限流后结果记为 login-throttled' ($n.State.LastResult -eq 'login-throttled') "LastResult=$($n.State.LastResult)"
+Assert '限流原因写入状态' ($n.State.LastError -match '限流') "LastError=$($n.State.LastError)"
+Assert 'state.json 不再有冷却字段' (-not ($n.State.PSObject.Properties.Name -contains 'CooldownUntil') `
+    -and -not ($n.State.PSObject.Properties.Name -contains 'CooldownReason')) "字段=$($n.State.PSObject.Properties.Name -join ',')"
 
-# 场景 5：重复认证冲突 → 进入冷却
+# 场景 5：重复认证冲突 → 只记原因，不进入冷却
 $n = Invoke-Scenario -Name 's5-conflict' -Scenario 'conflict' -PortalHost "127.0.0.1:$Port" `
     -Targets @('tcp:127.0.0.1:65004') -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
 Assert '冲突后只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
-Assert '冲突后进入冷却并写明原因' ($n.State.CooldownReason -match '冲突') "reason=$($n.State.CooldownReason)"
+Assert '冲突后结果记为 login-conflict' ($n.State.LastResult -eq 'login-conflict') "LastResult=$($n.State.LastResult)"
+Assert '冲突原因写入状态' ($n.State.LastError -match '已在别处') "LastError=$($n.State.LastError)"
 
 # 场景 6：登录失败 + 最小间隔 → 短时间不重复登录
 $n = Invoke-Scenario -Name 's6-mininterval' -Scenario 'login-fail' -PortalHost "127.0.0.1:$Port" `
@@ -153,6 +155,44 @@ Assert '失败后 60 秒内不重复登录' ($n.Login -eq 1) "login=$($n.Login)�
 $n = Invoke-Scenario -Name 's7-recover' -Scenario 'online' -PortalHost "127.0.0.1:$Port" `
     -Targets @("tcp:127.0.0.1:$Port") -Seconds 8 -OnlineProbe 2
 Assert '恢复后状态为 online' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
+
+# 场景 8：旧配置一次性迁移（在线探测 60 秒 → 20 秒，剔除冷却项）
+function Invoke-ConfigMigration {
+    param([string]$Name, [int]$OnlineProbe)
+    $dir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $legacy = [ordered]@{
+        PortalHost             = '127.0.0.1:65010'
+        OnlineProbeSeconds     = $OnlineProbe
+        OfflineProbeSeconds    = 2
+        ConfirmAttempts        = 1
+        ConfirmGapMs           = 200
+        LoginCooldownMinutes   = 30
+        ProbeTargets           = @('tcp:127.0.0.1:65001')
+    }
+    ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
+    & $Exe '--set-credentials' 'testuser' 'testpass' '--data-dir' $dir | Out-String | Out-Null
+    & $Exe '--run-seconds' 4 '--data-dir' $dir | Out-String | Out-Null
+    return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+$migrated = Invoke-ConfigMigration -Name 's8-migrate' -OnlineProbe 60
+Assert '旧默认 60 秒迁移为 20 秒' ($migrated.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($migrated.OnlineProbeSeconds)"
+Assert '迁移后写入 ConfigVersion=2' ($migrated.ConfigVersion -eq 2) "ConfigVersion=$($migrated.ConfigVersion)"
+Assert '迁移后剔除 LoginCooldownMinutes' (-not ($migrated.PSObject.Properties.Name -contains 'LoginCooldownMinutes')) '仍存在该键'
+Assert '迁移后保留自定义 ProbeTargets' (($migrated.ProbeTargets -join ',') -eq 'tcp:127.0.0.1:65001') "ProbeTargets=$($migrated.ProbeTargets -join ',')"
+
+$custom = Invoke-ConfigMigration -Name 's8-custom' -OnlineProbe 45
+Assert '自定义 45 秒不会被改写' ($custom.OnlineProbeSeconds -eq 45) "OnlineProbeSeconds=$($custom.OnlineProbeSeconds)"
+
+# 场景 9：全新数据目录 → 默认配置就是「在线 20 秒 + 兜底 300 秒」
+$freshDir = Join-Path $work 's9-default'
+New-Item -ItemType Directory -Force -Path $freshDir | Out-Null
+& $Exe '--set-credentials' 'testuser' 'testpass' '--data-dir' $freshDir | Out-String | Out-Null
+& $Exe '--run-seconds' 4 '--data-dir' $freshDir | Out-String | Out-Null
+$fresh = Get-Content -LiteralPath (Join-Path $freshDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+Assert '新配置默认在线探测 20 秒' ($fresh.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($fresh.OnlineProbeSeconds)"
+Assert '新配置默认兜底巡检 300 秒' ($fresh.UpstreamProbeSeconds -eq 300) "UpstreamProbeSeconds=$($fresh.UpstreamProbeSeconds)"
 
 Write-Host ''
 $results | ForEach-Object { Write-Host $_ }

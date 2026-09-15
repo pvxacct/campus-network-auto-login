@@ -22,8 +22,6 @@ namespace CampusNet.Core
         public DateTime? LastProbe;
         public DateTime? LastLoginAttempt;
         public DateTime? LastLoginSuccess;
-        public DateTime? CooldownUntil;
-        public string CooldownReason = string.Empty;
         public bool Paused;
         public DateTime? PauseUntil;
         public bool HasCredential;
@@ -42,7 +40,6 @@ namespace CampusNet.Core
                 {
                     case "online":
                     case "login-ok": return "green";
-                    case "cooldown": return "orange";
                     case "paused": return "gray";
                     case "no-credential":
                     case "bad-credential":
@@ -61,8 +58,8 @@ namespace CampusNet.Core
     public sealed class LoginEngine : IDisposable
     {
         private const int HistoryLength = 60;
-        private const int UpstreamProbeSeconds = 300;
         private const int ReloginWaitSec = 3;
+        private const int PersistMinIntervalSeconds = 60;
 
         private readonly object _gate = new object();
         private readonly Logger _log;
@@ -76,6 +73,13 @@ namespace CampusNet.Core
         private Thread _worker;
         private volatile bool _stop;
         private bool _pendingRelogin;
+
+        private DateTime _lastPersistUtc = DateTime.MinValue;
+        private string _persistedStatusKey;
+        private bool _persistedOnline;
+        private bool _persistedPaused;
+        private int _persistedFailureCount;
+        private int _persistedLoginCount;
 
         public LoginEngine(Logger log)
         {
@@ -98,7 +102,15 @@ namespace CampusNet.Core
                 try { _credential = CredentialStore.Load(AppPaths.CredentialFile); }
                 catch (Exception ex) { _credential = null; _log.Error("读取凭据失败（凭据与当前 Windows 用户绑定，换用户后需要重新保存）：" + ex.Message); }
                 _state = AppState.Load(AppPaths.StateFile);
+                ResetPersistGate();
             }
+        }
+
+        /// <summary>让下一次持久化真正落盘（配置 / 凭据 / 暂停状态变化后调用）。</summary>
+        private void ResetPersistGate()
+        {
+            _lastPersistUtc = DateTime.MinValue;
+            _persistedStatusKey = null;
         }
 
         public void Start()
@@ -142,6 +154,7 @@ namespace CampusNet.Core
                 _state.Paused = true;
                 _state.PauseUntil = duration.HasValue ? AppPaths.FormatTime(DateTime.Now + duration.Value) : string.Empty;
                 _state.Save(AppPaths.StateFile);
+                ResetPersistGate();
             }
             _log.Warn(duration.HasValue
                 ? "已暂停自动登录，约 " + Math.Round(duration.Value.TotalMinutes) + " 分钟后自动恢复。"
@@ -157,6 +170,7 @@ namespace CampusNet.Core
                 _state.Paused = false;
                 _state.PauseUntil = string.Empty;
                 _state.Save(AppPaths.StateFile);
+                ResetPersistGate();
             }
             _log.Info("已恢复自动登录。");
             _wake.Set();
@@ -187,8 +201,6 @@ namespace CampusNet.Core
                 copy.LastProbe = from.LastProbe;
                 copy.LastLoginAttempt = from.LastLoginAttempt;
                 copy.LastLoginSuccess = from.LastLoginSuccess;
-                copy.CooldownUntil = from.CooldownUntil;
-                copy.CooldownReason = from.CooldownReason;
                 copy.Paused = from.Paused;
                 copy.PauseUntil = from.PauseUntil;
                 copy.HasCredential = from.HasCredential;
@@ -217,6 +229,9 @@ namespace CampusNet.Core
         {
             while (!_stop)
             {
+                // 先清掉唤醒信号，再去评估：避免「评估结束到开始等待」之间到达的唤醒被丢掉，
+                // 那样会白等一个完整周期（例如手动「立即重连」要等 20 秒才生效）。
+                try { _wake.Reset(); } catch { }
                 int waitSeconds;
                 try
                 {
@@ -225,11 +240,14 @@ namespace CampusNet.Core
                 catch (Exception ex)
                 {
                     _log.Error("内部异常：" + ex.Message);
+                    foreach (string line in ex.ToString().Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        _log.Error("异常堆栈：" + line.Trim());
+                    }
                     waitSeconds = 30;
                 }
                 if (_stop) { break; }
                 try { _wake.Wait(TimeSpan.FromSeconds(Math.Max(1, waitSeconds))); } catch { }
-                _wake.Reset();
             }
         }
 
@@ -270,6 +288,8 @@ namespace CampusNet.Core
 
             // ---------- 探测（不发任何 Portal 请求）----------
             ProbeOutcome probe = NetworkProbe.Probe(config, 1, 0);
+            // 联网状态发生翻转时立即刷新网卡信息缓存，平时走短时缓存，不每轮枚举网卡
+            if (probe.Online != _state.Online) { NetworkProbe.InvalidateNetworkInfo(); }
             UpdateNetwork(probe);
             _state.LastProbe = AppPaths.FormatTime(now);
 
@@ -318,7 +338,7 @@ namespace CampusNet.Core
                 SetStatus("upstream", "本机探测不通，但 Portal 显示账号在线");
                 _log.WarnOnce("upstream", "本地探测全部失败，但 Portal 显示账号仍在线（可能是上游故障或网卡问题），暂不登录。");
                 Persist(probe.LatencyMs, probe.LossPercent);
-                return UpstreamProbeSeconds;
+                return config.UpstreamProbeSeconds;
             }
 
             return LoginFlow(probe, status, relogin);
@@ -345,31 +365,7 @@ namespace CampusNet.Core
                 }
             }
 
-            // 闸门 1：冷却（限流 / 冲突 / 连续失败退避）
-            int cooldownLeft = _state.CooldownRemainingSeconds;
-            if (cooldownLeft <= 0)
-            {
-                DateTime? lastAttempt = _state.LastLoginAttemptTime;
-                if (_state.ConsecutiveFailures >= 3 && lastAttempt.HasValue)
-                {
-                    int backoffMinutes = (int)Math.Min(Math.Pow(2, _state.ConsecutiveFailures - 2), 30);
-                    if ((now - lastAttempt.Value).TotalMinutes < backoffMinutes)
-                    {
-                        SetCooldown(backoffMinutes, "连续失败 " + _state.ConsecutiveFailures + " 次");
-                        cooldownLeft = _state.CooldownRemainingSeconds;
-                    }
-                }
-            }
-            if (cooldownLeft > 0)
-            {
-                string reason = string.IsNullOrEmpty(_state.CooldownReason) ? "冷却中" : _state.CooldownReason;
-                SetStatus("cooldown", "冷却中（剩 " + Remaining(_state.CooldownUntilTime) + "）：" + reason);
-                _log.WarnOnce("cooldown", "进入冷却（" + reason + "），期间只检查状态、不登录。");
-                Persist(probe.LatencyMs, probe.LossPercent);
-                return Math.Max(5, config.OfflineProbeSeconds);
-            }
-
-            // 闸门 2：两次登录之间的最小间隔
+            // 闸门 1：两次登录之间的最小间隔
             if (config.LoginMinIntervalSeconds > 0)
             {
                 DateTime? reference = _state.LastLoginAttemptTime;
@@ -388,7 +384,7 @@ namespace CampusNet.Core
                 }
             }
 
-            // 闸门 3：每小时登录次数上限
+            // 闸门 2：每小时登录次数上限
             if (config.LoginHourlyLimit > 0)
             {
                 DateTime? windowStart = _state.LoginWindowStartTime;
@@ -409,7 +405,7 @@ namespace CampusNet.Core
                 }
             }
 
-            // 闸门 4：登录前二次确认
+            // 闸门 3：登录前二次确认
             if (config.LoginConfirmDelaySec > 0 && !relogin)
             {
                 Thread.Sleep(config.LoginConfirmDelaySec * 1000);
@@ -447,7 +443,7 @@ namespace CampusNet.Core
 
             bool success = false;
             string lastMessage = string.Empty;
-            string cooldownReason = string.Empty;
+            string limitReason = string.Empty;
             for (int attempt = 1; attempt <= config.RetryCount; attempt++)
             {
                 _log.Info("第 " + attempt + "/" + config.RetryCount + " 次尝试登录（账号 " + credential.UserName + "）。");
@@ -475,13 +471,13 @@ namespace CampusNet.Core
                         success = true;
                         break;
                     }
-                    cooldownReason = "重复认证冲突（Portal 提示账号已在别处在线，本机复检仍不在线）";
-                    _log.Warn("复检仍未在线，判定为重复认证冲突，不再反复登录。");
+                    limitReason = "重复认证冲突（Portal 提示账号已在别处在线，本机复检仍不在线）";
+                    _log.Warn("复检仍未在线，判定为重复认证冲突，本次不再重试登录。");
                     break;
                 }
                 else if (result.RateLimited)
                 {
-                    cooldownReason = "Portal 明确限流（请求过于频繁）";
+                    limitReason = "Portal 明确限流（请求过于频繁）";
                     _log.Warn("Portal 明确限流：" + result.Message + "，不再重试。");
                     break;
                 }
@@ -503,8 +499,6 @@ namespace CampusNet.Core
                     _state.LastMessage = "自动登录成功";
                     _state.ConsecutiveFailures = 0;
                     _state.LastLoginSuccess = AppPaths.FormatTime(DateTime.Now);
-                    _state.CooldownUntil = string.Empty;
-                    _state.CooldownReason = string.Empty;
                 }
                 _log.Info("自动登录成功，网络已恢复。");
                 SetStatus("online", "在线（刚刚自动登录）");
@@ -513,24 +507,37 @@ namespace CampusNet.Core
             }
 
             lock (_gate) { _state.ConsecutiveFailures++; }
-            if (!string.IsNullOrEmpty(cooldownReason) && config.LoginCooldownMinutes > 0)
+            if (!string.IsNullOrEmpty(limitReason))
             {
-                SetCooldown(config.LoginCooldownMinutes, cooldownReason);
-                _log.Warn("进入冷却：" + cooldownReason + "，约 " + config.LoginCooldownMinutes + " 分钟后自动恢复（期间只检查状态、不登录）。");
-                SetStatus("cooldown", "冷却中（" + config.LoginCooldownMinutes + " 分钟）：" + cooldownReason);
+                // 限流 / 重复认证冲突：不做冷却，只记原因；后续按最小间隔与每小时上限的节奏继续尝试
+                string key = limitReason.StartsWith("Portal 明确限流", StringComparison.Ordinal)
+                    ? "login-throttled"
+                    : "login-conflict";
+                string text = key == "login-throttled"
+                    ? "Portal 限流，稍后按节奏重试"
+                    : "重复认证冲突，稍后按节奏重试";
+                _log.Warn(limitReason + "；本次不重试，将按最小间隔 " + config.LoginMinIntervalSeconds
+                    + " 秒、每小时上限 " + config.LoginHourlyLimit + " 次的节奏继续尝试。");
+                lock (_gate)
+                {
+                    _state.Online = false;
+                    _state.LastError = limitReason + "：" + lastMessage;
+                    _state.LastMessage = limitReason;
+                    _state.LastResult = key;
+                }
+                SetStatus(key, text);
             }
             else
             {
                 _log.Error("自动登录失败（已连续失败 " + _state.ConsecutiveFailures + " 次）：" + lastMessage);
+                lock (_gate)
+                {
+                    _state.Online = false;
+                    _state.LastError = lastMessage;
+                    _state.LastMessage = lastMessage;
+                    _state.LastResult = "login-failed";
+                }
                 SetStatus("login-failed", "自动登录失败：" + Shorten(lastMessage));
-            }
-
-            lock (_gate)
-            {
-                _state.Online = false;
-                _state.LastError = lastMessage;
-                _state.LastMessage = lastMessage;
-                if (string.IsNullOrEmpty(cooldownReason)) { _state.LastResult = "login-failed"; }
             }
             Persist(probe.LatencyMs, probe.LossPercent);
             return Math.Max(5, config.OfflineProbeSeconds);
@@ -565,16 +572,6 @@ namespace CampusNet.Core
             }
         }
 
-        private void SetCooldown(int minutes, string reason)
-        {
-            lock (_gate)
-            {
-                _state.CooldownUntil = AppPaths.FormatTime(DateTime.Now.AddMinutes(minutes));
-                _state.CooldownReason = reason;
-                _state.LastResult = "cooldown";
-            }
-        }
-
         private void SetStatus(string key, string text)
         {
             bool changed;
@@ -603,7 +600,24 @@ namespace CampusNet.Core
             lock (_gate)
             {
                 _state.Version = AppPaths.Version;
-                _state.Save(AppPaths.StateFile);
+                // state.json 写入节流：状态实质变化时立刻写，否则最多每 60 秒写一次，
+                // 避免常驻进程每 20 秒就落盘一次（SSD 写入与磁盘抖动）。内存快照不受影响。
+                bool changed = _persistedStatusKey == null
+                    || !string.Equals(_persistedStatusKey, _state.LastResult, StringComparison.Ordinal)
+                    || _persistedOnline != _state.Online
+                    || _persistedPaused != _state.Paused
+                    || _persistedFailureCount != _state.ConsecutiveFailures
+                    || _persistedLoginCount != _state.LoginWindowCount;
+                if (changed || (DateTime.UtcNow - _lastPersistUtc).TotalSeconds >= PersistMinIntervalSeconds)
+                {
+                    try { _state.Save(AppPaths.StateFile); } catch { }
+                    _lastPersistUtc = DateTime.UtcNow;
+                    _persistedStatusKey = _state.LastResult;
+                    _persistedOnline = _state.Online;
+                    _persistedPaused = _state.Paused;
+                    _persistedFailureCount = _state.ConsecutiveFailures;
+                    _persistedLoginCount = _state.LoginWindowCount;
+                }
                 _snapshot.LastResult = _state.LastResult;
                 _snapshot.Online = _state.Online;
                 _snapshot.LastMessage = _state.LastMessage;
@@ -615,8 +629,6 @@ namespace CampusNet.Core
                 _snapshot.LastProbe = _state.LastProbeTime;
                 _snapshot.LastLoginAttempt = _state.LastLoginAttemptTime;
                 _snapshot.LastLoginSuccess = _state.LastLoginSuccessTime;
-                _snapshot.CooldownUntil = _state.CooldownUntilTime;
-                _snapshot.CooldownReason = _state.CooldownReason;
                 _snapshot.Paused = _state.Paused;
                 _snapshot.PauseUntil = _state.PauseUntilTime;
                 _snapshot.HasCredential = _credential != null && _credential.IsUsable;
@@ -636,8 +648,6 @@ namespace CampusNet.Core
                 _snapshot.UserName = _credential != null ? _credential.UserName : string.Empty;
                 _snapshot.Paused = _state.Paused;
                 _snapshot.PauseUntil = _state.PauseUntilTime;
-                _snapshot.CooldownUntil = _state.CooldownUntilTime;
-                _snapshot.CooldownReason = _state.CooldownReason;
                 _snapshot.LastLoginSuccess = _state.LastLoginSuccessTime;
                 _snapshot.LastProbe = _state.LastProbeTime;
                 _snapshot.LastTrigger = AppPaths.ParseTime(_state.LastTrigger);

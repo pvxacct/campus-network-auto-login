@@ -166,7 +166,46 @@ namespace CampusNet.Core
             return false;
         }
 
+        private static readonly object InfoGate = new object();
+        private static NetworkInfo _infoCache;
+        private static DateTime _infoCacheUtc = DateTime.MinValue;
+        private const int InfoCacheSeconds = 30;
+
+        /// <summary>网卡信息缓存有效期内的读取（缓存 30 秒；状态翻转或手动刷新时立即失效）。</summary>
         public static NetworkInfo GetNetworkInfo()
+        {
+            lock (InfoGate)
+            {
+                if (_infoCache != null && (DateTime.UtcNow - _infoCacheUtc).TotalSeconds < InfoCacheSeconds)
+                {
+                    return Clone(_infoCache);
+                }
+                _infoCache = QueryNetworkInfo();
+                _infoCacheUtc = DateTime.UtcNow;
+                return Clone(_infoCache);
+            }
+        }
+
+        /// <summary>让下一次读取重新枚举网卡（联网状态翻转、界面点刷新、复制诊断时调用）。</summary>
+        public static void InvalidateNetworkInfo()
+        {
+            lock (InfoGate) { _infoCacheUtc = DateTime.MinValue; }
+        }
+
+        private static NetworkInfo Clone(NetworkInfo source)
+        {
+            return new NetworkInfo
+            {
+                HasAdapter = source.HasAdapter,
+                AdapterName = source.AdapterName,
+                AdapterType = source.AdapterType,
+                IPv4 = source.IPv4,
+                Gateway = source.Gateway,
+                Dns = source.Dns
+            };
+        }
+
+        private static NetworkInfo QueryNetworkInfo()
         {
             var info = new NetworkInfo();
             try

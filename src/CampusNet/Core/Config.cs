@@ -10,8 +10,13 @@ namespace CampusNet.Core
     /// <summary>用户配置：门户地址、探测节奏、风控闸门、表单固定字段等。</summary>
     public sealed class AppConfig
     {
+        /// <summary>配置文件结构版本：小于 2 的旧配置会在加载时自动迁移一次。</summary>
+        public const int CurrentConfigVersion = 2;
+
         public const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+        public int ConfigVersion = CurrentConfigVersion;
 
         public string PortalHost = "10.66.209.2";
         public int EportalPort = 801;
@@ -22,10 +27,13 @@ namespace CampusNet.Core
         public string UserAgent = DefaultUserAgent;
 
         /// <summary>网络正常时的探测间隔（秒）。只要探测能通就不碰 Portal。</summary>
-        public int OnlineProbeSeconds = 60;
+        public int OnlineProbeSeconds = 20;
 
         /// <summary>探测失败后的快速复检间隔（秒），用于尽快发现断网并重连。</summary>
         public int OfflineProbeSeconds = 5;
+
+        /// <summary>「本机探测不通、但 Portal 显示账号在线」时的兜底巡检间隔（秒）。</summary>
+        public int UpstreamProbeSeconds = 300;
 
         public int ProbeTimeoutMs = 1500;
         public int ConfirmAttempts = 3;
@@ -41,7 +49,6 @@ namespace CampusNet.Core
         public int LoginConfirmDelaySec = 3;
         public int LoginMinIntervalSeconds = 60;
         public int LoginHourlyLimit = 12;
-        public int LoginCooldownMinutes = 30;
         public int StatusTimeoutSec = 8;
         public int LoginTimeoutSec = 15;
         public int RetryCount = 1;
@@ -93,8 +100,10 @@ namespace CampusNet.Core
             config.ErrorPromptPath = Json.GetString(map, "ErrorPromptPath", config.ErrorPromptPath);
             config.UserAgent = Json.GetString(map, "UserAgent", config.UserAgent);
 
+            config.ConfigVersion = Json.GetInt(map, "ConfigVersion", 1);
             config.OnlineProbeSeconds = Clamp(Json.GetInt(map, "OnlineProbeSeconds", config.OnlineProbeSeconds), 5, 3600);
             config.OfflineProbeSeconds = Clamp(Json.GetInt(map, "OfflineProbeSeconds", config.OfflineProbeSeconds), 1, 600);
+            config.UpstreamProbeSeconds = Clamp(Json.GetInt(map, "UpstreamProbeSeconds", config.UpstreamProbeSeconds), 30, 3600);
             config.ProbeTimeoutMs = Clamp(Json.GetInt(map, "ProbeTimeoutMs", config.ProbeTimeoutMs), 200, 10000);
             config.ConfirmAttempts = Clamp(Json.GetInt(map, "ConfirmAttempts", config.ConfirmAttempts), 1, 10);
             config.ConfirmGapMs = Clamp(Json.GetInt(map, "ConfirmGapMs", config.ConfirmGapMs), 100, 5000);
@@ -102,7 +111,6 @@ namespace CampusNet.Core
             config.LoginConfirmDelaySec = Clamp(Json.GetInt(map, "LoginConfirmDelaySec", config.LoginConfirmDelaySec), 0, 60);
             config.LoginMinIntervalSeconds = Clamp(Json.GetInt(map, "LoginMinIntervalSeconds", config.LoginMinIntervalSeconds), 0, 3600);
             config.LoginHourlyLimit = Clamp(Json.GetInt(map, "LoginHourlyLimit", config.LoginHourlyLimit), 0, 240);
-            config.LoginCooldownMinutes = Clamp(Json.GetInt(map, "LoginCooldownMinutes", config.LoginCooldownMinutes), 0, 1440);
             config.StatusTimeoutSec = Clamp(Json.GetInt(map, "StatusTimeoutSec", config.StatusTimeoutSec), 2, 60);
             config.LoginTimeoutSec = Clamp(Json.GetInt(map, "LoginTimeoutSec", config.LoginTimeoutSec), 2, 60);
             config.RetryCount = Clamp(Json.GetInt(map, "RetryCount", config.RetryCount), 1, 5);
@@ -142,6 +150,14 @@ namespace CampusNet.Core
             }
 
             if (string.IsNullOrWhiteSpace(config.PortalHost)) { config.PortalHost = "10.66.209.2"; }
+
+            // 旧配置一次性迁移：把「在线探测 60 秒」的旧默认值升级为 20 秒，并剔除已废弃的冷却项。
+            if (config.ConfigVersion < CurrentConfigVersion)
+            {
+                if (config.OnlineProbeSeconds == 60) { config.OnlineProbeSeconds = 20; }
+                config.ConfigVersion = CurrentConfigVersion;
+                try { config.Save(path); } catch { }
+            }
             return config;
         }
 
@@ -149,6 +165,7 @@ namespace CampusNet.Core
         {
             var builder = new StringBuilder();
             builder.AppendLine("{");
+            builder.AppendLine("  " + Json.Number("ConfigVersion", ConfigVersion) + ",");
             builder.AppendLine("  " + Json.String("PortalHost", PortalHost) + ",");
             builder.AppendLine("  " + Json.Number("EportalPort", EportalPort) + ",");
             builder.AppendLine("  " + Json.String("StatusPath", StatusPath) + ",");
@@ -158,6 +175,7 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.String("UserAgent", UserAgent) + ",");
             builder.AppendLine("  " + Json.Number("OnlineProbeSeconds", OnlineProbeSeconds) + ",");
             builder.AppendLine("  " + Json.Number("OfflineProbeSeconds", OfflineProbeSeconds) + ",");
+            builder.AppendLine("  " + Json.Number("UpstreamProbeSeconds", UpstreamProbeSeconds) + ",");
             builder.AppendLine("  " + Json.Number("ProbeTimeoutMs", ProbeTimeoutMs) + ",");
             builder.AppendLine("  " + Json.Number("ConfirmAttempts", ConfirmAttempts) + ",");
             builder.AppendLine("  " + Json.Number("ConfirmGapMs", ConfirmGapMs) + ",");
@@ -165,7 +183,6 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.Number("LoginConfirmDelaySec", LoginConfirmDelaySec) + ",");
             builder.AppendLine("  " + Json.Number("LoginMinIntervalSeconds", LoginMinIntervalSeconds) + ",");
             builder.AppendLine("  " + Json.Number("LoginHourlyLimit", LoginHourlyLimit) + ",");
-            builder.AppendLine("  " + Json.Number("LoginCooldownMinutes", LoginCooldownMinutes) + ",");
             builder.AppendLine("  " + Json.Number("StatusTimeoutSec", StatusTimeoutSec) + ",");
             builder.AppendLine("  " + Json.Number("LoginTimeoutSec", LoginTimeoutSec) + ",");
             builder.AppendLine("  " + Json.Number("RetryCount", RetryCount) + ",");
@@ -255,8 +272,6 @@ namespace CampusNet.Core
         public bool Online;
         public string LastError = string.Empty;
         public int ConsecutiveFailures;
-        public string CooldownUntil = string.Empty;
-        public string CooldownReason = string.Empty;
         public string LastLoginAttempt = string.Empty;
         public string LastLoginSuccess = string.Empty;
         public string LoginWindowStart = string.Empty;
@@ -279,8 +294,6 @@ namespace CampusNet.Core
             state.Online = Json.GetBool(map, "Online", false);
             state.LastError = Json.GetString(map, "LastError", string.Empty);
             state.ConsecutiveFailures = Json.GetInt(map, "ConsecutiveFailures", 0);
-            state.CooldownUntil = Json.GetString(map, "CooldownUntil", string.Empty);
-            state.CooldownReason = Json.GetString(map, "CooldownReason", string.Empty);
             state.LastLoginAttempt = Json.GetString(map, "LastLoginAttempt", string.Empty);
             state.LastLoginSuccess = Json.GetString(map, "LastLoginSuccess", string.Empty);
             state.LoginWindowStart = Json.GetString(map, "LoginWindowStart", string.Empty);
@@ -303,8 +316,6 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.Bool("Online", Online) + ",");
             builder.AppendLine("  " + Json.String("LastError", LastError) + ",");
             builder.AppendLine("  " + Json.Number("ConsecutiveFailures", ConsecutiveFailures) + ",");
-            builder.AppendLine("  " + Json.String("CooldownUntil", CooldownUntil) + ",");
-            builder.AppendLine("  " + Json.String("CooldownReason", CooldownReason) + ",");
             builder.AppendLine("  " + Json.String("LastLoginAttempt", LastLoginAttempt) + ",");
             builder.AppendLine("  " + Json.String("LastLoginSuccess", LastLoginSuccess) + ",");
             builder.AppendLine("  " + Json.String("LoginWindowStart", LoginWindowStart) + ",");
@@ -317,22 +328,11 @@ namespace CampusNet.Core
             Json.WriteText(path, builder.ToString());
         }
 
-        public DateTime? CooldownUntilTime { get { return AppPaths.ParseTime(CooldownUntil); } }
         public DateTime? LastProbeTime { get { return AppPaths.ParseTime(LastProbe); } }
         public DateTime? LastLoginAttemptTime { get { return AppPaths.ParseTime(LastLoginAttempt); } }
         public DateTime? LastLoginSuccessTime { get { return AppPaths.ParseTime(LastLoginSuccess); } }
         public DateTime? PauseUntilTime { get { return AppPaths.ParseTime(PauseUntil); } }
         public DateTime? LoginWindowStartTime { get { return AppPaths.ParseTime(LoginWindowStart); } }
 
-        public int CooldownRemainingSeconds
-        {
-            get
-            {
-                DateTime? until = CooldownUntilTime;
-                if (!until.HasValue) { return 0; }
-                double seconds = (until.Value - DateTime.Now).TotalSeconds;
-                return seconds <= 0 ? 0 : (int)Math.Ceiling(seconds);
-            }
-        }
     }
 }

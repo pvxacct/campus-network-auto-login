@@ -119,9 +119,7 @@ namespace CampusNet
             StatResult.Text = ResultText(snapshot.LastResult);
             StatCount.Text = snapshot.LoginWindowCount + " 次";
             StatFail.Text = snapshot.ConsecutiveFailures + " 次";
-            StatCooldown.Text = snapshot.CooldownUntil.HasValue && snapshot.CooldownUntil.Value > DateTime.Now
-                ? AppPaths.FormatTime(snapshot.CooldownUntil.Value)
-                : "无";
+            StatNextProbe.Text = NextProbeText(snapshot);
             StatError.Text = string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError;
 
             PauseButton.IsEnabled = !snapshot.Paused;
@@ -231,6 +229,9 @@ namespace CampusNet
             OfflineProbeBox.Text = config.OfflineProbeSeconds.ToString(CultureInfo.InvariantCulture);
             HourlyLimitBox.Text = config.LoginHourlyLimit.ToString(CultureInfo.InvariantCulture);
             PortalHostBox.Text = config.PortalHost;
+            MinIntervalBox.Text = config.LoginMinIntervalSeconds.ToString(CultureInfo.InvariantCulture);
+            UpstreamProbeBox.Text = config.UpstreamProbeSeconds.ToString(CultureInfo.InvariantCulture);
+            ProbeTimeoutBox.Text = config.ProbeTimeoutMs.ToString(CultureInfo.InvariantCulture);
             EngineSnapshot snapshot = _engine.Snapshot();
             if (snapshot.HasCredential) { UserNameBox.Text = snapshot.UserName; }
         }
@@ -269,6 +270,9 @@ namespace CampusNet
             if (int.TryParse(OnlineProbeBox.Text, out value)) { config.OnlineProbeSeconds = Math.Max(5, Math.Min(3600, value)); }
             if (int.TryParse(OfflineProbeBox.Text, out value)) { config.OfflineProbeSeconds = Math.Max(1, Math.Min(600, value)); }
             if (int.TryParse(HourlyLimitBox.Text, out value)) { config.LoginHourlyLimit = Math.Max(0, Math.Min(240, value)); }
+            if (int.TryParse(MinIntervalBox.Text, out value)) { config.LoginMinIntervalSeconds = Math.Max(0, Math.Min(3600, value)); }
+            if (int.TryParse(UpstreamProbeBox.Text, out value)) { config.UpstreamProbeSeconds = Math.Max(30, Math.Min(3600, value)); }
+            if (int.TryParse(ProbeTimeoutBox.Text, out value)) { config.ProbeTimeoutMs = Math.Max(200, Math.Min(10000, value)); }
             string host = (PortalHostBox.Text ?? string.Empty).Trim();
             if (!string.IsNullOrEmpty(host)) { config.PortalHost = host; }
             try
@@ -277,7 +281,9 @@ namespace CampusNet
                 _engine.Reload();
                 LoadSettingsIntoUi();
                 _log.Info("高级设置已保存：正常时每 " + config.OnlineProbeSeconds + " 秒探测，异常时每 "
-                    + config.OfflineProbeSeconds + " 秒探测，每小时最多登录 " + config.LoginHourlyLimit + " 次。");
+                    + config.OfflineProbeSeconds + " 秒探测，兜底每 " + config.UpstreamProbeSeconds
+                    + " 秒；登录最小间隔 " + config.LoginMinIntervalSeconds + " 秒，每小时最多登录 "
+                    + config.LoginHourlyLimit + " 次，单次探测超时 " + config.ProbeTimeoutMs + " 毫秒。");
                 MessageBox.Show("设置已保存并立即生效。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
@@ -370,6 +376,7 @@ namespace CampusNet
 
         private void Refresh_Click(object sender, RoutedEventArgs e)
         {
+            NetworkProbe.InvalidateNetworkInfo();
             _engine.CheckNow();
             UpdateUi();
             RefreshLog();
@@ -386,6 +393,8 @@ namespace CampusNet
         {
             try
             {
+                NetworkProbe.InvalidateNetworkInfo();
+                _engine.CheckNow();
                 string text = Diagnostics.Build(_engine, _log, true);
                 Clipboard.SetText(text);
                 MessageBox.Show("诊断信息已复制到剪贴板，可以直接粘贴发给别人。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
@@ -437,6 +446,20 @@ namespace CampusNet
             return (int)span.TotalHours + " 小时前";
         }
 
+        /// <summary>按当前状态与配置推算下一次本地探测的时间。</summary>
+        private string NextProbeText(EngineSnapshot snapshot)
+        {
+            if (snapshot.Paused) { return "已暂停"; }
+            if (snapshot.StatusKey == "login-attempt") { return "进行中"; }
+            if (!snapshot.LastProbe.HasValue) { return "等待首次探测"; }
+            AppConfig config = _engine.Config;
+            int interval = snapshot.Online ? config.OnlineProbeSeconds : config.OfflineProbeSeconds;
+            double remain = (snapshot.LastProbe.Value.AddSeconds(interval) - DateTime.Now).TotalSeconds;
+            if (remain <= 0) { return "即将"; }
+            if (remain >= 60) { return "约 " + (int)Math.Ceiling(remain / 60.0) + " 分钟后"; }
+            return (int)Math.Ceiling(remain) + " 秒后";
+        }
+
         private static string ResultText(string result)
         {
             switch (result)
@@ -446,8 +469,8 @@ namespace CampusNet
                 case "login-failed": return "登录失败";
                 case "login-wait": return "等待下次登录";
                 case "login-throttled": return "已触发频率上限";
+                case "login-conflict": return "重复认证冲突";
                 case "login-attempt": return "正在登录";
-                case "cooldown": return "冷却中";
                 case "paused": return "已暂停";
                 case "unreachable": return "无法连接校园网";
                 case "upstream": return "上游异常";
