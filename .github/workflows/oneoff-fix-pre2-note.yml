@@ -21,6 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           tag=v2.0.0-pre.2
+          repo="$GITHUB_REPOSITORY"
           title="校园网自动登录 v2.0.0-pre.2（有严重问题，请用 pre.3）"
 
           cat > /tmp/warn.md <<'EOF'
@@ -39,9 +40,9 @@ jobs:
           ---
           EOF
 
-          gh release view "$tag" --json body -q .body > /tmp/old.md || echo "" > /tmp/old.md
+          gh release view "$tag" --repo "$repo" --json body -q .body > /tmp/old.md || echo "" > /tmp/old.md
           cat /tmp/warn.md /tmp/old.md > /tmp/new.md
-          gh release edit "$tag" --title "$title" --notes-file /tmp/new.md --prerelease
+          gh release edit "$tag" --repo "$repo" --title "$title" --notes-file /tmp/new.md --prerelease
 
           echo "=== 更新后的 Release ==="
-          gh release view "$tag" --json tagName,name,isPrerelease,assets
+          gh release view "$tag" --repo "$repo" --json tagName,name,isPrerelease,assets
