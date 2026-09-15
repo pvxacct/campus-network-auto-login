@@ -1,0 +1,47 @@
+# 一次性工作流：给 v2.0.0-pre.2 的 Release 加上「有严重问题」的醒目提示。
+# 只改标题与说明文字，不新增 / 不替换 / 不删除任何附件（附件仍是那一个 CampusNet.exe）。
+# 用完即删：跑完后下一次提交会把本文件删掉。
+name: One-off fix pre.2 release note
+
+on:
+  push:
+    paths:
+      - '.github/workflows/oneoff-fix-pre2-note.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix-note:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update v2.0.0-pre.2 title and notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=v2.0.0-pre.2
+          title="校园网自动登录 v2.0.0-pre.2（有严重问题，请用 pre.3）"
+
+          cat > /tmp/warn.md <<'EOF'
+          > ## ⚠️ 这一版有严重问题，请勿使用，改用 [v2.0.0-pre.3](https://github.com/pvxacct/campus-network-auto-login/releases/tag/v2.0.0-pre.3)
+          >
+          > **现象**：网络监控一直显示「在线」、延迟显示为 `0 ms`，账号被踢下线后程序**不会自动登录**，
+          > 只有手动点「立即重连」才有用。
+          >
+          > **原因**：pre.2 只用 TCP 握手判断在线。有的校园网关会替任意 TCP 连接代答握手
+          > （连 `203.0.113.1:443` 这种保留地址都显示 0 ms「连上」），于是「连得上」根本说明不了能上网。
+          >
+          > **修复**：pre.3 改为**内容校验**（必须真的取回指定网页里的文本才算在线，
+          > 默认目标 `http:www.msftconnecttest.com/connecttest.txt|Microsoft Connect Test`），
+          > 并在在线时每 5 分钟做一次只读的 Portal 会话核对。详见 [更新日志](https://github.com/pvxacct/campus-network-auto-login/blob/main/CHANGELOG.md)。
+
+          ---
+          EOF
+
+          gh release view "$tag" --json body -q .body > /tmp/old.md || echo "" > /tmp/old.md
+          cat /tmp/warn.md /tmp/old.md > /tmp/new.md
+          gh release edit "$tag" --title "$title" --notes-file /tmp/new.md --prerelease
+
+          echo "=== 更新后的 Release ==="
+          gh release view "$tag" --json tagName,name,isPrerelease,assets
