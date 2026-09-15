@@ -38,7 +38,7 @@ jobs:
           $exe = 'src\CampusNet\bin\Release\net48\CampusNet.exe'
           $version = (& $exe --version | Out-String).Trim()
           Write-Host "版本：$version"
-          if ($version -ne '2.0.0-pre.3') { throw "版本号不符合预期：$version" }
+          if ($version -ne '2.0.0-pre.4') { throw "版本号不符合预期：$version" }
           & $exe --status
 
       - name: Verify committed exe

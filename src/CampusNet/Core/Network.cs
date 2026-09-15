@@ -193,6 +193,28 @@ namespace CampusNet.Core
         }
 
         /// <summary>
+        /// 只跑一遍「内容校验」目标，返回是否有目标真的取回了预期文本。
+        /// 用于「TCP 都通、只有内容校验失败」时的第二次机会：先补测一次，
+        /// 只有补测也失败才去打扰 Portal——避免单次超时（校园网里并不罕见）造成的误判。
+        /// </summary>
+        public static bool ContentCheck(AppConfig config, out int latencyMs)
+        {
+            latencyMs = -1;
+            foreach (string text in config.ProbeTargets)
+            {
+                ProbeTarget target = ProbeTarget.Parse(text);
+                if (target == null || !target.ContentVerified) { continue; }
+                int value;
+                if (RunTarget(config, target, out value))
+                {
+                    latencyMs = value;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
         /// 内容校验探测：真正取回页面内容并核对关键字。
         /// 只做 TCP 握手是不够的——有些网络（例如本机的校园网关）会替任意地址代答握手，
         /// 「连接成功」根本说明不了能上网；只有拿到预期文本才算端到端连通。

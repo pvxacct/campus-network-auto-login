@@ -80,6 +80,8 @@ namespace CampusNet.Core
         private DateTime _startedAt = DateTime.Now;
         /// <summary>内容校验失败后是否已经向 Portal 求证过一次（用于「第一次立即求证、之后按节奏」）。</summary>
         private bool _suspectVerified;
+        /// <summary>本次「内容校验失败」是否已经补测过一次（一次失败先补测，别急着打扰 Portal）。</summary>
+        private bool _suspectRetried;
 
         private DateTime _lastPersistUtc = DateTime.MinValue;
         private string _persistedStatusKey;
@@ -310,7 +312,24 @@ namespace CampusNet.Core
                 // 账号被踢下线后本地探测照样 0 ms 连上，于是程序永远以为在线。
                 // 只要配置了内容校验目标却没通过，就必须向 Portal 求证一次。
                 bool suspect = probe.HasVerifiedTargets && !probe.Verified;
-                if (probe.Verified) { _suspectVerified = false; }
+                if (probe.Verified) { _suspectVerified = false; _suspectRetried = false; }
+                if (suspect && !_suspectRetried)
+                {
+                    // 第二次机会：TCP 已经通了，说明很可能只是这一次内容校验超时/抖动。
+                    // 立刻补测一次内容校验，成功就直接按「在线」处理（0 个 Portal 请求）。
+                    _suspectRetried = true;
+                    int retryLatency;
+                    if (NetworkProbe.ContentCheck(config, out retryLatency))
+                    {
+                        probe.Verified = true;
+                        if (retryLatency >= 0) { probe.LatencyMs = retryLatency; }
+                        suspect = false;
+                        _suspectRetried = false;
+                        UpdateNetwork(probe);
+                        _log.Info("内容校验第一次没过、补测通过（" + (retryLatency < 0 ? "未知" : retryLatency + " ms")
+                            + "），判定为一次抖动，不打扰 Portal。");
+                    }
+                }
                 // 会话核对的锚点：上次核对时间；从没核对过就用本次启动时间，
                 // 这样刚启动时既不会立刻发请求，也能在「内容校验失败」时马上求证。
                 DateTime anchor = _state.LastSessionCheckTime ?? _startedAt;
@@ -568,6 +587,7 @@ namespace CampusNet.Core
                     _state.LastLoginSuccess = AppPaths.FormatTime(DateTime.Now);
                 }
                 _suspectVerified = false;
+                _suspectRetried = false;
                 _log.Info("自动登录成功，网络已恢复。");
                 SetStatus("online", "在线（刚刚自动登录）");
                 Persist(-1, 0);
