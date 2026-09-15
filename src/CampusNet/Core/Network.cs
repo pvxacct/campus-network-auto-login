@@ -10,16 +10,28 @@ using System.Text.RegularExpressions;
 
 namespace CampusNet.Core
 {
-    /// <summary>一个探测目标：tcp:host:port 或 icmp:host。</summary>
+    /// <summary>一个探测目标：tcp:host:port、icmp:host 或 http:主机/路径[|期望文本]。</summary>
     public sealed class ProbeTarget
     {
         public string Kind = "tcp";
         public string Host = string.Empty;
         public int Port;
+        /// <summary>http / https 目标的完整地址。</summary>
+        public string Url = string.Empty;
+        /// <summary>内容校验关键字：响应体必须包含它才算通过（可为空 = 只要 2xx）。</summary>
+        public string Expect = string.Empty;
+
+        /// <summary>是否是「内容校验」目标（能识破网关只代答 TCP 握手的情况）。</summary>
+        public bool ContentVerified { get { return Kind == "http"; } }
 
         public string Display
         {
-            get { return Kind == "icmp" ? Host : Host + ":" + Port.ToString(CultureInfo.InvariantCulture); }
+            get
+            {
+                if (Kind == "icmp") { return Host; }
+                if (Kind == "http") { return Host; }
+                return Host + ":" + Port.ToString(CultureInfo.InvariantCulture);
+            }
         }
 
         public static ProbeTarget Parse(string text)
@@ -27,6 +39,26 @@ namespace CampusNet.Core
             if (string.IsNullOrWhiteSpace(text)) { return null; }
             string value = text.Trim();
             var target = new ProbeTarget();
+            if (value.StartsWith("http:", StringComparison.OrdinalIgnoreCase) ||
+                value.StartsWith("https:", StringComparison.OrdinalIgnoreCase))
+            {
+                int colon = value.IndexOf(':');
+                string scheme = value.Substring(0, colon).ToLowerInvariant();
+                string rest = value.Substring(colon + 1).Trim();
+                int bar = rest.IndexOf('|');
+                if (bar >= 0)
+                {
+                    target.Expect = rest.Substring(bar + 1).Trim();
+                    rest = rest.Substring(0, bar).Trim();
+                }
+                if (rest.StartsWith("//", StringComparison.Ordinal)) { rest = rest.Substring(2); }
+                if (rest.Length == 0) { return null; }
+                target.Kind = "http";
+                target.Url = scheme + "://" + rest;
+                int slash = rest.IndexOf('/');
+                target.Host = slash > 0 ? rest.Substring(0, slash) : rest;
+                return target;
+            }
             if (value.StartsWith("icmp:", StringComparison.OrdinalIgnoreCase))
             {
                 target.Kind = "icmp";
@@ -48,18 +80,31 @@ namespace CampusNet.Core
     public sealed class ProbeOutcome
     {
         public bool Online;
+        /// <summary>至少一个「内容校验」目标真的取回了预期内容（不只是握手成功）。</summary>
+        public bool Verified;
+        /// <summary>配置里是否存在内容校验目标（没有的话只能靠周期性会话校验兜底）。</summary>
+        public bool HasVerifiedTargets;
         public int Successes;
         public int Attempts;
         public int LatencyMs = -1;
         public int LossPercent = 100;
         public readonly List<string> Failures = new List<string>();
+        /// <summary>逐目标明细，供界面展示（例如「www.msftconnecttest.com 31 ms」）。</summary>
+        public readonly List<string> Details = new List<string>();
 
         public string Summary
         {
             get
             {
                 if (Attempts == 0) { return "没有可用的探测目标"; }
-                if (Online) { return "连通（" + Successes + "/" + Attempts + "，延迟 " + LatencyMs + " ms）"; }
+                if (Online)
+                {
+                    string head = Verified ? "内容校验通过" : (HasVerifiedTargets ? "只有 TCP 握手、内容校验未通过" : "连通");
+                    string body = Details.Count > 0
+                        ? string.Join(" · ", Details.ToArray())
+                        : Successes + "/" + Attempts;
+                    return head + "（" + body + "）";
+                }
                 return "不通（" + Successes + "/" + Attempts + "）" + (Failures.Count > 0 ? "：" + Failures[0] : string.Empty);
             }
         }
@@ -89,6 +134,12 @@ namespace CampusNet.Core
             }
             if (targets.Count == 0) { outcome.Online = true; outcome.LossPercent = 0; return outcome; }
 
+            foreach (ProbeTarget target in targets)
+            {
+                if (target.ContentVerified) { outcome.HasVerifiedTargets = true; break; }
+            }
+
+            var detailMap = new Dictionary<string, string>();
             int round = Math.Max(1, rounds);
             for (int i = 0; i < round; i++)
             {
@@ -97,18 +148,24 @@ namespace CampusNet.Core
                 {
                     outcome.Attempts++;
                     int latency;
-                    bool ok = target.Kind == "icmp"
-                        ? PingTarget(target.Host, config.ProbeTimeoutMs, out latency)
-                        : TcpTarget(target.Host, target.Port, config.ProbeTimeoutMs, out latency);
+                    bool ok = RunTarget(config, target, out latency);
                     if (ok)
                     {
                         outcome.Successes++;
-                        if (latency >= 0 && (outcome.LatencyMs < 0 || latency < outcome.LatencyMs)) { outcome.LatencyMs = latency; }
+                        if (target.ContentVerified) { outcome.Verified = true; }
+                        // 延迟取「按配置顺序第一个成功目标」而不是所有目标里的最小值：
+                        // 最小值会被本机/网关代答的目标拉到 0 ms，界面看起来就像坏了。
+                        if (outcome.LatencyMs < 0 && latency >= 0) { outcome.LatencyMs = latency; }
                     }
                     else if (!outcome.Failures.Contains(target.Display))
                     {
                         outcome.Failures.Add(target.Display);
                     }
+                    string detail = target.Display + (ok
+                        ? " " + latency + " ms" + (latency >= 0 && latency < 5 ? "（本地代答）" : string.Empty)
+                        : " 失败");
+                    string previous;
+                    if (!detailMap.TryGetValue(target.Display, out previous) || ok) { detailMap[target.Display] = detail; }
                 }
                 if (outcome.Successes > 0) { break; }
             }
@@ -117,7 +174,77 @@ namespace CampusNet.Core
             outcome.LossPercent = outcome.Attempts == 0
                 ? 100
                 : (int)Math.Round(100.0 * (outcome.Attempts - outcome.Successes) / outcome.Attempts);
+            foreach (ProbeTarget target in targets)
+            {
+                string detail;
+                if (detailMap.TryGetValue(target.Display, out detail)) { outcome.Details.Add(detail); }
+            }
             return outcome;
+        }
+
+        private static bool RunTarget(AppConfig config, ProbeTarget target, out int latencyMs)
+        {
+            if (target.Kind == "icmp") { return PingTarget(target.Host, config.ProbeTimeoutMs, out latencyMs); }
+            if (target.Kind == "http")
+            {
+                return HttpTarget(target.Url, target.Expect, Math.Max(3000, config.ProbeTimeoutMs), out latencyMs);
+            }
+            return TcpTarget(target.Host, target.Port, config.ProbeTimeoutMs, out latencyMs);
+        }
+
+        /// <summary>
+        /// 内容校验探测：真正取回页面内容并核对关键字。
+        /// 只做 TCP 握手是不够的——有些网络（例如本机的校园网关）会替任意地址代答握手，
+        /// 「连接成功」根本说明不了能上网；只有拿到预期文本才算端到端连通。
+        /// </summary>
+        public static bool HttpTarget(string url, string expect, int timeoutMs, out int latencyMs)
+        {
+            latencyMs = -1;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                var request = (HttpWebRequest)WebRequest.Create(url);
+                request.Method = "GET";
+                request.Proxy = null;                 // 直连，避免被本机代理影响判断
+                request.AllowAutoRedirect = false;    // 被跳到 Portal 登录页 = 未认证
+                request.Timeout = timeoutMs;
+                request.ReadWriteTimeout = timeoutMs;
+                request.UserAgent = AppConfig.DefaultUserAgent;
+                request.KeepAlive = false;
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    int code = (int)response.StatusCode;
+                    if (code < 200 || code > 299) { return false; }
+                    string body = ReadProbeBody(response, 4096);
+                    if (!string.IsNullOrEmpty(expect) &&
+                        body.IndexOf(expect, StringComparison.OrdinalIgnoreCase) < 0) { return false; }
+                }
+                watch.Stop();
+                latencyMs = (int)watch.ElapsedMilliseconds;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string ReadProbeBody(HttpWebResponse response, int maxChars)
+        {
+            try
+            {
+                using (Stream stream = response.GetResponseStream())
+                {
+                    if (stream == null) { return string.Empty; }
+                    using (var reader = new StreamReader(stream, Encoding.UTF8, true))
+                    {
+                        var buffer = new char[maxChars];
+                        int read = reader.Read(buffer, 0, buffer.Length);
+                        return read > 0 ? new string(buffer, 0, read) : string.Empty;
+                    }
+                }
+            }
+            catch { return string.Empty; }
         }
 
         public static bool TcpTarget(string host, int port, int timeoutMs, out int latencyMs)

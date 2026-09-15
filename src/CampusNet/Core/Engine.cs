@@ -22,6 +22,8 @@ namespace CampusNet.Core
         public DateTime? LastProbe;
         public DateTime? LastLoginAttempt;
         public DateTime? LastLoginSuccess;
+        public string LastSessionCheck = string.Empty;
+        public string LastSessionResult = string.Empty;
         public bool Paused;
         public DateTime? PauseUntil;
         public bool HasCredential;
@@ -45,6 +47,7 @@ namespace CampusNet.Core
                     case "bad-credential":
                     case "login-failed":
                     case "unreachable": return "red";
+                    // 其余（含 verifying / tcp-only / session-check / login-wait / login-throttled）统一为黄色
                     default: return "amber";
                 }
             }
@@ -73,6 +76,10 @@ namespace CampusNet.Core
         private Thread _worker;
         private volatile bool _stop;
         private bool _pendingRelogin;
+        /// <summary>本次启动（或最近一次配置重载）的时间，用作会话核对的初始锚点。</summary>
+        private DateTime _startedAt = DateTime.Now;
+        /// <summary>内容校验失败后是否已经向 Portal 求证过一次（用于「第一次立即求证、之后按节奏」）。</summary>
+        private bool _suspectVerified;
 
         private DateTime _lastPersistUtc = DateTime.MinValue;
         private string _persistedStatusKey;
@@ -80,6 +87,7 @@ namespace CampusNet.Core
         private bool _persistedPaused;
         private int _persistedFailureCount;
         private int _persistedLoginCount;
+        private string _persistedSessionCheck;
 
         public LoginEngine(Logger log)
         {
@@ -103,6 +111,7 @@ namespace CampusNet.Core
                 catch (Exception ex) { _credential = null; _log.Error("读取凭据失败（凭据与当前 Windows 用户绑定，换用户后需要重新保存）：" + ex.Message); }
                 _state = AppState.Load(AppPaths.StateFile);
                 ResetPersistGate();
+                _startedAt = DateTime.Now;
             }
         }
 
@@ -201,6 +210,8 @@ namespace CampusNet.Core
                 copy.LastProbe = from.LastProbe;
                 copy.LastLoginAttempt = from.LastLoginAttempt;
                 copy.LastLoginSuccess = from.LastLoginSuccess;
+                copy.LastSessionCheck = from.LastSessionCheck;
+                copy.LastSessionResult = from.LastSessionResult;
                 copy.Paused = from.Paused;
                 copy.PauseUntil = from.PauseUntil;
                 copy.HasCredential = from.HasCredential;
@@ -295,7 +306,62 @@ namespace CampusNet.Core
 
             if (probe.Online && !relogin)
             {
-                OnOnline(probe, "网络正常");
+                // 「TCP 能连」不等于「能上网」：有的网关会替任意地址代答 TCP 握手，
+                // 账号被踢下线后本地探测照样 0 ms 连上，于是程序永远以为在线。
+                // 只要配置了内容校验目标却没通过，就必须向 Portal 求证一次。
+                bool suspect = probe.HasVerifiedTargets && !probe.Verified;
+                if (probe.Verified) { _suspectVerified = false; }
+                // 会话核对的锚点：上次核对时间；从没核对过就用本次启动时间，
+                // 这样刚启动时既不会立刻发请求，也能在「内容校验失败」时马上求证。
+                DateTime anchor = _state.LastSessionCheckTime ?? _startedAt;
+                double sinceSession = (now - anchor).TotalSeconds;
+                bool sessionDue = config.SessionCheckSeconds > 0 && sinceSession >= config.SessionCheckSeconds;
+                int calmSeconds = Math.Max(60, config.SessionCheckSeconds > 0 ? config.SessionCheckSeconds : 60);
+                bool verifyDue = suspect && (!_suspectVerified || sinceSession >= calmSeconds);
+
+                if (verifyDue || sessionDue)
+                {
+                    if (suspect)
+                    {
+                        _suspectVerified = true;
+                        SetStatus("verifying", "TCP 能连但内容校验未通过，正在向 Portal 核对");
+                        _log.WarnOnce("verify-content", "TCP 握手成功但内容校验未通过（疑似网关代答或账号已被踢下线），向 Portal 核对一次。");
+                    }
+                    else
+                    {
+                        SetStatus("session-check", "正在核对 Portal 会话（在线巡检）");
+                    }
+
+                    StatusResult check = _portal.GetStatus();
+                    RecordSessionCheck(check);
+
+                    if (!check.Reachable)
+                    {
+                        _log.WarnOnce("session-unreachable", "Portal 暂时不可达，本次跳过会话核对：" + check.Error);
+                        SetStatus("online", "在线（Portal 暂时不可达，稍后再核对）");
+                        Persist(probe.LatencyMs, probe.LossPercent);
+                        return config.OnlineProbeSeconds;
+                    }
+                    if (!check.Online)
+                    {
+                        _log.Warn("Portal 会话核对显示账号已离线，立即进入登录流程。");
+                        SetStatus("offline-detected", "Portal 显示已离线，准备登录");
+                        return LoginFlow(probe, check, false);
+                    }
+                    OnOnline(probe, suspect ? "TCP 可连（内容校验未通过，但 Portal 确认账号在线）" : "网络正常");
+                    Persist(probe.LatencyMs, probe.LossPercent);
+                    return config.OnlineProbeSeconds;
+                }
+
+                if (suspect)
+                {
+                    // 还没到核对时间：如实说明「只有 TCP 握手通过」，别让界面显示成一切正常
+                    SetStatus("tcp-only", "TCP 可连、内容校验未通过（疑似本地代答），稍后向 Portal 核对");
+                }
+                else
+                {
+                    OnOnline(probe, "网络正常");
+                }
                 Persist(probe.LatencyMs, probe.LossPercent);
                 return config.OnlineProbeSeconds;
             }
@@ -463,7 +529,9 @@ namespace CampusNet.Core
                 }
                 else if (result.AlreadyOnline)
                 {
-                    _log.Warn("Portal 提示账号已在别处在线：" + result.Message);
+                    // userid error2「账号已在别处在线」按用户要求忽略：不当成特殊冲突，
+                    // 只做一次 2 秒复检（真在线就算成功），否则记成一次普通失败，按节奏继续重试。
+                    _log.WarnOnce("error2", "Portal 提示账号已在别处在线（已忽略该提示，继续按节奏尝试）：" + result.Message);
                     Thread.Sleep(2000);
                     StatusResult after = _portal.GetStatus();
                     if (after.Reachable && after.Online)
@@ -471,9 +539,8 @@ namespace CampusNet.Core
                         success = true;
                         break;
                     }
-                    limitReason = "重复认证冲突（Portal 提示账号已在别处在线，本机复检仍不在线）";
-                    _log.Warn("复检仍未在线，判定为重复认证冲突，本次不再重试登录。");
-                    break;
+                    lastMessage = "账号已在别处在线（Portal 提示：" + result.Message + "），本机复检仍不在线";
+                    _log.Warn("复检仍未在线：" + lastMessage + "。");
                 }
                 else if (result.RateLimited)
                 {
@@ -500,6 +567,7 @@ namespace CampusNet.Core
                     _state.ConsecutiveFailures = 0;
                     _state.LastLoginSuccess = AppPaths.FormatTime(DateTime.Now);
                 }
+                _suspectVerified = false;
                 _log.Info("自动登录成功，网络已恢复。");
                 SetStatus("online", "在线（刚刚自动登录）");
                 Persist(-1, 0);
@@ -509,13 +577,7 @@ namespace CampusNet.Core
             lock (_gate) { _state.ConsecutiveFailures++; }
             if (!string.IsNullOrEmpty(limitReason))
             {
-                // 限流 / 重复认证冲突：不做冷却，只记原因；后续按最小间隔与每小时上限的节奏继续尝试
-                string key = limitReason.StartsWith("Portal 明确限流", StringComparison.Ordinal)
-                    ? "login-throttled"
-                    : "login-conflict";
-                string text = key == "login-throttled"
-                    ? "Portal 限流，稍后按节奏重试"
-                    : "重复认证冲突，稍后按节奏重试";
+                // Portal 明确限流：不做冷却，只记原因；后续按最小间隔与每小时上限的节奏继续尝试
                 _log.Warn(limitReason + "；本次不重试，将按最小间隔 " + config.LoginMinIntervalSeconds
                     + " 秒、每小时上限 " + config.LoginHourlyLimit + " 次的节奏继续尝试。");
                 lock (_gate)
@@ -523,9 +585,9 @@ namespace CampusNet.Core
                     _state.Online = false;
                     _state.LastError = limitReason + "：" + lastMessage;
                     _state.LastMessage = limitReason;
-                    _state.LastResult = key;
+                    _state.LastResult = "login-throttled";
                 }
-                SetStatus(key, text);
+                SetStatus("login-throttled", "Portal 限流，稍后按节奏重试");
             }
             else
             {
@@ -556,6 +618,21 @@ namespace CampusNet.Core
             }
             if (!wasOnline) { _log.Info("网络已恢复：" + message + "（" + probe.Summary + "）。"); }
             SetStatus("online", "在线（延迟 " + (probe.LatencyMs < 0 ? "未知" : probe.LatencyMs + " ms") + "）");
+        }
+
+        /// <summary>记录一次「在线会话核对」的结果（只读 chkstatus，绝不触发登录）。</summary>
+        private void RecordSessionCheck(StatusResult check)
+        {
+            string result = !check.Reachable ? "unreachable" : (check.Online ? "online" : "offline");
+            lock (_gate)
+            {
+                _state.LastSessionCheck = AppPaths.FormatTime(DateTime.Now);
+                _state.LastSessionResult = result;
+                _snapshot.LastSessionCheck = _state.LastSessionCheck;
+                _snapshot.LastSessionResult = result;
+            }
+            if (check.Online) { _log.Info("会话核对：Portal 显示账号在线。"); }
+            else if (check.Reachable) { _log.Warn("会话核对：Portal 显示账号不在线。"); }
         }
 
         private void UpdateNetwork(ProbeOutcome probe)
@@ -607,7 +684,8 @@ namespace CampusNet.Core
                     || _persistedOnline != _state.Online
                     || _persistedPaused != _state.Paused
                     || _persistedFailureCount != _state.ConsecutiveFailures
-                    || _persistedLoginCount != _state.LoginWindowCount;
+                    || _persistedLoginCount != _state.LoginWindowCount
+                    || !string.Equals(_persistedSessionCheck, _state.LastSessionCheck, StringComparison.Ordinal);
                 if (changed || (DateTime.UtcNow - _lastPersistUtc).TotalSeconds >= PersistMinIntervalSeconds)
                 {
                     try { _state.Save(AppPaths.StateFile); } catch { }
@@ -617,6 +695,7 @@ namespace CampusNet.Core
                     _persistedPaused = _state.Paused;
                     _persistedFailureCount = _state.ConsecutiveFailures;
                     _persistedLoginCount = _state.LoginWindowCount;
+                    _persistedSessionCheck = _state.LastSessionCheck;
                 }
                 _snapshot.LastResult = _state.LastResult;
                 _snapshot.Online = _state.Online;
@@ -629,6 +708,8 @@ namespace CampusNet.Core
                 _snapshot.LastProbe = _state.LastProbeTime;
                 _snapshot.LastLoginAttempt = _state.LastLoginAttemptTime;
                 _snapshot.LastLoginSuccess = _state.LastLoginSuccessTime;
+                _snapshot.LastSessionCheck = _state.LastSessionCheck;
+                _snapshot.LastSessionResult = _state.LastSessionResult;
                 _snapshot.Paused = _state.Paused;
                 _snapshot.PauseUntil = _state.PauseUntilTime;
                 _snapshot.HasCredential = _credential != null && _credential.IsUsable;
@@ -649,6 +730,8 @@ namespace CampusNet.Core
                 _snapshot.Paused = _state.Paused;
                 _snapshot.PauseUntil = _state.PauseUntilTime;
                 _snapshot.LastLoginSuccess = _state.LastLoginSuccessTime;
+                _snapshot.LastSessionCheck = _state.LastSessionCheck;
+                _snapshot.LastSessionResult = _state.LastSessionResult;
                 _snapshot.LastProbe = _state.LastProbeTime;
                 _snapshot.LastTrigger = AppPaths.ParseTime(_state.LastTrigger);
                 _snapshot.ConsecutiveFailures = _state.ConsecutiveFailures;

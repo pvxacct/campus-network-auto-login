@@ -67,6 +67,9 @@ namespace CampusNet
                     case "--diagnose":
                         PrintDiagnose(HasFlag(args, "--with-log"));
                         return;
+                    case "--clear-log":
+                        ClearLog();
+                        return;
                     case "--once":
                         RunHeadless(12, false);
                         return;
@@ -185,6 +188,10 @@ namespace CampusNet
             ConsoleBridge.Line("风控：" + "最小间隔 " + config.LoginMinIntervalSeconds + " 秒；每小时上限 "
                 + config.LoginHourlyLimit + " 次");
             ConsoleBridge.Line("暂停：" + (state.Paused ? "是" : "否"));
+            ConsoleBridge.Line("会话核对：" + (string.IsNullOrEmpty(state.LastSessionCheck)
+                ? "尚未核对"
+                : state.LastSessionCheck + "（" + SessionText(state.LastSessionResult) + "）")
+                + "；间隔 " + (config.SessionCheckSeconds > 0 ? config.SessionCheckSeconds + " 秒" : "关闭"));
             ConsoleBridge.Line("开机自启：" + (SelfInstaller.IsAutoStartEnabled ? "已开启" : "已关闭"));
             ConsoleBridge.Line("Portal：" + config.PortalHost + config.StatusPath);
             ConsoleBridge.Line("旧版残留：" + legacy.Describe());
@@ -199,6 +206,16 @@ namespace CampusNet
             var engine = new LoginEngine(log);
             engine.PrimeForDisplay();
             ConsoleBridge.Line(Diagnostics.Build(engine, log, withLog));
+            Shutdown(0);
+        }
+
+        private void ClearLog()
+        {
+            ConsoleBridge.Attach();
+            AppPaths.EnsureDataDir();
+            var log = new Logger(AppPaths.LogFile, AppPaths.LogOldFile);
+            log.Clear();
+            ConsoleBridge.Line("日志已清空：" + AppPaths.LogFile);
             Shutdown(0);
         }
 
@@ -233,7 +250,10 @@ namespace CampusNet
                 case "login-ok": return "自动登录成功";
                 case "login-wait": return "等待下次登录";
                 case "login-throttled": return "已触发频率上限";
-                case "login-conflict": return "重复认证冲突";
+                case "verifying": return "正在核对网络状态";
+                case "tcp-only": return "只有 TCP 握手通过";
+                case "session-check": return "正在核对 Portal 会话";
+                case "offline-detected": return "检测到已离线";
                 case "paused": return "已暂停";
                 case "no-credential": return "未保存账号";
                 case "unreachable": return "无法连接校园网";
@@ -246,6 +266,17 @@ namespace CampusNet
         private static string Text(string value)
         {
             return string.IsNullOrEmpty(value) ? "—" : value;
+        }
+
+        private static string SessionText(string key)
+        {
+            switch (key)
+            {
+                case "online": return "Portal 显示在线";
+                case "offline": return "Portal 显示已离线";
+                case "unreachable": return "Portal 不可达";
+                default: return string.IsNullOrEmpty(key) ? "—" : key;
+            }
         }
 
         private static string Age(string value)

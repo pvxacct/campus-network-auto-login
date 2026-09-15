@@ -14,7 +14,7 @@ namespace CampusNet.Core
     {
         public const string AppName = "CampusNet";
         public const string DisplayName = "校园网自动登录";
-        public const string Version = "2.0.0-pre.2";
+        public const string Version = "2.0.0-pre.3";
 
         /// <summary>旧版（1.x PowerShell 版）残留位置，仅用于检测与清理。</summary>
         public const string LegacyScriptDir = @"C:\CampusAutoLogin";
@@ -343,6 +343,21 @@ namespace CampusNet.Core
                 }
             }
             return result;
+        }
+
+        /// <summary>
+        /// 清空日志：删除 login.log 与 login.log.old，并清掉内存缓存，最后留一行「日志已清空」。
+        /// 界面上的「清空日志」按钮与 --clear-log 参数都走这里。
+        /// </summary>
+        public void Clear()
+        {
+            lock (_gate)
+            {
+                _recent.Clear();
+                try { if (File.Exists(_path)) { File.Delete(_path); } } catch { }
+                try { if (File.Exists(_oldPath)) { File.Delete(_oldPath); } } catch { }
+            }
+            Write("INFO", "日志已清空");
         }
 
         public string TailText(int count)

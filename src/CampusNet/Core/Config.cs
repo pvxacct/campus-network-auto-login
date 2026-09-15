@@ -10,8 +10,8 @@ namespace CampusNet.Core
     /// <summary>用户配置：门户地址、探测节奏、风控闸门、表单固定字段等。</summary>
     public sealed class AppConfig
     {
-        /// <summary>配置文件结构版本：小于 2 的旧配置会在加载时自动迁移一次。</summary>
-        public const int CurrentConfigVersion = 2;
+        /// <summary>配置文件结构版本：小于当前值的老配置会在加载时自动迁移一次。</summary>
+        public const int CurrentConfigVersion = 3;
 
         public const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -41,6 +41,14 @@ namespace CampusNet.Core
 
         public List<string> ProbeTargets = new List<string>
         {
+            "http:www.msftconnecttest.com/connecttest.txt|Microsoft Connect Test",
+            "tcp:223.5.5.5:443",
+            "tcp:114.114.114.114:53"
+        };
+
+        /// <summary>pre.2 及更早版本的默认探测列表：全是纯 TCP 握手，会被网关「代答」骗过。</summary>
+        private static readonly List<string> LegacyProbeTargets = new List<string>
+        {
             "tcp:223.5.5.5:443",
             "tcp:114.114.114.114:53",
             "tcp:www.msftconnecttest.com:80"
@@ -49,6 +57,10 @@ namespace CampusNet.Core
         public int LoginConfirmDelaySec = 3;
         public int LoginMinIntervalSeconds = 60;
         public int LoginHourlyLimit = 12;
+
+        /// <summary>在线时每隔多少秒只读核对一次 Portal 会话（0 = 关闭）。</summary>
+        public int SessionCheckSeconds = 300;
+
         public int StatusTimeoutSec = 8;
         public int LoginTimeoutSec = 15;
         public int RetryCount = 1;
@@ -111,6 +123,7 @@ namespace CampusNet.Core
             config.LoginConfirmDelaySec = Clamp(Json.GetInt(map, "LoginConfirmDelaySec", config.LoginConfirmDelaySec), 0, 60);
             config.LoginMinIntervalSeconds = Clamp(Json.GetInt(map, "LoginMinIntervalSeconds", config.LoginMinIntervalSeconds), 0, 3600);
             config.LoginHourlyLimit = Clamp(Json.GetInt(map, "LoginHourlyLimit", config.LoginHourlyLimit), 0, 240);
+            config.SessionCheckSeconds = Clamp(Json.GetInt(map, "SessionCheckSeconds", config.SessionCheckSeconds), 0, 3600);
             config.StatusTimeoutSec = Clamp(Json.GetInt(map, "StatusTimeoutSec", config.StatusTimeoutSec), 2, 60);
             config.LoginTimeoutSec = Clamp(Json.GetInt(map, "LoginTimeoutSec", config.LoginTimeoutSec), 2, 60);
             config.RetryCount = Clamp(Json.GetInt(map, "RetryCount", config.RetryCount), 1, 5);
@@ -151,14 +164,31 @@ namespace CampusNet.Core
 
             if (string.IsNullOrWhiteSpace(config.PortalHost)) { config.PortalHost = "10.66.209.2"; }
 
-            // 旧配置一次性迁移：把「在线探测 60 秒」的旧默认值升级为 20 秒，并剔除已废弃的冷却项。
+            // 旧配置一次性迁移，迁移后回写一次（写失败不影响运行）：
+            //   v1 -> v2：在线探测 60 秒的旧默认值升级为 20 秒。
+            //   v2 -> v3：pre.2 的纯 TCP 默认探测列表换成带内容校验的新默认；
+            //             老列表会被校园网关「替任意地址代答 TCP 握手」骗过，导致永远判定在线。
             if (config.ConfigVersion < CurrentConfigVersion)
             {
+                if (SameTargets(config.ProbeTargets, LegacyProbeTargets))
+                {
+                    config.ProbeTargets = new List<string>(new AppConfig().ProbeTargets);
+                }
                 if (config.OnlineProbeSeconds == 60) { config.OnlineProbeSeconds = 20; }
                 config.ConfigVersion = CurrentConfigVersion;
                 try { config.Save(path); } catch { }
             }
             return config;
+        }
+
+        private static bool SameTargets(List<string> left, List<string> right)
+        {
+            if (left == null || right == null || left.Count != right.Count) { return false; }
+            for (int i = 0; i < left.Count; i++)
+            {
+                if (string.Compare(left[i].Trim(), right[i].Trim(), StringComparison.OrdinalIgnoreCase) != 0) { return false; }
+            }
+            return true;
         }
 
         public void Save(string path)
@@ -183,6 +213,7 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.Number("LoginConfirmDelaySec", LoginConfirmDelaySec) + ",");
             builder.AppendLine("  " + Json.Number("LoginMinIntervalSeconds", LoginMinIntervalSeconds) + ",");
             builder.AppendLine("  " + Json.Number("LoginHourlyLimit", LoginHourlyLimit) + ",");
+            builder.AppendLine("  " + Json.Number("SessionCheckSeconds", SessionCheckSeconds) + ",");
             builder.AppendLine("  " + Json.Number("StatusTimeoutSec", StatusTimeoutSec) + ",");
             builder.AppendLine("  " + Json.Number("LoginTimeoutSec", LoginTimeoutSec) + ",");
             builder.AppendLine("  " + Json.Number("RetryCount", RetryCount) + ",");
@@ -274,6 +305,8 @@ namespace CampusNet.Core
         public int ConsecutiveFailures;
         public string LastLoginAttempt = string.Empty;
         public string LastLoginSuccess = string.Empty;
+        public string LastSessionCheck = string.Empty;
+        public string LastSessionResult = string.Empty;
         public string LoginWindowStart = string.Empty;
         public int LoginWindowCount;
         public long RunCount;
@@ -296,6 +329,8 @@ namespace CampusNet.Core
             state.ConsecutiveFailures = Json.GetInt(map, "ConsecutiveFailures", 0);
             state.LastLoginAttempt = Json.GetString(map, "LastLoginAttempt", string.Empty);
             state.LastLoginSuccess = Json.GetString(map, "LastLoginSuccess", string.Empty);
+            state.LastSessionCheck = Json.GetString(map, "LastSessionCheck", string.Empty);
+            state.LastSessionResult = Json.GetString(map, "LastSessionResult", string.Empty);
             state.LoginWindowStart = Json.GetString(map, "LoginWindowStart", string.Empty);
             state.LoginWindowCount = Json.GetInt(map, "LoginWindowCount", 0);
             state.RunCount = Json.GetInt(map, "RunCount", 0);
@@ -318,6 +353,8 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.Number("ConsecutiveFailures", ConsecutiveFailures) + ",");
             builder.AppendLine("  " + Json.String("LastLoginAttempt", LastLoginAttempt) + ",");
             builder.AppendLine("  " + Json.String("LastLoginSuccess", LastLoginSuccess) + ",");
+            builder.AppendLine("  " + Json.String("LastSessionCheck", LastSessionCheck) + ",");
+            builder.AppendLine("  " + Json.String("LastSessionResult", LastSessionResult) + ",");
             builder.AppendLine("  " + Json.String("LoginWindowStart", LoginWindowStart) + ",");
             builder.AppendLine("  " + Json.Number("LoginWindowCount", LoginWindowCount) + ",");
             builder.AppendLine("  " + Json.Number("RunCount", RunCount) + ",");
@@ -331,6 +368,7 @@ namespace CampusNet.Core
         public DateTime? LastProbeTime { get { return AppPaths.ParseTime(LastProbe); } }
         public DateTime? LastLoginAttemptTime { get { return AppPaths.ParseTime(LastLoginAttempt); } }
         public DateTime? LastLoginSuccessTime { get { return AppPaths.ParseTime(LastLoginSuccess); } }
+        public DateTime? LastSessionCheckTime { get { return AppPaths.ParseTime(LastSessionCheck); } }
         public DateTime? PauseUntilTime { get { return AppPaths.ParseTime(PauseUntil); } }
         public DateTime? LoginWindowStartTime { get { return AppPaths.ParseTime(LoginWindowStart); } }
 

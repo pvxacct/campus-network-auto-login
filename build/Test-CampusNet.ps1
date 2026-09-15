@@ -26,6 +26,7 @@ function Write-Config {
         [int]$OnlineProbe,
         [int]$OfflineProbe,
         [int]$HourlyLimit,
+        [int]$SessionCheck = 300,
         [string[]]$Targets
     )
     $config = [ordered]@{
@@ -44,6 +45,7 @@ function Write-Config {
         LoginConfirmDelaySec   = 1
         LoginMinIntervalSeconds = 60
         LoginHourlyLimit       = $HourlyLimit
+        SessionCheckSeconds    = $SessionCheck
         StatusTimeoutSec       = 5
         LoginTimeoutSec        = 5
         RetryCount             = 1
@@ -61,13 +63,14 @@ function Invoke-Scenario {
         [int]$Seconds = 12,
         [int]$OnlineProbe = 3,
         [int]$OfflineProbe = 2,
-        [int]$HourlyLimit = 12
+        [int]$HourlyLimit = 12,
+        [int]$SessionCheck = 300
     )
     $dataDir = Join-Path $work $Name
     New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
     $logPath = Join-Path $dataDir 'portal-requests.log'
     Write-Config -Path (Join-Path $dataDir 'config.json') -PortalHost $PortalHost -OnlineProbe $OnlineProbe `
-        -OfflineProbe $OfflineProbe -HourlyLimit $HourlyLimit -Targets $Targets
+        -OfflineProbe $OfflineProbe -HourlyLimit $HourlyLimit -SessionCheck $SessionCheck -Targets $Targets
 
     $portal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
         -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', $Scenario, '-Port', $Port, '-LogPath', $logPath
@@ -139,12 +142,13 @@ Assert '限流原因写入状态' ($n.State.LastError -match '限流') "LastErro
 Assert 'state.json 不再有冷却字段' (-not ($n.State.PSObject.Properties.Name -contains 'CooldownUntil') `
     -and -not ($n.State.PSObject.Properties.Name -contains 'CooldownReason')) "字段=$($n.State.PSObject.Properties.Name -join ',')"
 
-# 场景 5：重复认证冲突 → 只记原因，不进入冷却
+# 场景 5：Portal 提示「账号已在别处在线」→ 忽略该提示，按普通失败记录并按节奏继续
 $n = Invoke-Scenario -Name 's5-conflict' -Scenario 'conflict' -PortalHost "127.0.0.1:$Port" `
     -Targets @('tcp:127.0.0.1:65004') -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
-Assert '冲突后只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
-Assert '冲突后结果记为 login-conflict' ($n.State.LastResult -eq 'login-conflict') "LastResult=$($n.State.LastResult)"
-Assert '冲突原因写入状态' ($n.State.LastError -match '已在别处') "LastError=$($n.State.LastError)"
+Assert 'error2 后 16 秒内只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
+Assert 'error2 记为普通失败（login-failed）' ($n.State.LastResult -eq 'login-failed') "LastResult=$($n.State.LastResult)"
+Assert 'error2 原因写入状态' ($n.State.LastError -match '已在别处') "LastError=$($n.State.LastError)"
+Assert 'state.json 不再出现 login-conflict' ($n.State.LastResult -ne 'login-conflict') "LastResult=$($n.State.LastResult)"
 
 # 场景 6：登录失败 + 最小间隔 → 短时间不重复登录
 $n = Invoke-Scenario -Name 's6-mininterval' -Scenario 'login-fail' -PortalHost "127.0.0.1:$Port" `
@@ -176,9 +180,34 @@ function Invoke-ConfigMigration {
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
+# 场景 8a：pre.2 的默认探测列表（纯 TCP）必须被换成带内容校验的新默认
+function Invoke-TargetsMigration {
+    param([string]$Name, [string[]]$Targets)
+    $dir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $legacy = [ordered]@{
+        ConfigVersion          = 2
+        PortalHost             = '127.0.0.1:65010'
+        OnlineProbeSeconds     = 20
+        OfflineProbeSeconds    = 2
+        ConfirmAttempts        = 1
+        ConfirmGapMs           = 200
+        ProbeTargets           = @($Targets)
+    }
+    ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
+    & $Exe '--set-credentials' 'testuser' 'testpass' '--data-dir' $dir | Out-String | Out-Null
+    & $Exe '--run-seconds' 4 '--data-dir' $dir | Out-String | Out-Null
+    return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+$legacyDefault = @('tcp:223.5.5.5:443', 'tcp:114.114.114.114:53', 'tcp:www.msftconnecttest.com:80')
+$migratedTargets = Invoke-TargetsMigration -Name 's8-legacy-targets' -Targets $legacyDefault
+Assert 'pre.2 默认探测列表被换成内容校验目标' ($migratedTargets.ProbeTargets[0] -like 'http:*|Microsoft Connect Test') "ProbeTargets=$($migratedTargets.ProbeTargets -join ',')"
+Assert '迁移后探测目标共 3 项' ($migratedTargets.ProbeTargets.Count -eq 3) "Count=$($migratedTargets.ProbeTargets.Count)"
+
 $migrated = Invoke-ConfigMigration -Name 's8-migrate' -OnlineProbe 60
 Assert '旧默认 60 秒迁移为 20 秒' ($migrated.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($migrated.OnlineProbeSeconds)"
-Assert '迁移后写入 ConfigVersion=2' ($migrated.ConfigVersion -eq 2) "ConfigVersion=$($migrated.ConfigVersion)"
+Assert '迁移后写入 ConfigVersion=3' ($migrated.ConfigVersion -eq 3) "ConfigVersion=$($migrated.ConfigVersion)"
 Assert '迁移后剔除 LoginCooldownMinutes' (-not ($migrated.PSObject.Properties.Name -contains 'LoginCooldownMinutes')) '仍存在该键'
 Assert '迁移后保留自定义 ProbeTargets' (($migrated.ProbeTargets -join ',') -eq 'tcp:127.0.0.1:65001') "ProbeTargets=$($migrated.ProbeTargets -join ',')"
 
@@ -193,6 +222,34 @@ New-Item -ItemType Directory -Force -Path $freshDir | Out-Null
 $fresh = Get-Content -LiteralPath (Join-Path $freshDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert '新配置默认在线探测 20 秒' ($fresh.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($fresh.OnlineProbeSeconds)"
 Assert '新配置默认兜底巡检 300 秒' ($fresh.UpstreamProbeSeconds -eq 300) "UpstreamProbeSeconds=$($fresh.UpstreamProbeSeconds)"
+Assert '新配置默认带内容校验目标' ($fresh.ProbeTargets[0] -like 'http:*|Microsoft Connect Test') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
+Assert '新配置默认会话校验 300 秒' ($fresh.SessionCheckSeconds -eq 300) "SessionCheckSeconds=$($fresh.SessionCheckSeconds)"
+
+# 场景 10：TCP 能连、内容校验失败（网关代答导致「假在线」）→ 必须查 Portal 并登录
+$n = Invoke-Scenario -Name 's10-content-fail' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
+    -Targets @("tcp:127.0.0.1:$Port", "http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") `
+    -Seconds 16 -OnlineProbe 2 -OfflineProbe 2
+Assert '内容校验失败时会去核对 Portal' ($n.Status -ge 1) "chkstatus=$($n.Status)"
+Assert '内容校验失败时会自动登录' ($n.Login -eq 1) "login=$($n.Login)"
+Assert '补救后状态为 login-ok/online' ($n.State.LastResult -eq 'login-ok' -or $n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
+Assert '会话核对时间被记录' (-not [string]::IsNullOrEmpty($n.State.LastSessionCheck)) "LastSessionCheck=$($n.State.LastSessionCheck)"
+
+# 场景 11：探测全通但 Portal 会话已离线 → 到会话校验间隔后自动登录
+$n = Invoke-Scenario -Name 's11-session-check' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
+    -Targets @("tcp:127.0.0.1:$Port") -Seconds 16 -OnlineProbe 2 -OfflineProbe 2 -SessionCheck 3
+Assert '会话校验到点后自动登录' ($n.Login -eq 1) "login=$($n.Login)"
+Assert '会话校验结果被记录' ($n.State.LastSessionResult -eq 'online' -or $n.State.LastSessionResult -eq 'offline') "LastSessionResult=$($n.State.LastSessionResult)"
+
+# 场景 12：--clear-log 清空日志（只剩一行「日志已清空」）
+$clearDir = Join-Path $work 's12-clearlog'
+New-Item -ItemType Directory -Force -Path $clearDir | Out-Null
+$logFile = Join-Path $clearDir 'login.log'
+Set-Content -LiteralPath $logFile -Value @('2026-01-01 00:00:00 [INFO] 旧日志一', '2026-01-01 00:00:01 [WARN] 旧日志二') -Encoding UTF8
+Set-Content -LiteralPath ($logFile + '.old') -Value '2026-01-01 00:00:00 [INFO] 更旧的日志' -Encoding UTF8
+& $Exe '--clear-log' '--data-dir' $clearDir | Out-String | Out-Null
+$afterClear = @(Get-Content -LiteralPath $logFile -Encoding UTF8)
+Assert '清空日志后只剩一行提示' ($afterClear.Count -eq 1 -and $afterClear[0] -match '日志已清空') "行数=$($afterClear.Count)"
+Assert '清空日志后不留 login.log.old' (-not (Test-Path -LiteralPath ($logFile + '.old'))) '旧日志文件仍存在'
 
 Write-Host ''
 $results | ForEach-Object { Write-Host $_ }

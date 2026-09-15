@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
@@ -112,7 +113,7 @@ namespace CampusNet
                 : network.AdapterName + "（" + network.AdapterType + "）";
             LatencyText.Text = snapshot.LatencyMs < 0 ? "—" : snapshot.LatencyMs + " ms";
             LossText.Text = snapshot.LossPercent + "%";
-            ProbeText.Text = string.IsNullOrEmpty(snapshot.ProbeSummary) ? "等待首次探测…" : "探测：" + snapshot.ProbeSummary;
+            ProbeText.Text = string.IsNullOrEmpty(snapshot.ProbeSummary) ? "等待首次探测…" : "探测明细：" + snapshot.ProbeSummary;
 
             StatProbe.Text = Describe(snapshot.LastProbe);
             StatLogin.Text = Describe(snapshot.LastLoginSuccess);
@@ -120,6 +121,8 @@ namespace CampusNet
             StatCount.Text = snapshot.LoginWindowCount + " 次";
             StatFail.Text = snapshot.ConsecutiveFailures + " 次";
             StatNextProbe.Text = NextProbeText(snapshot);
+            StatSession.Text = SessionText(snapshot);
+            StatProbeMode.Text = ProbeModeText();
             StatError.Text = string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError;
 
             PauseButton.IsEnabled = !snapshot.Paused;
@@ -232,6 +235,7 @@ namespace CampusNet
             MinIntervalBox.Text = config.LoginMinIntervalSeconds.ToString(CultureInfo.InvariantCulture);
             UpstreamProbeBox.Text = config.UpstreamProbeSeconds.ToString(CultureInfo.InvariantCulture);
             ProbeTimeoutBox.Text = config.ProbeTimeoutMs.ToString(CultureInfo.InvariantCulture);
+            SessionCheckBox.Text = config.SessionCheckSeconds.ToString(CultureInfo.InvariantCulture);
             EngineSnapshot snapshot = _engine.Snapshot();
             if (snapshot.HasCredential) { UserNameBox.Text = snapshot.UserName; }
         }
@@ -263,32 +267,160 @@ namespace CampusNet
             }
         }
 
-        private void SaveAdvanced_Click(object sender, RoutedEventArgs e)
+        // ------------------------------------------------- 高级设置：改完自动保存（没有保存按钮）
+
+        /// <summary>各输入框的合法范围：键名对应 TextBox 的 Tag。</summary>
+        private static readonly Dictionary<string, int[]> AdvancedRanges = new Dictionary<string, int[]>
         {
+            { "OnlineProbeSeconds", new[] { 5, 3600 } },
+            { "OfflineProbeSeconds", new[] { 1, 600 } },
+            { "LoginHourlyLimit", new[] { 0, 240 } },
+            { "LoginMinIntervalSeconds", new[] { 0, 3600 } },
+            { "UpstreamProbeSeconds", new[] { 30, 3600 } },
+            { "ProbeTimeoutMs", new[] { 200, 10000 } },
+            { "SessionCheckSeconds", new[] { 0, 3600 } }
+        };
+
+        private void AdvancedBox_LostFocus(object sender, RoutedEventArgs e)
+        {
+            CommitAdvanced(sender as TextBox);
+        }
+
+        private void AdvancedBox_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Enter) { return; }
+            e.Handled = true;
+            CommitAdvanced(sender as TextBox);
+        }
+
+        private void PortalHost_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Enter) { return; }
+            e.Handled = true;
+            CommitPortalHost();
+        }
+
+        private void PortalHost_LostFocus(object sender, RoutedEventArgs e)
+        {
+            CommitPortalHost();
+        }
+
+        /// <summary>校验单个输入框并立即写盘、立即生效；非法值自动回退到当前值。</summary>
+        private void CommitAdvanced(TextBox box)
+        {
+            if (box == null || box.Tag == null) { return; }
+            string field = Convert.ToString(box.Tag, CultureInfo.InvariantCulture);
+            int[] range;
+            if (!AdvancedRanges.TryGetValue(field, out range)) { return; }
+
             AppConfig config = _engine.Config;
-            int value;
-            if (int.TryParse(OnlineProbeBox.Text, out value)) { config.OnlineProbeSeconds = Math.Max(5, Math.Min(3600, value)); }
-            if (int.TryParse(OfflineProbeBox.Text, out value)) { config.OfflineProbeSeconds = Math.Max(1, Math.Min(600, value)); }
-            if (int.TryParse(HourlyLimitBox.Text, out value)) { config.LoginHourlyLimit = Math.Max(0, Math.Min(240, value)); }
-            if (int.TryParse(MinIntervalBox.Text, out value)) { config.LoginMinIntervalSeconds = Math.Max(0, Math.Min(3600, value)); }
-            if (int.TryParse(UpstreamProbeBox.Text, out value)) { config.UpstreamProbeSeconds = Math.Max(30, Math.Min(3600, value)); }
-            if (int.TryParse(ProbeTimeoutBox.Text, out value)) { config.ProbeTimeoutMs = Math.Max(200, Math.Min(10000, value)); }
-            string host = (PortalHostBox.Text ?? string.Empty).Trim();
-            if (!string.IsNullOrEmpty(host)) { config.PortalHost = host; }
+            int current = ReadField(config, field);
+            int parsed;
+            if (!int.TryParse((box.Text ?? string.Empty).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed))
+            {
+                box.Text = current.ToString(CultureInfo.InvariantCulture);
+                AdvancedHint.Text = "「" + FieldLabel(field) + "」需要 " + range[0] + "–" + range[1]
+                    + " 之间的整数，已还原为 " + current + "。";
+                return;
+            }
+
+            int value = Math.Max(range[0], Math.Min(range[1], parsed));
+            box.Text = value.ToString(CultureInfo.InvariantCulture);
+            if (value == current)
+            {
+                AdvancedHint.Text = "「" + FieldLabel(field) + "」未变化（允许 " + range[0] + "–" + range[1] + "）。";
+                return;
+            }
+
+            WriteField(config, field, value);
             try
             {
                 config.Save(AppPaths.ConfigFile);
                 _engine.Reload();
                 LoadSettingsIntoUi();
-                _log.Info("高级设置已保存：正常时每 " + config.OnlineProbeSeconds + " 秒探测，异常时每 "
-                    + config.OfflineProbeSeconds + " 秒探测，兜底每 " + config.UpstreamProbeSeconds
-                    + " 秒；登录最小间隔 " + config.LoginMinIntervalSeconds + " 秒，每小时最多登录 "
-                    + config.LoginHourlyLimit + " 次，单次探测超时 " + config.ProbeTimeoutMs + " 毫秒。");
-                MessageBox.Show("设置已保存并立即生效。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
+                AdvancedHint.Text = "已保存并立即生效：" + FieldLabel(field) + " = " + value
+                    + "（允许 " + range[0] + "–" + range[1] + "）。";
+                _log.Info("设置已更新：" + FieldLabel(field) + " = " + value + "。");
+                RefreshLog();
             }
             catch (Exception ex)
             {
-                MessageBox.Show("保存失败：" + ex.Message, AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Error);
+                AdvancedHint.Text = "保存失败：" + ex.Message;
+            }
+        }
+
+        private void CommitPortalHost()
+        {
+            AppConfig config = _engine.Config;
+            string host = (PortalHostBox.Text ?? string.Empty).Trim();
+            if (string.IsNullOrEmpty(host))
+            {
+                PortalHostBox.Text = config.PortalHost;
+                AdvancedHint.Text = "Portal 地址不能为空，已还原为 " + config.PortalHost + "。";
+                return;
+            }
+            if (string.Equals(host, config.PortalHost, StringComparison.OrdinalIgnoreCase))
+            {
+                PortalHostBox.Text = config.PortalHost;
+                return;
+            }
+            config.PortalHost = host;
+            try
+            {
+                config.Save(AppPaths.ConfigFile);
+                _engine.Reload();
+                LoadSettingsIntoUi();
+                AdvancedHint.Text = "已保存并立即生效：Portal 地址 = " + host + "。";
+                _log.Info("设置已更新：Portal 地址 = " + host + "。");
+                RefreshLog();
+            }
+            catch (Exception ex)
+            {
+                AdvancedHint.Text = "保存失败：" + ex.Message;
+            }
+        }
+
+        private static int ReadField(AppConfig config, string field)
+        {
+            switch (field)
+            {
+                case "OnlineProbeSeconds": return config.OnlineProbeSeconds;
+                case "OfflineProbeSeconds": return config.OfflineProbeSeconds;
+                case "LoginHourlyLimit": return config.LoginHourlyLimit;
+                case "LoginMinIntervalSeconds": return config.LoginMinIntervalSeconds;
+                case "UpstreamProbeSeconds": return config.UpstreamProbeSeconds;
+                case "ProbeTimeoutMs": return config.ProbeTimeoutMs;
+                case "SessionCheckSeconds": return config.SessionCheckSeconds;
+                default: return 0;
+            }
+        }
+
+        private static void WriteField(AppConfig config, string field, int value)
+        {
+            switch (field)
+            {
+                case "OnlineProbeSeconds": config.OnlineProbeSeconds = value; break;
+                case "OfflineProbeSeconds": config.OfflineProbeSeconds = value; break;
+                case "LoginHourlyLimit": config.LoginHourlyLimit = value; break;
+                case "LoginMinIntervalSeconds": config.LoginMinIntervalSeconds = value; break;
+                case "UpstreamProbeSeconds": config.UpstreamProbeSeconds = value; break;
+                case "ProbeTimeoutMs": config.ProbeTimeoutMs = value; break;
+                case "SessionCheckSeconds": config.SessionCheckSeconds = value; break;
+            }
+        }
+
+        private static string FieldLabel(string field)
+        {
+            switch (field)
+            {
+                case "OnlineProbeSeconds": return "正常时探测间隔";
+                case "OfflineProbeSeconds": return "异常时探测间隔";
+                case "LoginHourlyLimit": return "每小时登录上限";
+                case "LoginMinIntervalSeconds": return "登录最小间隔";
+                case "UpstreamProbeSeconds": return "兜底巡检间隔";
+                case "ProbeTimeoutMs": return "探测超时";
+                case "SessionCheckSeconds": return "会话校验间隔";
+                default: return field;
             }
         }
 
@@ -357,7 +489,30 @@ namespace CampusNet
         private void Relogin_Click(object sender, RoutedEventArgs e)
         {
             _engine.Relogin();
-            MessageBox.Show("已开始立即重连：会先注销当前会话，再重新登录。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
+            _log.Info("已请求立即重连：先注销当前会话，再重新登录。");
+            RefreshLog();
+            // 立刻禁用按钮，避免连点；10 秒后由 UpdateUi 恢复
+            ReloginButton.IsEnabled = false;
+            ReloginButton.Content = "正在重连…";
+            var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(10) };
+            timer.Tick += delegate
+            {
+                timer.Stop();
+                ReloginButton.Content = "立即重连";
+                UpdateUi();
+            };
+            timer.Start();
+        }
+
+        private void ClearLog_Click(object sender, RoutedEventArgs e)
+        {
+            MessageBoxResult answer = MessageBox.Show(
+                "确定要清空运行日志吗？\n\n会删除 login.log 与 login.log.old，删除后无法恢复。",
+                AppPaths.DisplayName, MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (answer != MessageBoxResult.Yes) { return; }
+            _log.Clear();
+            _logSignature = string.Empty;
+            RefreshLog();
         }
 
         private void Pause_Click(object sender, RoutedEventArgs e)
@@ -469,7 +624,10 @@ namespace CampusNet
                 case "login-failed": return "登录失败";
                 case "login-wait": return "等待下次登录";
                 case "login-throttled": return "已触发频率上限";
-                case "login-conflict": return "重复认证冲突";
+                case "verifying": return "正在核对网络状态";
+                case "tcp-only": return "只有 TCP 握手通过";
+                case "session-check": return "正在核对 Portal 会话";
+                case "offline-detected": return "检测到已离线";
                 case "login-attempt": return "正在登录";
                 case "paused": return "已暂停";
                 case "unreachable": return "无法连接校园网";
@@ -478,6 +636,37 @@ namespace CampusNet
                 case "starting": return "启动中";
                 default: return result;
             }
+        }
+
+        /// <summary>「会话校验」一行：最近一次只读核对的时间与结果。</summary>
+        private static string SessionText(EngineSnapshot snapshot)
+        {
+            DateTime? time = AppPaths.ParseTime(snapshot.LastSessionCheck);
+            if (!time.HasValue) { return "尚未核对"; }
+            return Relative(time) + " · " + SessionResultText(snapshot.LastSessionResult);
+        }
+
+        private static string SessionResultText(string key)
+        {
+            switch (key)
+            {
+                case "online": return "Portal 显示在线";
+                case "offline": return "Portal 显示已离线";
+                case "unreachable": return "Portal 不可达";
+                default: return string.IsNullOrEmpty(key) ? "—" : key;
+            }
+        }
+
+        /// <summary>「探测方式」一行：是否配了内容校验目标（能识破网关代答）。</summary>
+        private string ProbeModeText()
+        {
+            bool content = false;
+            foreach (string text in _engine.Config.ProbeTargets)
+            {
+                ProbeTarget target = ProbeTarget.Parse(text);
+                if (target != null && target.ContentVerified) { content = true; break; }
+            }
+            return content ? "内容校验 + TCP 兜底" : "仅 TCP 握手（可能被代答）";
         }
 
         private static string Mask(string userName)
