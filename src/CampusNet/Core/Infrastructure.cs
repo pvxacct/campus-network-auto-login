@@ -14,7 +14,7 @@ namespace CampusNet.Core
     {
         public const string AppName = "CampusNet";
         public const string DisplayName = "校园网自动登录";
-        public const string Version = "2.0.0-pre.4";
+        public const string Version = "2.0.0-pre.5";
 
         /// <summary>旧版（1.x PowerShell 版）残留位置，仅用于检测与清理。</summary>
         public const string LegacyScriptDir = @"C:\CampusAutoLogin";
@@ -351,13 +351,31 @@ namespace CampusNet.Core
         /// </summary>
         public void Clear()
         {
+            var problems = new List<string>();
             lock (_gate)
             {
                 _recent.Clear();
-                try { if (File.Exists(_path)) { File.Delete(_path); } } catch { }
-                try { if (File.Exists(_oldPath)) { File.Delete(_oldPath); } } catch { }
+                foreach (string path in new[] { _path, _oldPath })
+                {
+                    try
+                    {
+                        if (!File.Exists(path)) { continue; }
+                        File.Delete(path);
+                    }
+                    catch
+                    {
+                        // 文件被别的程序打开着（例如正被记事本 / 另一个实例读）时删不掉，
+                        // 退而求其次把内容截断成空文件，别让「清空日志」看起来生效了却留着旧内容。
+                        try { File.WriteAllText(path, string.Empty, Json.Utf8WithBom); }
+                        catch (Exception ex) { problems.Add(Path.GetFileName(path) + "（" + ex.Message + "）"); }
+                    }
+                }
             }
             Write("INFO", "日志已清空");
+            foreach (string problem in problems)
+            {
+                Warn("清空日志时有文件没能处理干净：" + problem);
+            }
         }
 
         public string TailText(int count)

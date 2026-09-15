@@ -34,7 +34,7 @@ Write-Host ('SHA256：{0}' -f $hash)
 Write-Host ''
 Write-Host '== 版本自检 ==' -ForegroundColor Cyan
 $version = (& $exe --version | Out-String).Trim()
-if ($version -ne '2.0.0-pre.4') { throw "版本号不符合预期：$version" }
+if ($version -ne '2.0.0-pre.5') { throw "版本号不符合预期：$version" }
 Write-Host "版本：$version"
 
 if (-not $SkipTests) {
