@@ -20,6 +20,8 @@ namespace CampusNet.Core
         public string Url = string.Empty;
         /// <summary>内容校验关键字：响应体必须包含它才算通过（可为空 = 只要 2xx）。</summary>
         public string Expect = string.Empty;
+        /// <summary>期望的 HTTP 状态码（0 = 任意 2xx）；用于 generate_204 这类只认状态码的目标。</summary>
+        public int ExpectStatus;
 
         /// <summary>是否是「内容校验」目标（能识破网关只代答 TCP 握手的情况）。</summary>
         public bool ContentVerified { get { return Kind == "http"; } }
@@ -50,6 +52,15 @@ namespace CampusNet.Core
                 {
                     target.Expect = rest.Substring(bar + 1).Trim();
                     rest = rest.Substring(0, bar).Trim();
+                    // 竖线后正好是三位数字时按「期望状态码」理解（例如 generate_204 目标写 |204），
+                    // 避免被劫持时返回的 200 门户页面被误判成「网络正常」。
+                    int statusCode;
+                    if (target.Expect.Length == 3 &&
+                        int.TryParse(target.Expect, NumberStyles.Integer, CultureInfo.InvariantCulture, out statusCode))
+                    {
+                        target.ExpectStatus = statusCode;
+                        target.Expect = string.Empty;
+                    }
                 }
                 if (rest.StartsWith("//", StringComparison.Ordinal)) { rest = rest.Substring(2); }
                 if (rest.Length == 0) { return null; }
@@ -187,7 +198,8 @@ namespace CampusNet.Core
             if (target.Kind == "icmp") { return PingTarget(target.Host, config.ProbeTimeoutMs, out latencyMs); }
             if (target.Kind == "http")
             {
-                return HttpTarget(target.Url, target.Expect, Math.Max(3000, config.ProbeTimeoutMs), out latencyMs);
+                return HttpTarget(target.Url, target.Expect, target.ExpectStatus,
+                    Math.Max(5000, config.ProbeTimeoutMs), out latencyMs);
             }
             return TcpTarget(target.Host, target.Port, config.ProbeTimeoutMs, out latencyMs);
         }
@@ -200,26 +212,38 @@ namespace CampusNet.Core
         public static bool ContentCheck(AppConfig config, out int latencyMs)
         {
             latencyMs = -1;
+            var targets = new List<ProbeTarget>();
             foreach (string text in config.ProbeTargets)
             {
                 ProbeTarget target = ProbeTarget.Parse(text);
-                if (target == null || !target.ContentVerified) { continue; }
-                int value;
-                if (RunTarget(config, target, out value))
+                if (target != null && target.ContentVerified) { targets.Add(target); }
+            }
+            foreach (ProbeTarget target in targets)
+            {
+                for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    latencyMs = value;
-                    return true;
+                    int value;
+                    if (RunTarget(config, target, out value))
+                    {
+                        latencyMs = value;
+                        return true;
+                    }
+                    // 这张校园网偶尔会「第一次握手成功但内容不来」：稍等再试同一条目标，
+                    // 比立刻去打扰 Portal 更省事，也更不容易把抖动误判成掉线。
+                    if (attempt == 0) { System.Threading.Thread.Sleep(ContentRetryGapMs); }
                 }
             }
             return false;
         }
+
+        private const int ContentRetryGapMs = 300;
 
         /// <summary>
         /// 内容校验探测：真正取回页面内容并核对关键字。
         /// 只做 TCP 握手是不够的——有些网络（例如本机的校园网关）会替任意地址代答握手，
         /// 「连接成功」根本说明不了能上网；只有拿到预期文本才算端到端连通。
         /// </summary>
-        public static bool HttpTarget(string url, string expect, int timeoutMs, out int latencyMs)
+        public static bool HttpTarget(string url, string expect, int expectStatus, int timeoutMs, out int latencyMs)
         {
             latencyMs = -1;
             var watch = System.Diagnostics.Stopwatch.StartNew();
@@ -236,7 +260,12 @@ namespace CampusNet.Core
                 using (var response = (HttpWebResponse)request.GetResponse())
                 {
                     int code = (int)response.StatusCode;
-                    if (code < 200 || code > 299) { return false; }
+                    if (expectStatus > 0)
+                    {
+                        // 只认状态码的目标（例如 generate_204）：被门户劫持时通常返回 200/302，一律算失败。
+                        if (code != expectStatus) { return false; }
+                    }
+                    else if (code < 200 || code > 299) { return false; }
                     string body = ReadProbeBody(response, 4096);
                     if (!string.IsNullOrEmpty(expect) &&
                         body.IndexOf(expect, StringComparison.OrdinalIgnoreCase) < 0) { return false; }
@@ -439,6 +468,8 @@ namespace CampusNet.Core
         public bool Success;
         public bool RateLimited;
         public bool AlreadyOnline;
+        /// <summary>true = 收到了 Portal 的业务提示（Msg/msga），而不是传输失败或无法识别的响应。</summary>
+        public bool BusinessPrompt;
         public string Message = string.Empty;
     }
 
@@ -522,6 +553,7 @@ namespace CampusNet.Core
                 string prompt = Translate(msga);
                 result.AlreadyOnline = msga.IndexOf("userid error2", StringComparison.OrdinalIgnoreCase) >= 0;
                 result.RateLimited = msga.IndexOf("waitsec", StringComparison.OrdinalIgnoreCase) >= 0;
+                result.BusinessPrompt = true;
                 result.Message = "Msg=" + msg + ", " + msga + " -> " + prompt;
                 return result;
             }

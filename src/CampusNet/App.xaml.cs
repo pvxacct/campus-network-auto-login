@@ -1,8 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Threading;
 using CampusNet.Core;
 using CampusNet.UI;
 
@@ -11,6 +16,7 @@ namespace CampusNet
     public partial class App : Application
     {
         private const string MutexName = @"Local\CampusNet.SingleInstance";
+        private const string SelfTestMutexName = @"Local\CampusNet.SelfTest";
         private const string ShowEventName = @"Local\CampusNet.ShowWindow";
 
         private Mutex _instanceMutex;
@@ -25,6 +31,7 @@ namespace CampusNet
         {
             base.OnStartup(e);
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            InstallCrashGuards();
             string[] args = ApplyDataDirOverride(e.Args ?? new string[0]);
             string head = args.Length > 0 ? args[0].ToLowerInvariant() : string.Empty;
 
@@ -69,6 +76,10 @@ namespace CampusNet
                         return;
                     case "--clear-log":
                         ClearLog();
+                        return;
+                    case "--watchdog":
+                        Environment.ExitCode = Watchdog.Run(HasFlag(args, "--check-only"));
+                        Shutdown(Environment.ExitCode);
                         return;
                     case "--once":
                         RunHeadless(12, false);
@@ -132,6 +143,56 @@ namespace CampusNet
             return int.TryParse(args[index], NumberStyles.Integer, CultureInfo.InvariantCulture, out value) ? value : fallback;
         }
 
+        // ---------------------------------------------------------------- 稳定性兜底
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = false)]
+        private static extern int RegisterApplicationRestart(string commandLine, int flags);
+
+        /// <summary>崩溃后由 Windows 直接把它拉回来（命令行固定为 --tray），不必等人发现。</summary>
+        private static void EnableAutoRestart()
+        {
+            try { RegisterApplicationRestart("--tray", 0); } catch { }
+        }
+
+        /// <summary>
+        /// 任何一层未处理异常都不允许让后台「无声消失」：
+        /// 界面线程异常吞掉并记日志（程序继续跑），后台线程异常至少留下 crash.log 给下次排查。
+        /// </summary>
+        private void InstallCrashGuards()
+        {
+            DispatcherUnhandledException += delegate(object sender, DispatcherUnhandledExceptionEventArgs e)
+            {
+                e.Handled = true;
+                WriteCrash("界面线程未处理异常（已忽略，程序继续运行）", e.Exception);
+                try { if (_log != null) { _log.Error("界面线程未处理异常（已忽略）：" + e.Exception.Message); } } catch { }
+            };
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+            {
+                WriteCrash("后台线程未处理异常（进程即将退出）", e.ExceptionObject as Exception);
+            };
+            TaskScheduler.UnobservedTaskException += delegate(object sender, UnobservedTaskExceptionEventArgs e)
+            {
+                e.SetObserved();
+                WriteCrash("未观察的任务异常（已忽略）", e.Exception);
+            };
+        }
+
+        private static void WriteCrash(string title, Exception ex)
+        {
+            try
+            {
+                AppPaths.EnsureDataDir();
+                var builder = new StringBuilder();
+                builder.AppendLine("===== " + AppPaths.FormatTime(DateTime.Now) + " =====");
+                builder.AppendLine(title);
+                builder.AppendLine("版本：" + AppPaths.Version);
+                builder.AppendLine("命令行：" + (Environment.CommandLine ?? string.Empty));
+                builder.AppendLine(ex == null ? "（没有异常对象）" : ex.ToString());
+                File.AppendAllText(AppPaths.CrashFile, builder.ToString(), new UTF8Encoding(true));
+            }
+            catch { }
+        }
+
         private Logger CreateLogger()
         {
             AppPaths.EnsureDataDir();
@@ -193,6 +254,10 @@ namespace CampusNet
                 : state.LastSessionCheck + "（" + SessionText(state.LastSessionResult) + "）")
                 + "；间隔 " + (config.SessionCheckSeconds > 0 ? config.SessionCheckSeconds + " 秒" : "关闭"));
             ConsoleBridge.Line("开机自启：" + (SelfInstaller.IsAutoStartEnabled ? "已开启" : "已关闭"));
+            ConsoleBridge.Line("守护      ：" + (SelfInstaller.IsWatchdogInstalled ? "已开启（每 2 分钟检查一次）" : "未开启"));
+            ConsoleBridge.Line("已忽略提示：" + state.IgnoredPrompts + " 次"
+                + (string.IsNullOrEmpty(state.LastIgnoredPrompt) ? string.Empty : "；最近：" + state.LastIgnoredPrompt));
+            ConsoleBridge.Line("强制重登  ：" + (string.IsNullOrEmpty(state.LastForcedRelogin) ? "尚未发生" : state.LastForcedRelogin));
             ConsoleBridge.Line("Portal：" + config.PortalHost + config.StatusPath);
             ConsoleBridge.Line("旧版残留：" + legacy.Describe());
             Shutdown(0);
@@ -258,6 +323,7 @@ namespace CampusNet
                 case "no-credential": return "未保存账号";
                 case "unreachable": return "无法连接校园网";
                 case "login-failed": return "登录失败";
+                case "login-retry": return "登录提示已忽略，正在重试";
                 case "upstream": return "上游异常";
                 default: return key;
             }
@@ -295,8 +361,10 @@ namespace CampusNet
         private void StartUi(bool startHidden, bool selfTest)
         {
             bool createdNew;
-            _instanceMutex = new Mutex(true, MutexName, out createdNew);
-            if (!createdNew)
+            // 自检模式用另一个互斥体名字：它只活几秒、只读多看少写，
+            // 不该因为「托盘里已经有一个实例」就悄悄跳过检查，也不该干扰守护的存活判断。
+            _instanceMutex = new Mutex(true, selfTest ? SelfTestMutexName : MutexName, out createdNew);
+            if (!createdNew && !selfTest)
             {
                 try
                 {
@@ -309,6 +377,9 @@ namespace CampusNet
             }
 
             _log = CreateLogger();
+            EnableAutoRestart();
+            _log.Info("程序启动：" + AppPaths.Version + "，" + (startHidden ? "托盘后台模式" : "主窗口模式")
+                + "，数据目录 " + AppPaths.DataDir);
             _engine = new LoginEngine(_log);
             _engine.StatusChanged += OnEngineStatusChanged;
             _engine.Start();
@@ -341,12 +412,31 @@ namespace CampusNet
                 {
                     timer.Stop();
                     ConsoleBridge.Attach();
-                    ConsoleBridge.Line("界面自检通过：窗口已构建并完成一次刷新。");
-                    Environment.ExitCode = 0;
-                    Shutdown(0);
+                    bool ok = TraySelfTest();
+                    ConsoleBridge.Line(ok
+                        ? "界面自检通过：窗口已构建、完成一次刷新，托盘提示文本安全。"
+                        : "界面自检失败：托盘提示文本没有被压缩到安全长度。");
+                    Environment.ExitCode = ok ? 0 : 1;
+                    Shutdown(Environment.ExitCode);
                 };
                 timer.Start();
             }
+        }
+
+        /// <summary>
+        /// 回归用例：超长状态文本（例如「自动登录失败：账号已在别处在线…」）曾经把托盘打成
+        /// ArgumentOutOfRangeException 并让整个后台进程消失，这里必须压到 63 字符以内。
+        /// </summary>
+        private bool TraySelfTest()
+        {
+            if (_tray == null) { return false; }
+            string stress = new string('测', 200)
+                + "自动登录失败：账号已在别处在线（Portal 提示：Msg=01, userid error2 -> 密码错误），本机复检仍不在线";
+            _tray.Update("login-failed", stress, false);
+            int length = _tray.LastTooltip == null ? -1 : _tray.LastTooltip.Length;
+            ConsoleBridge.Line("托盘自检：状态文本 " + stress.Length + " 字 → 托盘提示 " + length
+                + " 字（上限 " + TrayIcon.MaxTooltipChars + "）。");
+            return length > 0 && length <= TrayIcon.MaxTooltipChars;
         }
 
         private void WatchForShowRequest()

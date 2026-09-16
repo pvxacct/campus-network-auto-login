@@ -74,6 +74,9 @@ while ($true) {
                 'online' { $online = $true }
                 'confirm-online' { if ($counts.chkstatus -ge 2) { $online = $true } }
                 'offline-ok' { if ($counts.login -ge 1) { $online = $true } }
+                # 登录接口回了「已在别处在线」，但会话其实已经建立：第 3 次查询起显示在线
+                'conflict-then-online' { if ($counts.chkstatus -ge 3) { $online = $true } }
+                'content-ok' { $online = $true }
                 default { $online = $false }
             }
             $value = if ($online) { 1 } else { 0 }
@@ -90,6 +93,9 @@ while ($true) {
                 }
                 'login-fail' {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=05;msga='error9 unknown';</script>"
+                }
+                'garbage' {
+                    Send-Response -Stream $stream -Body '<html>something entirely unexpected</html>'
                 }
                 default {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_3.htm--><html>login ok</html>"
@@ -109,6 +115,10 @@ while ($true) {
             if ($code -match 'waitsec') { $prompt = '请求过于频繁' }
             Send-Response -Stream $stream -ContentType 'application/json; charset=utf-8' `
                 -Body ("dr1({`"result`":1,`"error_code`":`"$code`",`"error_prompt_zh`":`"$prompt`"})")
+        }
+        elseif ($Scenario -eq 'content-ok' -and $path -like '*connecttest.txt*') {
+            # 内容校验测试用：真的把预期关键字发回去
+            Send-Response -Stream $stream -ContentType 'text/plain; charset=utf-8' -Body 'Microsoft Connect Test'
         }
         else {
             Send-Response -Stream $stream -Body 'not found'

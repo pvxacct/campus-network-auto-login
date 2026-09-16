@@ -13,6 +13,7 @@ namespace CampusNet.Core
     {
         private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValueName = "CampusNet";
+        public const string WatchdogTaskName = "CampusNetWatchdog";
 
         public static bool IsRunningFromInstallDir
         {
@@ -39,11 +40,13 @@ namespace CampusNet.Core
             CreateShortcut(AppPaths.StartMenuShortcut, AppPaths.InstalledExe, "校园网自动登录（Dr.COM）");
             if (desktopShortcut) { CreateShortcut(AppPaths.DesktopShortcut, AppPaths.InstalledExe, "校园网自动登录（Dr.COM）"); }
             SetAutoStart(true, log);
+            EnsureWatchdog(log);
         }
 
         public static void Uninstall(Logger log, bool removeData, bool removeDesktopShortcut)
         {
             SetAutoStart(false, log);
+            RemoveWatchdog(log);
             TryDelete(AppPaths.StartMenuShortcut);
             if (removeDesktopShortcut) { TryDelete(AppPaths.DesktopShortcut); }
             if (removeData)
@@ -101,6 +104,86 @@ namespace CampusNet.Core
             catch (Exception ex)
             {
                 if (log != null) { log.Warn("设置开机自启失败：" + ex.Message); }
+            }
+        }
+
+        // ---------------------------------------------------------------- 守护任务
+
+        /// <summary>守护计划任务是否已注册。</summary>
+        public static bool IsWatchdogInstalled
+        {
+            get { return TaskExists(WatchdogTaskName); }
+        }
+
+        /// <summary>
+        /// 注册（或覆盖）守护任务：每 2 分钟唤起一次「&lt;exe&gt; --watchdog」。
+        /// 只作用于当前用户、普通权限即可，失败只记日志，绝不阻断安装主流程。
+        /// </summary>
+        public static bool EnsureWatchdog(Logger log)
+        {
+            string exe = IsInstalled ? AppPaths.InstalledExe : AppPaths.CurrentExe;
+            string command = "\"" + exe + "\" --watchdog";
+            string arguments = "/create /f /tn \"" + WatchdogTaskName + "\" /tr \"" + command
+                + "\" /sc minute /mo 2";
+            bool created = RunSchtasks(arguments, 20000, log);
+            if (log != null)
+            {
+                log.Info(created
+                    ? "已注册守护任务 " + WatchdogTaskName + "（每 2 分钟检查一次，程序崩溃或卡死会自动拉起）。"
+                    : "守护任务注册失败；自动登录本身不受影响，只是崩溃后需要手动打开一次。");
+            }
+            return created;
+        }
+
+        public static void RemoveWatchdog(Logger log)
+        {
+            if (!TaskExists(WatchdogTaskName)) { return; }
+            bool removed = RunSchtasks("/delete /f /tn \"" + WatchdogTaskName + "\"", 20000, log);
+            if (log != null && removed) { log.Info("已删除守护任务 " + WatchdogTaskName + "。"); }
+        }
+
+        /// <summary>计划任务是否存在（schtasks 查询，普通权限即可）。</summary>
+        public static bool TaskExists(string name)
+        {
+            return RunSchtasks("/query /tn \"" + name + "\"", 8000, null);
+        }
+
+        private static bool RunSchtasks(string arguments, int timeoutMs, Logger log)
+        {
+            try
+            {
+                var info = new ProcessStartInfo("schtasks.exe", arguments);
+                info.UseShellExecute = false;
+                info.CreateNoWindow = true;
+                info.RedirectStandardOutput = true;
+                info.RedirectStandardError = true;
+                using (Process process = Process.Start(info))
+                {
+                    if (process == null) { return false; }
+                    string output = process.StandardOutput.ReadToEnd();
+                    string error = process.StandardError.ReadToEnd();
+                    if (!process.WaitForExit(timeoutMs))
+                    {
+                        try { process.Kill(); } catch { }
+                        if (log != null) { log.Warn("schtasks 超时：" + arguments); }
+                        return false;
+                    }
+                    if (process.ExitCode != 0)
+                    {
+                        if (log != null)
+                        {
+                            string detail = (error + " " + output).Trim();
+                            log.Warn("schtasks " + arguments + " 失败（" + process.ExitCode + "）：" + detail);
+                        }
+                        return false;
+                    }
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (log != null) { log.Warn("调用 schtasks 失败：" + ex.Message); }
+                return false;
             }
         }
 
@@ -176,22 +259,7 @@ namespace CampusNet.Core
 
         public static bool TaskExists()
         {
-            try
-            {
-                var info = new ProcessStartInfo("schtasks.exe", "/query /tn \"" + AppPaths.LegacyTaskName + "\"");
-                info.UseShellExecute = false;
-                info.CreateNoWindow = true;
-                info.RedirectStandardOutput = true;
-                info.RedirectStandardError = true;
-                using (Process process = Process.Start(info))
-                {
-                    process.StandardOutput.ReadToEnd();
-                    process.StandardError.ReadToEnd();
-                    process.WaitForExit(5000);
-                    return process.HasExited && process.ExitCode == 0;
-                }
-            }
-            catch { return false; }
+            return SelfInstaller.TaskExists(AppPaths.LegacyTaskName);
         }
 
         /// <summary>提权执行清理（弹一次 UAC），返回是否成功。</summary>
@@ -282,6 +350,9 @@ namespace CampusNet.Core
             builder.AppendLine("程序路径：" + AppPaths.CurrentExe);
             builder.AppendLine("已安装  ：" + (SelfInstaller.IsInstalled ? "是（" + AppPaths.InstalledExe + "）" : "否（便携运行）"));
             builder.AppendLine("开机自启：" + (SelfInstaller.IsAutoStartEnabled ? "已开启" : "已关闭"));
+            builder.AppendLine("守护    ：" + (SelfInstaller.IsWatchdogInstalled
+                ? "已开启（计划任务 " + SelfInstaller.WatchdogTaskName + "，每 2 分钟检查一次）"
+                : "未开启（崩溃后不会自动回来）"));
             builder.AppendLine("数据目录：" + AppPaths.DataDir);
             builder.AppendLine("账号    ：" + (snapshot.HasCredential ? Mask(snapshot.UserName) : "未保存"));
             builder.AppendLine();
@@ -299,6 +370,11 @@ namespace CampusNet.Core
             builder.AppendLine("连续失败  ：" + snapshot.ConsecutiveFailures + " 次；本小时登录 " + snapshot.LoginWindowCount + " 次");
             builder.AppendLine("暂停      ：" + (snapshot.Paused ? "是" + (snapshot.PauseUntil.HasValue ? "，直到 " + Display(snapshot.PauseUntil) : string.Empty) : "否"));
             builder.AppendLine("最近错误  ：" + (string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError));
+            builder.AppendLine("已忽略提示：" + snapshot.IgnoredPrompts + " 次"
+                + (string.IsNullOrEmpty(snapshot.LastIgnoredPrompt) ? string.Empty : "；最近：" + snapshot.LastIgnoredPrompt));
+            builder.AppendLine("强制重登  ：" + (string.IsNullOrEmpty(snapshot.LastForcedRelogin)
+                ? "尚未发生（本机不通而 Portal 说在线时才会自动注销重登）"
+                : Display(AppPaths.ParseTime(snapshot.LastForcedRelogin)) + Since(AppPaths.ParseTime(snapshot.LastForcedRelogin))));
             builder.AppendLine("累计检查  ：" + snapshot.RunCount + " 次");
             builder.AppendLine();
             builder.AppendLine("---- 网络 ----");
@@ -316,6 +392,9 @@ namespace CampusNet.Core
             builder.AppendLine("风控闸门  ：最小间隔 " + config.LoginMinIntervalSeconds + " 秒；每小时上限 "
                 + config.LoginHourlyLimit + " 次；登录前确认 " + config.LoginConfirmDelaySec + " 秒；会话核对每 "
                 + (config.SessionCheckSeconds > 0 ? config.SessionCheckSeconds + " 秒" : "关闭"));
+            builder.AppendLine("残留重登  ：" + (config.StuckReloginSeconds > 0
+                ? "本机连续 " + config.StuckReloginSeconds + " 秒不通但 Portal 说在线时，自动注销并重新登录"
+                : "关闭"));
             builder.AppendLine("探测目标  ：" + string.Join(", ", config.ProbeTargets.ToArray()));
             builder.AppendLine("探测方式  ：" + (HasContentTarget(config)
                 ? "内容校验 + TCP 兜底（能识破网关代答）"

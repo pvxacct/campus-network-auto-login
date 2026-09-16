@@ -46,6 +46,7 @@ function Write-Config {
         LoginMinIntervalSeconds = 60
         LoginHourlyLimit       = $HourlyLimit
         SessionCheckSeconds    = $SessionCheck
+        StuckReloginSeconds    = 60
         StatusTimeoutSec       = 5
         LoginTimeoutSec        = 5
         RetryCount             = 1
@@ -97,9 +98,13 @@ function Invoke-Scenario {
         $state = [pscustomobject]@{ LastResult = ''; LastError = ''; ConsecutiveFailures = 0; LoginWindowCount = 0 }
     }
 
+    $logContent = ''
+    $localLog = Join-Path $dataDir 'login.log'
+    if (Test-Path -LiteralPath $localLog) { $logContent = Get-Content -LiteralPath $localLog -Raw -Encoding UTF8 }
+
     return [pscustomobject]@{
         Name = $Name; Status = $status; Login = $login; Logout = $logout
-        Requests = $requests; State = $state; Output = $output
+        Requests = $requests; State = $state; Output = $output; Log = $logContent
     }
 }
 
@@ -142,18 +147,23 @@ Assert '限流原因写入状态' ($n.State.LastError -match '限流') "LastErro
 Assert 'state.json 不再有冷却字段' (-not ($n.State.PSObject.Properties.Name -contains 'CooldownUntil') `
     -and -not ($n.State.PSObject.Properties.Name -contains 'CooldownReason')) "字段=$($n.State.PSObject.Properties.Name -join ',')"
 
-# 场景 5：Portal 提示「账号已在别处在线」→ 忽略该提示，按普通失败记录并按节奏继续
+# 场景 5：Portal 提示「账号已在别处在线 / 密码错误」→ 完全忽略，不记失败、不写「最近错误」
 $n = Invoke-Scenario -Name 's5-conflict' -Scenario 'conflict' -PortalHost "127.0.0.1:$Port" `
-    -Targets @('tcp:127.0.0.1:65004') -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
-Assert 'error2 后 16 秒内只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
-Assert 'error2 记为普通失败（login-failed）' ($n.State.LastResult -eq 'login-failed') "LastResult=$($n.State.LastResult)"
-Assert 'error2 原因写入状态' ($n.State.LastError -match '已在别处') "LastError=$($n.State.LastError)"
+    -Targets @('tcp:127.0.0.1:65004') -Seconds 30 -OnlineProbe 2 -OfflineProbe 2
+Assert 'error2 后只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
+Assert 'error2 不再记为登录失败' ($n.State.LastResult -eq 'login-retry') "LastResult=$($n.State.LastResult)"
+Assert 'error2 不写「最近错误」' ([string]::IsNullOrEmpty($n.State.LastError)) "LastError=$($n.State.LastError)"
+Assert 'error2 计入「已忽略提示」' ($n.State.IgnoredPrompts -ge 1) "IgnoredPrompts=$($n.State.IgnoredPrompts)"
+Assert 'error2 的提示原文被记下' ($n.State.LastIgnoredPrompt -match 'error2|已在别处|密码') "LastIgnoredPrompt=$($n.State.LastIgnoredPrompt)"
+Assert '日志里写明提示已忽略' ($n.Log -match '提示已忽略') '日志未出现「提示已忽略」'
 Assert 'state.json 不再出现 login-conflict' ($n.State.LastResult -ne 'login-conflict') "LastResult=$($n.State.LastResult)"
 
-# 场景 6：登录失败 + 最小间隔 → 短时间不重复登录
-$n = Invoke-Scenario -Name 's6-mininterval' -Scenario 'login-fail' -PortalHost "127.0.0.1:$Port" `
+# 场景 6：登录接口回了完全无法识别的响应 → 这才是真正的失败，照实记录
+$n = Invoke-Scenario -Name 's6-mininterval' -Scenario 'garbage' -PortalHost "127.0.0.1:$Port" `
     -Targets @('tcp:127.0.0.1:65005') -Seconds 16 -OnlineProbe 2 -OfflineProbe 1
 Assert '失败后 60 秒内不重复登录' ($n.Login -eq 1) "login=$($n.Login)（16 秒内应只有 1 次）"
+Assert '无法识别的登录响应记为 login-failed' ($n.State.LastResult -eq 'login-failed') "LastResult=$($n.State.LastResult)"
+Assert '真正的失败原因写入状态' ($n.State.LastError -match '未知响应') "LastError=$($n.State.LastError)"
 
 # 场景 7：探测恢复 → 立即回到正常状态
 $n = Invoke-Scenario -Name 's7-recover' -Scenario 'online' -PortalHost "127.0.0.1:$Port" `
@@ -202,12 +212,18 @@ function Invoke-TargetsMigration {
 
 $legacyDefault = @('tcp:223.5.5.5:443', 'tcp:114.114.114.114:53', 'tcp:www.msftconnecttest.com:80')
 $migratedTargets = Invoke-TargetsMigration -Name 's8-legacy-targets' -Targets $legacyDefault
-Assert 'pre.2 默认探测列表被换成内容校验目标' ($migratedTargets.ProbeTargets[0] -like 'http:*|Microsoft Connect Test') "ProbeTargets=$($migratedTargets.ProbeTargets -join ',')"
-Assert '迁移后探测目标共 3 项' ($migratedTargets.ProbeTargets.Count -eq 3) "Count=$($migratedTargets.ProbeTargets.Count)"
+Assert 'pre.2 默认探测列表被换成新的四条' ($migratedTargets.ProbeTargets[0] -eq 'http:connect.rom.miui.com/generate_204|204') "ProbeTargets=$($migratedTargets.ProbeTargets -join ',')"
+Assert '迁移后探测目标共 4 项' ($migratedTargets.ProbeTargets.Count -eq 4) "Count=$($migratedTargets.ProbeTargets.Count)"
+
+# 场景 8b：pre.3 ~ pre.5 的默认探测列表（只有微软一个内容校验目标）也要换成新的四条
+$legacyV3 = @('http:www.msftconnecttest.com/connecttest.txt|Microsoft Connect Test', 'tcp:223.5.5.5:443', 'tcp:114.114.114.114:53')
+$migratedV3 = Invoke-TargetsMigration -Name 's8-legacy-v3-targets' -Targets $legacyV3
+Assert 'pre.5 默认探测列表被换成新的四条' ($migratedV3.ProbeTargets.Count -eq 4 -and $migratedV3.ProbeTargets[0] -eq 'http:connect.rom.miui.com/generate_204|204') "ProbeTargets=$($migratedV3.ProbeTargets -join ',')"
+Assert 'pre.5 配置迁移后写入 ConfigVersion=4' ($migratedV3.ConfigVersion -eq 4) "ConfigVersion=$($migratedV3.ConfigVersion)"
 
 $migrated = Invoke-ConfigMigration -Name 's8-migrate' -OnlineProbe 60
 Assert '旧默认 60 秒迁移为 20 秒' ($migrated.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($migrated.OnlineProbeSeconds)"
-Assert '迁移后写入 ConfigVersion=3' ($migrated.ConfigVersion -eq 3) "ConfigVersion=$($migrated.ConfigVersion)"
+Assert '迁移后写入 ConfigVersion=4' ($migrated.ConfigVersion -eq 4) "ConfigVersion=$($migrated.ConfigVersion)"
 Assert '迁移后剔除 LoginCooldownMinutes' (-not ($migrated.PSObject.Properties.Name -contains 'LoginCooldownMinutes')) '仍存在该键'
 Assert '迁移后保留自定义 ProbeTargets' (($migrated.ProbeTargets -join ',') -eq 'tcp:127.0.0.1:65001') "ProbeTargets=$($migrated.ProbeTargets -join ',')"
 
@@ -222,8 +238,12 @@ New-Item -ItemType Directory -Force -Path $freshDir | Out-Null
 $fresh = Get-Content -LiteralPath (Join-Path $freshDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert '新配置默认在线探测 20 秒' ($fresh.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($fresh.OnlineProbeSeconds)"
 Assert '新配置默认兜底巡检 300 秒' ($fresh.UpstreamProbeSeconds -eq 300) "UpstreamProbeSeconds=$($fresh.UpstreamProbeSeconds)"
-Assert '新配置默认带内容校验目标' ($fresh.ProbeTargets[0] -like 'http:*|Microsoft Connect Test') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
+Assert '新配置默认带「204 内容校验」目标' ($fresh.ProbeTargets[0] -eq 'http:connect.rom.miui.com/generate_204|204') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
+Assert '新配置默认共 4 条探测目标' ($fresh.ProbeTargets.Count -eq 4) "Count=$($fresh.ProbeTargets.Count)"
+Assert '新配置默认保留微软内容校验目标' (($fresh.ProbeTargets -join ' ') -match 'msftconnecttest') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
 Assert '新配置默认会话校验 300 秒' ($fresh.SessionCheckSeconds -eq 300) "SessionCheckSeconds=$($fresh.SessionCheckSeconds)"
+Assert '新配置默认残留重登 60 秒' ($fresh.StuckReloginSeconds -eq 60) "StuckReloginSeconds=$($fresh.StuckReloginSeconds)"
+Assert '新配置写入 ConfigVersion=4' ($fresh.ConfigVersion -eq 4) "ConfigVersion=$($fresh.ConfigVersion)"
 
 # 场景 10：TCP 能连、内容校验失败（网关代答导致「假在线」）→ 必须查 Portal 并登录
 $n = Invoke-Scenario -Name 's10-content-fail' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
@@ -250,6 +270,40 @@ Set-Content -LiteralPath ($logFile + '.old') -Value '2026-01-01 00:00:00 [INFO] 
 $afterClear = @(Get-Content -LiteralPath $logFile -Encoding UTF8)
 Assert '清空日志后只剩一行提示' ($afterClear.Count -eq 1 -and $afterClear[0] -match '日志已清空') "行数=$($afterClear.Count)"
 Assert '清空日志后不留 login.log.old' (-not (Test-Path -LiteralPath ($logFile + '.old'))) '旧日志文件仍存在'
+
+# 场景 13：内容校验目标真的拿到预期内容 → 一个 Portal 请求都不发
+$n = Invoke-Scenario -Name 's13-content-pass' -Scenario 'content-ok' -PortalHost "127.0.0.1:$Port" `
+    -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -Seconds 12 -OnlineProbe 2
+Assert '内容校验通过时不请求 Portal' ($n.Status -eq 0 -and $n.Login -eq 0) "chkstatus=$($n.Status) login=$($n.Login)"
+Assert '内容校验通过后状态为 online' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
+
+# 场景 14：只认 204 的目标拿到 200（典型的门户劫持页）→ 判失败并自动恢复
+$n = Invoke-Scenario -Name 's14-expect-204' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
+    -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test|204") -Seconds 16 -OnlineProbe 2 -OfflineProbe 2
+Assert '期望 204 却拿到 200 时判定为不在线' ($n.Status -ge 1) "chkstatus=$($n.Status)"
+Assert '期望 204 失败后会自动登录' ($n.Login -eq 1) "login=$($n.Login)"
+Assert '恢复后状态为 login-ok' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
+
+# 场景 15：登录接口回「已在别处在线」，但复检确认网络其实已恢复 → 直接算成功
+$n = Invoke-Scenario -Name 's15-error2-recovered' -Scenario 'conflict-then-online' -PortalHost "127.0.0.1:$Port" `
+    -Targets @('tcp:127.0.0.1:65007') -Seconds 20 -OnlineProbe 2 -OfflineProbe 2
+Assert 'error2 后复检在线即算登录成功' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
+Assert 'error2 恢复场景只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
+
+# 场景 16：守护自检（--watchdog --check-only）的判定与退出码
+$watchDir = Join-Path $work 's16-watchdog'
+New-Item -ItemType Directory -Force -Path $watchDir | Out-Null
+$watchOut = Join-Path $watchDir 'watchdog-out.txt'
+$watch = Start-Process -FilePath $Exe -ArgumentList '--watchdog', '--check-only', '--data-dir', $watchDir `
+    -RedirectStandardOutput $watchOut -Wait -PassThru
+$watchText = if (Test-Path -LiteralPath $watchOut) { Get-Content -LiteralPath $watchOut -Raw -Encoding UTF8 } else { '' }
+$mainRunning = @(Get-Process -Name 'CampusNet' -ErrorAction SilentlyContinue).Count -gt 0
+if ($mainRunning) {
+    Assert '主程序在跑时守护判定为存活' ($watch.ExitCode -in @(0, 1)) "exit=$($watch.ExitCode) out=$watchText"
+} else {
+    Assert '主程序不在时守护判定为 dead（退出码 2）' ($watch.ExitCode -eq 2) "exit=$($watch.ExitCode) out=$watchText"
+}
+Assert '守护自检不写状态文件' (-not (Test-Path -LiteralPath (Join-Path $watchDir 'state.json'))) '状态文件被写出来了'
 
 Write-Host ''
 $results | ForEach-Object { Write-Host $_ }

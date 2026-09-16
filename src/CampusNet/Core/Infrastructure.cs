@@ -14,7 +14,7 @@ namespace CampusNet.Core
     {
         public const string AppName = "CampusNet";
         public const string DisplayName = "校园网自动登录";
-        public const string Version = "2.0.0-pre.5";
+        public const string Version = "2.0.0-pre.6";
 
         /// <summary>旧版（1.x PowerShell 版）残留位置，仅用于检测与清理。</summary>
         public const string LegacyScriptDir = @"C:\CampusAutoLogin";
@@ -76,6 +76,18 @@ namespace CampusNet.Core
         public static string LogOldFile
         {
             get { return Path.Combine(DataDir, "login.log.old"); }
+        }
+
+        /// <summary>未处理异常（崩溃 / 界面异常）的记录，正常运行时不存在。</summary>
+        public static string CrashFile
+        {
+            get { return Path.Combine(DataDir, "crash.log"); }
+        }
+
+        /// <summary>守护进程的拉起 / 重启记录。</summary>
+        public static string WatchdogLogFile
+        {
+            get { return Path.Combine(DataDir, "watchdog.log"); }
         }
 
         public static string StartMenuDir

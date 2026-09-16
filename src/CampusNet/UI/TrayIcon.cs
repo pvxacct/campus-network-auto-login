@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using CampusNet.Core;
 
@@ -13,10 +14,17 @@ namespace CampusNet.UI
     {
         private const int IconSize = 32;
 
+        /// <summary>Windows 托盘提示文本的硬上限：NotifyIcon.Text 超过 63 个字符会抛异常并可能杀掉进程。</summary>
+        public const int MaxTooltipChars = 63;
+
         private readonly NotifyIcon _icon;
         private readonly Dictionary<string, Icon> _iconCache = new Dictionary<string, Icon>();
         private readonly bool _balloonEnabled;
         private string _currentKey = string.Empty;
+        private int _safetyVariant;
+
+        /// <summary>最近一次实际写进托盘的提示文本（自检与诊断用）。</summary>
+        public string LastTooltip { get; private set; }
 
         public event Action OpenRequested;
         public event Action ReloginRequested;
@@ -32,7 +40,7 @@ namespace CampusNet.UI
             _balloonEnabled = balloonEnabled;
             _icon = new NotifyIcon();
             _icon.Visible = true;
-            _icon.Text = AppPaths.DisplayName;
+            _icon.Text = FitTooltip(string.Empty);
             _icon.Icon = GetIcon("gray");
             _icon.DoubleClick += delegate { Raise(OpenRequested); };
             _icon.MouseClick += delegate(object sender, MouseEventArgs e)
@@ -44,15 +52,41 @@ namespace CampusNet.UI
 
         public void Update(string statusKey, string statusText, bool paused)
         {
-            string colorKey = ColorFor(statusKey, paused);
-            if (_currentKey != colorKey)
+            // 托盘只是显示层：这里的任何异常都不允许影响自动登录主流程，
+            // 更不能因为提示文字过长把整个后台进程打崩（pre.5 的真实故障）。
+            try
             {
-                _currentKey = colorKey;
-                _icon.Icon = GetIcon(colorKey);
+                string colorKey = ColorFor(statusKey, paused);
+                if (_currentKey != colorKey)
+                {
+                    _currentKey = colorKey;
+                    _icon.Icon = GetIcon(colorKey);
+                }
+                LastTooltip = FitTooltip(statusText, _safetyVariant);
+                _safetyVariant = (_safetyVariant + 1) % 2;
+                _icon.Text = LastTooltip;
             }
-            string tooltip = AppPaths.DisplayName + " " + AppPaths.Version + "\n" + statusText;
-            if (tooltip.Length > 120) { tooltip = tooltip.Substring(0, 120); }
-            _icon.Text = tooltip;
+            catch { }
+        }
+
+        /// <summary>把状态文案压成 NotifyIcon 能接受的单行短文本（≤63 字符）。</summary>
+        public static string FitTooltip(string statusText)
+        {
+            return FitTooltip(statusText, 0);
+        }
+
+        private static string FitTooltip(string statusText, int variant)
+        {
+            string head = AppPaths.DisplayName + " " + AppPaths.Version;
+            string body = (statusText ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
+            string text = string.IsNullOrEmpty(body) ? head : head + " · " + body;
+            text = Regex.Replace(text, "\\s+", " ").Trim();
+            if (text.Length > MaxTooltipChars)
+            {
+                // 省略号在极少数系统上也可能不被接受，第二轮退化成半角句点再试一次。
+                text = text.Substring(0, MaxTooltipChars - 1).TrimEnd() + (variant == 0 ? "…" : ".");
+            }
+            return text;
         }
 
         public void ShowBalloon(string title, string text)
@@ -60,7 +94,9 @@ namespace CampusNet.UI
             if (!_balloonEnabled) { return; }
             try
             {
-                _icon.BalloonTipTitle = title;
+                string safeTitle = title ?? string.Empty;
+                if (safeTitle.Length > MaxTooltipChars) { safeTitle = safeTitle.Substring(0, MaxTooltipChars - 1) + "…"; }
+                _icon.BalloonTipTitle = safeTitle;
                 _icon.BalloonTipText = text;
                 _icon.BalloonTipIcon = ToolTipIcon.Info;
                 _icon.ShowBalloonTip(4000);

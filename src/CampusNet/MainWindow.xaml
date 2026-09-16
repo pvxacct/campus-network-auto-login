@@ -107,6 +107,7 @@
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
                         <TextBlock Grid.Row="0" Grid.Column="0" Text="最近探测" Style="{StaticResource Caption}" Margin="0,0,10,6" />
                         <TextBlock x:Name="StatProbe" Grid.Row="0" Grid.Column="1" Style="{StaticResource Value}" Margin="0,0,16,6" />
@@ -126,6 +127,10 @@
                         <TextBlock x:Name="StatProbeMode" Grid.Row="3" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,6" />
                         <TextBlock Grid.Row="4" Grid.Column="0" Text="最近错误" Style="{StaticResource Caption}" Margin="0,0,10,0" />
                         <TextBlock x:Name="StatError" Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="3" Style="{StaticResource Value}" TextWrapping="Wrap" />
+                        <TextBlock Grid.Row="5" Grid.Column="0" Text="已忽略提示" Style="{StaticResource Caption}" Margin="0,6,10,0" />
+                        <TextBlock x:Name="StatIgnored" Grid.Row="5" Grid.Column="1" Style="{StaticResource Value}" Margin="0,6,16,0" />
+                        <TextBlock Grid.Row="5" Grid.Column="2" Text="强制重登" Style="{StaticResource Caption}" Margin="0,6,10,0" />
+                        <TextBlock x:Name="StatForced" Grid.Row="5" Grid.Column="3" Style="{StaticResource Value}" Margin="0,6,0,0" />
                     </Grid>
                 </StackPanel>
             </Border>
@@ -182,10 +187,11 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Grid.Column="0" Text="正常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="正常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
                             <TextBox x:Name="OnlineProbeBox" Grid.Row="0" Grid.Column="1" Tag="OnlineProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
                             <TextBlock Grid.Row="1" Grid.Column="0" Text="异常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
                             <TextBox x:Name="OfflineProbeBox" Grid.Row="1" Grid.Column="1" Tag="OfflineProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
@@ -199,8 +205,10 @@
                             <TextBox x:Name="UpstreamProbeBox" Grid.Row="5" Grid.Column="1" Tag="UpstreamProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
                             <TextBlock Grid.Row="6" Grid.Column="0" Text="探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
                             <TextBox x:Name="ProbeTimeoutBox" Grid.Row="6" Grid.Column="1" Tag="ProbeTimeoutMs" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
-                            <TextBlock Grid.Row="7" Grid.Column="0" Text="会话校验间隔（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
-                            <TextBox x:Name="SessionCheckBox" Grid.Row="7" Grid.Column="1" Tag="SessionCheckSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
+                            <TextBlock Grid.Row="7" Grid.Column="0" Text="会话校验间隔（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                            <TextBox x:Name="SessionCheckBox" Grid.Row="7" Grid.Column="1" Tag="SessionCheckSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
+                            <TextBlock Grid.Row="8" Grid.Column="0" Text="残留会话自动重登（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
+                            <TextBox x:Name="StuckReloginBox" Grid.Row="8" Grid.Column="1" Tag="StuckReloginSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
                         </Grid>
                             <TextBlock x:Name="AdvancedHint" Style="{StaticResource Caption}" Margin="0,6,0,0" TextWrapping="Wrap"
                                        Text="输入框改完（点开别处或按回车）即自动保存并立即生效。" />

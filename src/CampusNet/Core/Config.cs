@@ -11,7 +11,7 @@ namespace CampusNet.Core
     public sealed class AppConfig
     {
         /// <summary>配置文件结构版本：小于当前值的老配置会在加载时自动迁移一次。</summary>
-        public const int CurrentConfigVersion = 3;
+        public const int CurrentConfigVersion = 4;
 
         public const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -41,9 +41,10 @@ namespace CampusNet.Core
 
         public List<string> ProbeTargets = new List<string>
         {
+            "http:connect.rom.miui.com/generate_204|204",
+            "http:www.baidu.com/robots.txt|Baiduspider",
             "http:www.msftconnecttest.com/connecttest.txt|Microsoft Connect Test",
-            "tcp:223.5.5.5:443",
-            "tcp:114.114.114.114:53"
+            "tcp:223.5.5.5:443"
         };
 
         /// <summary>pre.2 及更早版本的默认探测列表：全是纯 TCP 握手，会被网关「代答」骗过。</summary>
@@ -54,12 +55,25 @@ namespace CampusNet.Core
             "tcp:www.msftconnecttest.com:80"
         };
 
+        /// <summary>pre.3 ~ pre.5 的默认探测列表：只有一个内容校验目标，实测约 10% 单次抖动。</summary>
+        private static readonly List<string> LegacyProbeTargetsV3 = new List<string>
+        {
+            "http:www.msftconnecttest.com/connecttest.txt|Microsoft Connect Test",
+            "tcp:223.5.5.5:443",
+            "tcp:114.114.114.114:53"
+        };
+
         public int LoginConfirmDelaySec = 3;
         public int LoginMinIntervalSeconds = 60;
         public int LoginHourlyLimit = 12;
 
         /// <summary>在线时每隔多少秒只读核对一次 Portal 会话（0 = 关闭）。</summary>
         public int SessionCheckSeconds = 300;
+
+        /// <summary>
+        /// 本机探测连续不通、但 Portal 说账号还在线时的容忍秒数；
+        /// 超过它判定为「残留会话挡路」，自动注销后重新登录（0 = 关闭）。</summary>
+        public int StuckReloginSeconds = 60;
 
         public int StatusTimeoutSec = 8;
         public int LoginTimeoutSec = 15;
@@ -124,6 +138,7 @@ namespace CampusNet.Core
             config.LoginMinIntervalSeconds = Clamp(Json.GetInt(map, "LoginMinIntervalSeconds", config.LoginMinIntervalSeconds), 0, 3600);
             config.LoginHourlyLimit = Clamp(Json.GetInt(map, "LoginHourlyLimit", config.LoginHourlyLimit), 0, 240);
             config.SessionCheckSeconds = Clamp(Json.GetInt(map, "SessionCheckSeconds", config.SessionCheckSeconds), 0, 3600);
+            config.StuckReloginSeconds = Clamp(Json.GetInt(map, "StuckReloginSeconds", config.StuckReloginSeconds), 0, 3600);
             config.StatusTimeoutSec = Clamp(Json.GetInt(map, "StatusTimeoutSec", config.StatusTimeoutSec), 2, 60);
             config.LoginTimeoutSec = Clamp(Json.GetInt(map, "LoginTimeoutSec", config.LoginTimeoutSec), 2, 60);
             config.RetryCount = Clamp(Json.GetInt(map, "RetryCount", config.RetryCount), 1, 5);
@@ -168,9 +183,12 @@ namespace CampusNet.Core
             //   v1 -> v2：在线探测 60 秒的旧默认值升级为 20 秒。
             //   v2 -> v3：pre.2 的纯 TCP 默认探测列表换成带内容校验的新默认；
             //             老列表会被校园网关「替任意地址代答 TCP 握手」骗过，导致永远判定在线。
+            //   v3 -> v4：pre.3 ~ pre.5 的默认探测列表（只有微软一个内容校验目标，实测约 10% 抖动）
+            //             换成「小米 204 + 百度 + 微软 + TCP 兜底」四条，误判与状态闪跳都明显更少。
             if (config.ConfigVersion < CurrentConfigVersion)
             {
-                if (SameTargets(config.ProbeTargets, LegacyProbeTargets))
+                if (SameTargets(config.ProbeTargets, LegacyProbeTargets)
+                    || SameTargets(config.ProbeTargets, LegacyProbeTargetsV3))
                 {
                     config.ProbeTargets = new List<string>(new AppConfig().ProbeTargets);
                 }
@@ -214,6 +232,7 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.Number("LoginMinIntervalSeconds", LoginMinIntervalSeconds) + ",");
             builder.AppendLine("  " + Json.Number("LoginHourlyLimit", LoginHourlyLimit) + ",");
             builder.AppendLine("  " + Json.Number("SessionCheckSeconds", SessionCheckSeconds) + ",");
+            builder.AppendLine("  " + Json.Number("StuckReloginSeconds", StuckReloginSeconds) + ",");
             builder.AppendLine("  " + Json.Number("StatusTimeoutSec", StatusTimeoutSec) + ",");
             builder.AppendLine("  " + Json.Number("LoginTimeoutSec", LoginTimeoutSec) + ",");
             builder.AppendLine("  " + Json.Number("RetryCount", RetryCount) + ",");
@@ -314,6 +333,13 @@ namespace CampusNet.Core
         public string PauseUntil = string.Empty;
         public string LastMessage = string.Empty;
 
+        /// <summary>被忽略的 Portal 业务提示（「账号已在别处在线」「密码错误」等）的累计次数与最近一条。</summary>
+        public int IgnoredPrompts;
+        public string LastIgnoredPrompt = string.Empty;
+
+        /// <summary>最近一次「残留会话挡路 → 自动注销重登」的时间。</summary>
+        public string LastForcedRelogin = string.Empty;
+
         public static AppState Load(string path)
         {
             var state = new AppState();
@@ -337,6 +363,9 @@ namespace CampusNet.Core
             state.Paused = Json.GetBool(map, "Paused", false);
             state.PauseUntil = Json.GetString(map, "PauseUntil", string.Empty);
             state.LastMessage = Json.GetString(map, "LastMessage", string.Empty);
+            state.IgnoredPrompts = Json.GetInt(map, "IgnoredPrompts", 0);
+            state.LastIgnoredPrompt = Json.GetString(map, "LastIgnoredPrompt", string.Empty);
+            state.LastForcedRelogin = Json.GetString(map, "LastForcedRelogin", string.Empty);
             return state;
         }
 
@@ -360,17 +389,23 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.Number("RunCount", RunCount) + ",");
             builder.AppendLine("  " + Json.Bool("Paused", Paused) + ",");
             builder.AppendLine("  " + Json.String("PauseUntil", PauseUntil) + ",");
-            builder.AppendLine("  " + Json.String("LastMessage", LastMessage));
+            builder.AppendLine("  " + Json.String("LastMessage", LastMessage) + ",");
+            builder.AppendLine("  " + Json.Number("IgnoredPrompts", IgnoredPrompts) + ",");
+            builder.AppendLine("  " + Json.String("LastIgnoredPrompt", LastIgnoredPrompt) + ",");
+            builder.AppendLine("  " + Json.String("LastForcedRelogin", LastForcedRelogin));
             builder.AppendLine("}");
             Json.WriteText(path, builder.ToString());
         }
 
+        /// <summary>引擎心跳：每轮评估都会更新，写入节流最多滞后 60 秒。</summary>
+        public DateTime? LastTriggerTime { get { return AppPaths.ParseTime(LastTrigger); } }
         public DateTime? LastProbeTime { get { return AppPaths.ParseTime(LastProbe); } }
         public DateTime? LastLoginAttemptTime { get { return AppPaths.ParseTime(LastLoginAttempt); } }
         public DateTime? LastLoginSuccessTime { get { return AppPaths.ParseTime(LastLoginSuccess); } }
         public DateTime? LastSessionCheckTime { get { return AppPaths.ParseTime(LastSessionCheck); } }
         public DateTime? PauseUntilTime { get { return AppPaths.ParseTime(PauseUntil); } }
         public DateTime? LoginWindowStartTime { get { return AppPaths.ParseTime(LoginWindowStart); } }
+        public DateTime? LastForcedReloginTime { get { return AppPaths.ParseTime(LastForcedRelogin); } }
 
     }
 }

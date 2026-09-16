@@ -124,6 +124,8 @@ namespace CampusNet
             StatSession.Text = SessionText(snapshot);
             StatProbeMode.Text = ProbeModeText();
             StatError.Text = string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError;
+            StatIgnored.Text = snapshot.IgnoredPrompts + " 次";
+            StatForced.Text = ForcedReloginText(snapshot);
 
             PauseButton.IsEnabled = !snapshot.Paused;
             ResumeButton.IsEnabled = snapshot.Paused;
@@ -236,6 +238,7 @@ namespace CampusNet
             UpstreamProbeBox.Text = config.UpstreamProbeSeconds.ToString(CultureInfo.InvariantCulture);
             ProbeTimeoutBox.Text = config.ProbeTimeoutMs.ToString(CultureInfo.InvariantCulture);
             SessionCheckBox.Text = config.SessionCheckSeconds.ToString(CultureInfo.InvariantCulture);
+            StuckReloginBox.Text = config.StuckReloginSeconds.ToString(CultureInfo.InvariantCulture);
             EngineSnapshot snapshot = _engine.Snapshot();
             if (snapshot.HasCredential) { UserNameBox.Text = snapshot.UserName; }
         }
@@ -278,7 +281,8 @@ namespace CampusNet
             { "LoginMinIntervalSeconds", new[] { 0, 3600 } },
             { "UpstreamProbeSeconds", new[] { 30, 3600 } },
             { "ProbeTimeoutMs", new[] { 200, 10000 } },
-            { "SessionCheckSeconds", new[] { 0, 3600 } }
+            { "SessionCheckSeconds", new[] { 0, 3600 } },
+            { "StuckReloginSeconds", new[] { 0, 3600 } }
         };
 
         private void AdvancedBox_LostFocus(object sender, RoutedEventArgs e)
@@ -391,6 +395,7 @@ namespace CampusNet
                 case "UpstreamProbeSeconds": return config.UpstreamProbeSeconds;
                 case "ProbeTimeoutMs": return config.ProbeTimeoutMs;
                 case "SessionCheckSeconds": return config.SessionCheckSeconds;
+                case "StuckReloginSeconds": return config.StuckReloginSeconds;
                 default: return 0;
             }
         }
@@ -406,6 +411,7 @@ namespace CampusNet
                 case "UpstreamProbeSeconds": config.UpstreamProbeSeconds = value; break;
                 case "ProbeTimeoutMs": config.ProbeTimeoutMs = value; break;
                 case "SessionCheckSeconds": config.SessionCheckSeconds = value; break;
+                case "StuckReloginSeconds": config.StuckReloginSeconds = value; break;
             }
         }
 
@@ -420,6 +426,7 @@ namespace CampusNet
                 case "UpstreamProbeSeconds": return "兜底巡检间隔";
                 case "ProbeTimeoutMs": return "探测超时";
                 case "SessionCheckSeconds": return "会话校验间隔";
+                case "StuckReloginSeconds": return "残留会话自动重登";
                 default: return field;
             }
         }
@@ -624,6 +631,8 @@ namespace CampusNet
                 case "login-failed": return "登录失败";
                 case "login-wait": return "等待下次登录";
                 case "login-throttled": return "已触发频率上限";
+                case "login-retry": return "已忽略 Portal 提示，继续重试";
+                case "stuck-relogin": return "残留会话：正在强制重新登录";
                 case "verifying": return "正在核对网络状态";
                 case "tcp-only": return "只有 TCP 握手通过";
                 case "session-check": return "正在核对 Portal 会话";
@@ -655,6 +664,13 @@ namespace CampusNet
                 case "unreachable": return "Portal 不可达";
                 default: return string.IsNullOrEmpty(key) ? "—" : key;
             }
+        }
+
+        /// <summary>「强制重登」一行：本机不通但 Portal 说在线时，主动注销重登的最后一次时间。</summary>
+        private static string ForcedReloginText(EngineSnapshot snapshot)
+        {
+            DateTime? time = AppPaths.ParseTime(snapshot.LastForcedRelogin);
+            return time.HasValue ? Relative(time) : "尚未发生";
         }
 
         /// <summary>「探测方式」一行：是否配了内容校验目标（能识破网关代答）。</summary>
