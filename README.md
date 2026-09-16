@@ -2,7 +2,7 @@
 
 Windows 下的校园网 Portal 自动登录工具。2.0 把「自动登录」和「网络监控面板」合并成**一个单文件 exe**：
 双击就能用，没有 PowerShell 脚本、不需要管理员权限、不需要安装任何运行时
-（安装时只会注册一个属于当前用户的守护小任务 `CampusNetWatchdog`，用来在程序崩溃后自动把它拉起来）。
+（程序会顺手多起一个独立的守护小进程，主程序崩溃或卡死时把它自动拉回来）。
 
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6)](https://www.microsoft.com/windows/)
 [![.NET Framework](https://img.shields.io/badge/.NET%20Framework-4.8-512BD4)](https://dotnet.microsoft.com/)
@@ -85,8 +85,8 @@ Windows 下的校园网 Portal 自动登录工具。2.0 把「自动登录」和
   只记一行日志与「已忽略提示」计数，随后做几次轻量复检，网络真的通了就立刻算成功；
 - 本机连续 60 秒不通、Portal 却坚持说账号在线（典型的残留会话）时，
   程序会自动**注销 + 重新登录**一次，不需要手动点「立即重连」；
-- 后台有**守护任务**（计划任务 `CampusNetWatchdog`，每 2 分钟检查一次）：
-  程序崩溃或卡死会被自动拉起来；
+- 后台有**守护进程**（独立小进程，每 30 秒看一次）：主程序崩溃或卡死会自动被拉起来；
+  用户在托盘里点「退出」时它会一起收工，不会跟你抢着启动；
 - 网卡切换、插拔网线、休眠唤醒、解锁都会立即触发一次评估，不必等到下一个周期。
 
 ## 数据与隐私
@@ -114,7 +114,8 @@ CampusNet.exe --tray          只进托盘，不弹窗口（开机自启用的�
 CampusNet.exe --status        打印当前状态一行行摘要
 CampusNet.exe --diagnose      打印完整诊断信息（加 --with-log 附带日志尾部）
 CampusNet.exe --clear-log     清空运行日志（等价于界面上的「清空日志」按钮）
-CampusNet.exe --watchdog      守护自检并（必要时）把后台拉起来（计划任务用的就是它）
+CampusNet.exe --watchdog      守护自检并（必要时）把后台拉起来
+CampusNet.exe --watchdog-loop 守护进程主循环（常驻，由主程序自动启动）
 CampusNet.exe --relogin       立即注销并重新登录
 CampusNet.exe --once          前台跑一轮检查后退出（用于验证）
 CampusNet.exe --run-seconds N 前台跑 N 秒后退出

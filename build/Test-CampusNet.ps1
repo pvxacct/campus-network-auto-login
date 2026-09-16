@@ -305,6 +305,25 @@ if ($mainRunning) {
 }
 Assert '守护自检不写状态文件' (-not (Test-Path -LiteralPath (Join-Path $watchDir 'state.json'))) '状态文件被写出来了'
 
+# 场景 17：常驻守护进程（--watchdog-loop）在不在跑，状态里要如实显示
+$loopDir = Join-Path $work 's17-watchdog-loop'
+New-Item -ItemType Directory -Force -Path $loopDir | Out-Null
+$statusBefore = (& $Exe '--status' '--data-dir' $loopDir 2>&1 | Out-String)
+$preexisting = $statusBefore -match '守护\s*：已开启'
+if (-not $preexisting) {
+    Assert '守护未启动时状态显示未开启' ($statusBefore -match '守护\s*：未开启') "输出=$($statusBefore -replace "`r?`n", ' | ')"
+}
+$loop = Start-Process -FilePath $Exe -ArgumentList '--watchdog-loop', '--data-dir', $loopDir -PassThru
+Start-Sleep -Seconds 3
+$statusRunning = (& $Exe '--status' '--data-dir' $loopDir 2>&1 | Out-String)
+Assert '守护进程在跑时状态显示已开启' ($statusRunning -match '守护\s*：已开启') "输出=$($statusRunning -replace "`r?`n", ' | ')"
+try { Stop-Process -Id $loop.Id -Force -ErrorAction SilentlyContinue } catch { }
+Start-Sleep -Seconds 2
+if (-not $preexisting) {
+    $statusAfter = (& $Exe '--status' '--data-dir' $loopDir 2>&1 | Out-String)
+    Assert '守护进程退出后状态回到未开启' ($statusAfter -match '守护\s*：未开启') "输出=$($statusAfter -replace "`r?`n", ' | ')"
+}
+
 Write-Host ''
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ''

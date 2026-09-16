@@ -13,7 +13,6 @@ namespace CampusNet.Core
     {
         private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValueName = "CampusNet";
-        public const string WatchdogTaskName = "CampusNetWatchdog";
 
         public static bool IsRunningFromInstallDir
         {
@@ -109,37 +108,24 @@ namespace CampusNet.Core
 
         // ---------------------------------------------------------------- 守护任务
 
-        /// <summary>守护计划任务是否已注册。</summary>
+        /// <summary>守护进程是否在跑。</summary>
         public static bool IsWatchdogInstalled
         {
-            get { return TaskExists(WatchdogTaskName); }
+            get { return Watchdog.IsRunning; }
         }
 
         /// <summary>
-        /// 注册（或覆盖）守护任务：每 2 分钟唤起一次「&lt;exe&gt; --watchdog」。
-        /// 只作用于当前用户、普通权限即可，失败只记日志，绝不阻断安装主流程。
+        /// 确保守护进程在跑。守护是一个独立的小进程（`--watchdog-loop`），每 30 秒看一眼主程序，
+        /// 崩了/卡死了就把它拉起来——不需要管理员权限，也不需要注册计划任务。
         /// </summary>
         public static bool EnsureWatchdog(Logger log)
         {
-            string exe = IsInstalled ? AppPaths.InstalledExe : AppPaths.CurrentExe;
-            string command = "\"" + exe + "\" --watchdog";
-            string arguments = "/create /f /tn \"" + WatchdogTaskName + "\" /tr \"" + command
-                + "\" /sc minute /mo 2";
-            bool created = RunSchtasks(arguments, 20000, log);
-            if (log != null)
-            {
-                log.Info(created
-                    ? "已注册守护任务 " + WatchdogTaskName + "（每 2 分钟检查一次，程序崩溃或卡死会自动拉起）。"
-                    : "守护任务注册失败；自动登录本身不受影响，只是崩溃后需要手动打开一次。");
-            }
-            return created;
+            return Watchdog.EnsureRunning(log);
         }
 
         public static void RemoveWatchdog(Logger log)
         {
-            if (!TaskExists(WatchdogTaskName)) { return; }
-            bool removed = RunSchtasks("/delete /f /tn \"" + WatchdogTaskName + "\"", 20000, log);
-            if (log != null && removed) { log.Info("已删除守护任务 " + WatchdogTaskName + "。"); }
+            Watchdog.Stop(log);
         }
 
         /// <summary>计划任务是否存在（schtasks 查询，普通权限即可）。</summary>
@@ -351,7 +337,7 @@ namespace CampusNet.Core
             builder.AppendLine("已安装  ：" + (SelfInstaller.IsInstalled ? "是（" + AppPaths.InstalledExe + "）" : "否（便携运行）"));
             builder.AppendLine("开机自启：" + (SelfInstaller.IsAutoStartEnabled ? "已开启" : "已关闭"));
             builder.AppendLine("守护    ：" + (SelfInstaller.IsWatchdogInstalled
-                ? "已开启（计划任务 " + SelfInstaller.WatchdogTaskName + "，每 2 分钟检查一次）"
+                ? "已开启（守护进程每 " + Watchdog.LoopIntervalSeconds + " 秒检查一次）"
                 : "未开启（崩溃后不会自动回来）"));
             builder.AppendLine("数据目录：" + AppPaths.DataDir);
             builder.AppendLine("账号    ：" + (snapshot.HasCredential ? Mask(snapshot.UserName) : "未保存"));

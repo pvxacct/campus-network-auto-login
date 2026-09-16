@@ -81,6 +81,10 @@ namespace CampusNet
                         Environment.ExitCode = Watchdog.Run(HasFlag(args, "--check-only"));
                         Shutdown(Environment.ExitCode);
                         return;
+                    case "--watchdog-loop":
+                        Environment.ExitCode = Watchdog.RunLoop();
+                        Shutdown(Environment.ExitCode);
+                        return;
                     case "--once":
                         RunHeadless(12, false);
                         return;
@@ -254,7 +258,9 @@ namespace CampusNet
                 : state.LastSessionCheck + "（" + SessionText(state.LastSessionResult) + "）")
                 + "；间隔 " + (config.SessionCheckSeconds > 0 ? config.SessionCheckSeconds + " 秒" : "关闭"));
             ConsoleBridge.Line("开机自启：" + (SelfInstaller.IsAutoStartEnabled ? "已开启" : "已关闭"));
-            ConsoleBridge.Line("守护      ：" + (SelfInstaller.IsWatchdogInstalled ? "已开启（每 2 分钟检查一次）" : "未开启"));
+            ConsoleBridge.Line("守护      ：" + (SelfInstaller.IsWatchdogInstalled
+                ? "已开启（守护进程每 " + Watchdog.LoopIntervalSeconds + " 秒检查一次）"
+                : "未开启（崩溃后不会自动回来）"));
             ConsoleBridge.Line("已忽略提示：" + state.IgnoredPrompts + " 次"
                 + (string.IsNullOrEmpty(state.LastIgnoredPrompt) ? string.Empty : "；最近：" + state.LastIgnoredPrompt));
             ConsoleBridge.Line("强制重登  ：" + (string.IsNullOrEmpty(state.LastForcedRelogin) ? "尚未发生" : state.LastForcedRelogin));
@@ -380,6 +386,9 @@ namespace CampusNet
             EnableAutoRestart();
             _log.Info("程序启动：" + AppPaths.Version + "，" + (startHidden ? "托盘后台模式" : "主窗口模式")
                 + "，数据目录 " + AppPaths.DataDir);
+            // 守护进程：独立于本进程，主程序崩溃或卡死时由它拉起来（不需要管理员权限）
+            Watchdog.ResetIntent();
+            Watchdog.EnsureRunning(_log);
             _engine = new LoginEngine(_log);
             _engine.StatusChanged += OnEngineStatusChanged;
             _engine.Start();
@@ -495,6 +504,8 @@ namespace CampusNet
             if (_window != null) { _window.AllowClose(); }
             if (_tray != null) { _tray.Dispose(); _tray = null; }
             if (_engine != null) { _engine.Dispose(); _engine = null; }
+            // 用户主动退出：让守护进程也停下来，不然它过 30 秒又把程序拉起来
+            Watchdog.SignalIntent();
             if (_showEvent != null) { try { _showEvent.Close(); } catch { } }
             if (_instanceMutex != null) { try { _instanceMutex.ReleaseMutex(); } catch { } }
             Shutdown(0);

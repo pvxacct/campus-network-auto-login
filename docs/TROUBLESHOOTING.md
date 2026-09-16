@@ -119,18 +119,27 @@ exe 是用仓库源码现场编译、没有数字签名的程序，火绒、Defe
 
 ## 11. 后台悄悄消失 / 网络长时间不恢复
 
-2.0.0-pre.6 起有守护任务兜底，正常情况下不会再出现「没人管」的状态。如果怀疑它崩过：
+2.0.0-pre.6 起有守护进程兜底，正常情况下不会再出现「没人管」的状态。如果怀疑它崩过：
 
 1. 看 `%LOCALAPPDATA%\CampusNet\crash.log` —— 有内容就是崩过，里面带完整堆栈；
 2. 看 `%LOCALAPPDATA%\CampusNet\watchdog.log` —— 每一次「拉起 / 重启」都会记一行；
-3. 确认守护任务还在：
+3. 确认守护还在跑：
 
 ```powershell
-schtasks /query /tn CampusNetWatchdog
+CampusNet.exe --status                     # 「守护：已开启（守护进程每 30 秒检查一次）」
 CampusNet.exe --watchdog --check-only      # 打印当前判定：alive / stale / dead
 ```
 
-如果提示「未开启」，打开仪表盘点一次 **安装** 就会重新注册（`--install` 等价）。
+如果显示「未开启」，用托盘图标右键 → **退出** 再重新打开一次程序即可（程序每次启动都会把守护拉起来）。
+
+想再加一层（可选，需要管理员权限）：注册一个每 2 分钟跑一次的计划任务，等于给守护再加一道保险。
+在**管理员** PowerShell 里执行：
+
+```powershell
+schtasks /create /f /tn CampusNetWatchdog /tr "\"$env:LOCALAPPDATA\Programs\CampusNet\CampusNet.exe\" --watchdog" /sc minute /mo 2
+```
+
+它和守护进程互不冲突：都只是「看看进程在不在、不在就拉起来」。
 
 ## 12. 需要更深入的排查
 
