@@ -1,0 +1,65 @@
+# 一次性工作流：给 v2.0.0-pre.6 的 Release 加上「有严重问题」的醒目提示。
+# 只改标题与说明文字，不新增 / 不替换 / 不删除任何附件（附件仍是那一个 CampusNet.exe）。
+# 用完即删：跑完后下一次提交会把本文件删掉。
+name: One-off fix pre.6 release note
+
+on:
+  push:
+    paths:
+      - '.github/workflows/oneoff-fix-pre6-note.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix-note:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update v2.0.0-pre.6 title and notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=v2.0.0-pre.6
+          repo="$GITHUB_REPOSITORY"
+          title="校园网自动登录 v2.0.0-pre.6（有严重问题，请用 pre.7）"
+
+          cat > /tmp/warn.md <<'EOF'
+          > ## ⚠️ 这一版有已知问题，请改用 [v2.0.0-pre.7](https://github.com/pvxacct/campus-network-auto-login/releases/tag/v2.0.0-pre.7)
+          >
+          > **现象**：账号被踢下线后可能迟迟不恢复，最坏情况要等半分钟以上才会重新登录；
+          > 也可能出现「显示已登录成功、实际还是没网」并且长时间不再重试。
+          >
+          > **原因**（代码走查确认，共 10 处）：
+          >
+          > 1. 登录接口返回成功、但 Portal 状态接口不可达时，被直接记为 `login-ok` 并写「最近登录成功」，
+          >    之后长时间不再重试；实际上这一步根本没确认是否联网。
+          > 2. 断网判定是**串行**等三条 HTTP 探测目标各自超时：完全断网时单轮约十几秒，
+          >    再叠加多轮复检，接近半分钟到 50 秒，与「秒级重连」不符。
+          > 3. `ProbeTargets` 里全是非法格式时被判为「在线」，自动登录会永远不触发。
+          > 4. 配置文件损坏（半截 JSON / 空文件）时静默回退默认配置并继续登录，
+          >    存在把账号密码发到错误地址的风险；配置写入也非严格原子。
+          > 5. 界面保存账号或高级设置触发的 `Reload()` 与后台评估线程存在竞态。
+          > 6. `--set-credentials 账号 密码` 会把明文密码暴露在进程命令行里。
+          > 7. Portal 登录请求默认明文 HTTP 且允许自动跳转。
+          > 8. 守护进程的「降速」逻辑没生效（仍每 30 秒检查）。
+          > 9. `--data-dir` 不随守护进程传递，自定义数据目录时可能用错配置重新拉起。
+          > 10. 测试里 HTTP 204 与守护自检存在假覆盖。
+          >
+          > **修复**（pre.7）：只有 Portal 明确回答在线才算登录成功，状态接口不可达改为「待确认」并按异常节奏复检；
+          > 探测目标改为并行（整轮 ≈ 单条超时），HTTP 目标独立超时 3 秒、复检收紧到 2 轮 × 500 毫秒；
+          > 探测目标全非法 / 配置损坏都停下来提示用户、不再静默兜底；配置写入改为临时文件 + 原子替换；
+          > 每轮评估使用同一套不可变快照、状态对象永不替换；命令行不再接受明文密码（支持 `--password-stdin`）；
+          > Portal 登录请求禁止跨主机跳转并校验响应来源；守护进程降速生效并透传 `--data-dir`；
+          > 测试补齐真 204 与严格守护退出码，端到端断言从 68 条增至 84 条。
+          > 详见 [更新日志](https://github.com/pvxacct/campus-network-auto-login/blob/main/CHANGELOG.md)。
+
+          ---
+          EOF
+
+          gh release view "$tag" --repo "$repo" --json body -q .body > /tmp/old.md || echo "" > /tmp/old.md
+          cat /tmp/warn.md /tmp/old.md > /tmp/new.md
+          gh release edit "$tag" --repo "$repo" --title "$title" --notes-file /tmp/new.md --prerelease
+
+          echo "=== 更新后的 Release ==="
+          gh release view "$tag" --repo "$repo" --json tagName,name,isPrerelease,assets
