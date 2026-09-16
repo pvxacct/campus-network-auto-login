@@ -14,7 +14,7 @@ namespace CampusNet.Core
     {
         public const string AppName = "CampusNet";
         public const string DisplayName = "校园网自动登录";
-        public const string Version = "2.0.0-pre.6";
+        public const string Version = "2.0.0-pre.7";
 
         /// <summary>旧版（1.x PowerShell 版）残留位置，仅用于检测与清理。</summary>
         public const string LegacyScriptDir = @"C:\CampusAutoLogin";
@@ -184,15 +184,44 @@ namespace CampusNet.Core
         /// 原子写入文本文件（先写临时文件再替换，避免断电或崩溃留下半截文件）。
         /// 统一带 UTF-8 BOM：Windows 上的记事本、PowerShell 5.1 等工具默认按 ANSI 读取，
         /// 没有 BOM 时中文会乱码。
+        ///
+        /// 这里刻意不用「先删目标再改名」：那中间有一瞬间文件是不存在的，
+        /// 此刻断电 / 崩溃就会把用户配置整个丢掉（丢掉配置 = 下次启动用默认 Portal 登录）。
+        /// 先用 File.Replace 原地替换，只有它不被支持时才退回删除 + 改名。
+        /// 临时文件名带随机后缀：并发写入（界面保存 + 后台线程）不会互相踩。
         /// </summary>
         public static void WriteText(string path, string text)
         {
             string dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir)) { Directory.CreateDirectory(dir); }
-            string temp = path + ".tmp";
-            File.WriteAllText(temp, text, Utf8WithBom);
-            if (File.Exists(path)) { File.Delete(path); }
-            File.Move(temp, path);
+            string temp = path + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
+            try
+            {
+                using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (var writer = new StreamWriter(stream, Utf8WithBom))
+                {
+                    writer.Write(text);
+                    writer.Flush();
+                    stream.Flush(true);   // 落到磁盘之后再替换，断电也不会得到半截内容
+                }
+                if (File.Exists(path))
+                {
+                    try
+                    {
+                        File.Replace(temp, path, null, true);
+                        return;
+                    }
+                    catch (PlatformNotSupportedException) { }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+                if (File.Exists(path)) { File.Delete(path); }
+                File.Move(temp, path);
+            }
+            finally
+            {
+                try { if (File.Exists(temp)) { File.Delete(temp); } } catch { }
+            }
         }
 
         public static readonly UTF8Encoding Utf8WithBom = new UTF8Encoding(true);

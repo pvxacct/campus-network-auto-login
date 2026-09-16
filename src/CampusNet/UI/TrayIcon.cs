@@ -146,6 +146,8 @@ namespace CampusNet.UI
                 case "no-credential":
                 case "bad-credential":
                 case "login-failed":
+                case "config-invalid":
+                case "probe-config":
                 case "unreachable": return "red";
                 default: return "amber";
             }

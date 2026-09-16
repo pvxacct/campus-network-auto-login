@@ -210,16 +210,77 @@ namespace CampusNet
         private void SetCredentials(string[] args)
         {
             ConsoleBridge.Attach();
-            if (args.Length < 3)
+            string user = args.Length > 1 ? (args[1] ?? string.Empty).Trim() : string.Empty;
+            if (string.IsNullOrEmpty(user) || user.StartsWith("--", StringComparison.Ordinal))
             {
-                ConsoleBridge.Line("用法：CampusNet.exe --set-credentials <账号> <密码>");
+                ConsoleBridge.Line("用法：CampusNet.exe --set-credentials <账号> [--password-stdin]");
+                ConsoleBridge.Line("  · 加 --password-stdin（或把密码用管道送进来）时，从标准输入读一行；");
+                ConsoleBridge.Line("  · 不加时会在控制台提示输入密码，输入不回显；");
+                ConsoleBridge.Line("  · 密码不再接受命令行参数（会留在 PowerShell 历史 / 进程列表 / 审计日志里）。");
+                Shutdown(2);
+                return;
+            }
+
+            // 老写法 --set-credentials <账号> <密码>：直接拒绝，并提示改用安全写法。
+            if (args.Length > 2 && !args[2].StartsWith("--", StringComparison.Ordinal))
+            {
+                ConsoleBridge.Line("已拒绝：密码不能写在命令行里（会留在 PowerShell 历史、进程列表和审计日志中）。");
+                ConsoleBridge.Line("请改用： CampusNet.exe --set-credentials " + user + " --password-stdin");
+                ConsoleBridge.Line("       或打开图形界面 → 填写账号密码 → 保存。");
+                Shutdown(2);
+                return;
+            }
+
+            string password = ReadPassword(HasFlag(args, "--password-stdin"));
+            if (string.IsNullOrEmpty(password))
+            {
+                ConsoleBridge.Line("没有读到密码，已取消（账号未改动）。");
                 Shutdown(2);
                 return;
             }
             AppPaths.EnsureDataDir();
-            CredentialStore.Save(AppPaths.CredentialFile, args[1], args[2]);
+            CredentialStore.Save(AppPaths.CredentialFile, user, password);
             ConsoleBridge.Line("账号已保存（DPAPI 加密，仅当前 Windows 用户可解密）。");
             Shutdown(0);
+        }
+
+        /// <summary>
+        /// 读密码：加 --password-stdin（或输入被重定向）时从标准输入读一行；
+        /// 否则在控制台里提示输入并且不回显。
+        /// </summary>
+        private static string ReadPassword(bool stdin)
+        {
+            if (stdin)
+            {
+                try { return (Console.In.ReadLine() ?? string.Empty).Trim(); }
+                catch { return string.Empty; }
+            }
+
+            try
+            {
+                ConsoleBridge.Line("请输入密码（输入不回显，回车确认；直接回车 = 取消）：");
+                var builder = new StringBuilder();
+                while (true)
+                {
+                    ConsoleKeyInfo key = Console.ReadKey(true);
+                    if (key.Key == ConsoleKey.Enter) { Console.WriteLine(); break; }
+                    if (key.Key == ConsoleKey.Backspace)
+                    {
+                        if (builder.Length > 0) { builder.Length--; Console.Write("\b \b"); }
+                        continue;
+                    }
+                    if (char.IsControl(key.KeyChar)) { continue; }
+                    builder.Append(key.KeyChar);
+                    Console.Write('*');
+                }
+                return builder.ToString();
+            }
+            catch
+            {
+                // 没有可交互的控制台（例如管道输入）：退回标准输入读一行
+                try { return (Console.In.ReadLine() ?? string.Empty).Trim(); }
+                catch { return string.Empty; }
+            }
         }
 
         private void RunSimple(string label, Action<Logger> action)
@@ -264,7 +325,11 @@ namespace CampusNet
             ConsoleBridge.Line("已忽略提示：" + state.IgnoredPrompts + " 次"
                 + (string.IsNullOrEmpty(state.LastIgnoredPrompt) ? string.Empty : "；最近：" + state.LastIgnoredPrompt));
             ConsoleBridge.Line("强制重登  ：" + (string.IsNullOrEmpty(state.LastForcedRelogin) ? "尚未发生" : state.LastForcedRelogin));
-            ConsoleBridge.Line("Portal：" + config.PortalHost + config.StatusPath);
+            ConsoleBridge.Line("Portal：" + config.PortalBase + config.StatusPath);
+            if (config.Corrupted)
+            {
+                ConsoleBridge.Line("配置      ：已损坏（" + config.CorruptedReason + "）——已停止自动登录");
+            }
             ConsoleBridge.Line("旧版残留：" + legacy.Describe());
             Shutdown(0);
         }
@@ -319,6 +384,7 @@ namespace CampusNet
             {
                 case "online": return "网络正常";
                 case "login-ok": return "自动登录成功";
+                case "login-unconfirmed": return "登录已提交，等待确认";
                 case "login-wait": return "等待下次登录";
                 case "login-throttled": return "已触发频率上限";
                 case "verifying": return "正在核对网络状态";
@@ -331,6 +397,8 @@ namespace CampusNet
                 case "login-failed": return "登录失败";
                 case "login-retry": return "登录提示已忽略，正在重试";
                 case "upstream": return "上游异常";
+                case "config-invalid": return "配置文件损坏，已停止登录";
+                case "probe-config": return "探测目标配置无效，已停止登录";
                 default: return key;
             }
         }

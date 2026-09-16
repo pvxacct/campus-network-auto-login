@@ -372,9 +372,19 @@ namespace CampusNet.Core
             builder.AppendLine("探测结果  ：" + snapshot.ProbeSummary);
             builder.AppendLine();
             builder.AppendLine("---- 配置 ----");
-            builder.AppendLine("Portal    ：" + config.PortalHost + config.StatusPath);
+            if (config.Corrupted)
+            {
+                builder.AppendLine("配置状态  ：已损坏（" + config.CorruptedReason + "）——已停止自动登录，请检查 " + AppPaths.ConfigFile);
+            }
+            if (ValidTargetCount(config) == 0)
+            {
+                builder.AppendLine("探测目标  ：没有任何一条合法目标——已停止自动登录，请修正 ProbeTargets");
+            }
+            builder.AppendLine("Portal    ：" + config.PortalBase + config.StatusPath);
             builder.AppendLine("探测节奏  ：在线每 " + config.OnlineProbeSeconds + " 秒；异常每 " + config.OfflineProbeSeconds + " 秒；确认 "
-                + config.ConfirmAttempts + " 次；兜底巡检每 " + config.UpstreamProbeSeconds + " 秒");
+                + config.ConfirmAttempts + " 轮（间隔 " + config.ConfirmGapMs + " 毫秒）；兜底巡检每 " + config.UpstreamProbeSeconds + " 秒");
+            builder.AppendLine("探测超时  ：TCP/ICMP " + config.ProbeTimeoutMs + " 毫秒；HTTP " + config.HttpProbeTimeoutMs
+                + " 毫秒（并行探测，整轮约等于单次超时）");
             builder.AppendLine("风控闸门  ：最小间隔 " + config.LoginMinIntervalSeconds + " 秒；每小时上限 "
                 + config.LoginHourlyLimit + " 次；登录前确认 " + config.LoginConfirmDelaySec + " 秒；会话核对每 "
                 + (config.SessionCheckSeconds > 0 ? config.SessionCheckSeconds + " 秒" : "关闭"));
@@ -422,6 +432,16 @@ namespace CampusNet.Core
                 if (target != null && target.ContentVerified) { return true; }
             }
             return false;
+        }
+
+        private static int ValidTargetCount(AppConfig config)
+        {
+            int count = 0;
+            foreach (string text in config.ProbeTargets)
+            {
+                if (ProbeTarget.Parse(text) != null) { count++; }
+            }
+            return count;
         }
 
         private static string Since(DateTime? time)

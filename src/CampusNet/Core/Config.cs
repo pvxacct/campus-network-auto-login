@@ -11,12 +11,23 @@ namespace CampusNet.Core
     public sealed class AppConfig
     {
         /// <summary>配置文件结构版本：小于当前值的老配置会在加载时自动迁移一次。</summary>
-        public const int CurrentConfigVersion = 4;
+        public const int CurrentConfigVersion = 5;
 
         public const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
         public int ConfigVersion = CurrentConfigVersion;
+
+        /// <summary>
+        /// 配置文件存在但读不出来 / 解析不了时为 true。
+        /// 此时必须停止自动登录：否则会拿着「默认 Portal + 已有凭据」去登录，
+        /// 用户自定义的地址一旦丢失就会把账号密码发到错误的地方。
+        /// </summary>
+        public bool Corrupted;
+        public string CorruptedReason = string.Empty;
+
+        /// <summary>Portal 协议：http（默认，校园网 ePortal 基本都是明文）或 https。</summary>
+        public string PortalScheme = "http";
 
         public string PortalHost = "10.66.209.2";
         public int EportalPort = 801;
@@ -36,8 +47,14 @@ namespace CampusNet.Core
         public int UpstreamProbeSeconds = 300;
 
         public int ProbeTimeoutMs = 1500;
-        public int ConfirmAttempts = 3;
-        public int ConfirmGapMs = 1000;
+        /// <summary>
+        /// HTTP / HTTPS 探测目标的单次超时（毫秒）。比 TCP 握手短得多：
+        /// 内容校验目标正常只要几十毫秒，完全断网时这个值直接决定「多久能判定掉线」。
+        /// </summary>
+        public int HttpProbeTimeoutMs = 3000;
+        /// <summary>探测不通后的快速复检轮数（每轮并行跑所有目标）。</summary>
+        public int ConfirmAttempts = 2;
+        public int ConfirmGapMs = 500;
 
         public List<string> ProbeTargets = new List<string>
         {
@@ -95,9 +112,11 @@ namespace CampusNet.Core
             { "lang", "zh" }
         };
 
-        public string StatusUrl { get { return "http://" + PortalHost + StatusPath; } }
-        public string LoginUrl { get { return "http://" + PortalHost + LoginPath; } }
-        public string LogoutUrl { get { return "http://" + PortalHost + LogoutPath; } }
+        public string PortalBase { get { return NormalizeScheme(PortalScheme) + "://" + PortalHost; } }
+
+        public string StatusUrl { get { return PortalBase + StatusPath; } }
+        public string LoginUrl { get { return PortalBase + LoginPath; } }
+        public string LogoutUrl { get { return PortalBase + LogoutPath; } }
 
         public string ErrorUrl
         {
@@ -107,18 +126,67 @@ namespace CampusNet.Core
                 string host = PortalHost.IndexOf(':') >= 0
                     ? PortalHost
                     : PortalHost + ":" + EportalPort.ToString(CultureInfo.InvariantCulture);
-                return "http://" + host + ErrorPromptPath;
+                return NormalizeScheme(PortalScheme) + "://" + host + ErrorPromptPath;
             }
+        }
+
+        private static string NormalizeScheme(string value)
+        {
+            return string.Equals((value ?? string.Empty).Trim(), "https", StringComparison.OrdinalIgnoreCase)
+                ? "https"
+                : "http";
         }
 
         public static AppConfig Load(string path)
         {
             var config = new AppConfig();
-            Dictionary<string, object> map = null;
-            try { map = Json.ReadObject(path); } catch { map = null; }
-            if (map == null) { return config; }
+            if (!File.Exists(path)) { return config; }   // 首次运行：用默认配置，不算损坏
 
+            string rawText;
+            try { rawText = File.ReadAllText(path, Encoding.UTF8); }
+            catch (Exception ex)
+            {
+                config.Corrupted = true;
+                config.CorruptedReason = "读取失败：" + ex.Message;
+                return config;
+            }
+            if (string.IsNullOrWhiteSpace(rawText))
+            {
+                // 空文件几乎总是上一次写入被打断留下的。绝不能当成「没有配置」继续跑：
+                // 那样会拿默认 Portal 去登录，用户自定义的地址就此被悄悄绕过。
+                config.Corrupted = true;
+                config.CorruptedReason = "配置文件是空的（上一次写入可能被中断）";
+                return config;
+            }
+
+            Dictionary<string, object> map = null;
+            try { map = Json.ReadObjectFromText(rawText); }
+            catch (Exception ex)
+            {
+                config.Corrupted = true;
+                config.CorruptedReason = "内容不是合法 JSON：" + ex.Message;
+                return config;
+            }
+            if (map == null)
+            {
+                config.Corrupted = true;
+                config.CorruptedReason = "内容不是 JSON 对象";
+                return config;
+            }
+
+            config.PortalScheme = NormalizeScheme(Json.GetString(map, "PortalScheme", config.PortalScheme));
             config.PortalHost = Json.GetString(map, "PortalHost", config.PortalHost);
+            // 兼容把协议直接写进地址的写法（https://10.66.209.2）
+            if (config.PortalHost.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            {
+                config.PortalScheme = "http";
+                config.PortalHost = config.PortalHost.Substring(7);
+            }
+            else if (config.PortalHost.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                config.PortalScheme = "https";
+                config.PortalHost = config.PortalHost.Substring(8);
+            }
             config.EportalPort = Json.GetInt(map, "EportalPort", config.EportalPort);
             config.StatusPath = Json.GetString(map, "StatusPath", config.StatusPath);
             config.LoginPath = Json.GetString(map, "LoginPath", config.LoginPath);
@@ -131,6 +199,7 @@ namespace CampusNet.Core
             config.OfflineProbeSeconds = Clamp(Json.GetInt(map, "OfflineProbeSeconds", config.OfflineProbeSeconds), 1, 600);
             config.UpstreamProbeSeconds = Clamp(Json.GetInt(map, "UpstreamProbeSeconds", config.UpstreamProbeSeconds), 30, 3600);
             config.ProbeTimeoutMs = Clamp(Json.GetInt(map, "ProbeTimeoutMs", config.ProbeTimeoutMs), 200, 10000);
+            config.HttpProbeTimeoutMs = Clamp(Json.GetInt(map, "HttpProbeTimeoutMs", config.HttpProbeTimeoutMs), 500, 10000);
             config.ConfirmAttempts = Clamp(Json.GetInt(map, "ConfirmAttempts", config.ConfirmAttempts), 1, 10);
             config.ConfirmGapMs = Clamp(Json.GetInt(map, "ConfirmGapMs", config.ConfirmGapMs), 100, 5000);
 
@@ -185,6 +254,8 @@ namespace CampusNet.Core
             //             老列表会被校园网关「替任意地址代答 TCP 握手」骗过，导致永远判定在线。
             //   v3 -> v4：pre.3 ~ pre.5 的默认探测列表（只有微软一个内容校验目标，实测约 10% 抖动）
             //             换成「小米 204 + 百度 + 微软 + TCP 兜底」四条，误判与状态闪跳都明显更少。
+            //   v4 -> v5：复检默认值 3 轮 / 1000 毫秒 收紧为 2 轮 / 500 毫秒。
+            //             配合「每个目标并行探测」，完全断网时从判定到提交登录由几十秒压到十几秒。
             if (config.ConfigVersion < CurrentConfigVersion)
             {
                 if (SameTargets(config.ProbeTargets, LegacyProbeTargets)
@@ -193,6 +264,11 @@ namespace CampusNet.Core
                     config.ProbeTargets = new List<string>(new AppConfig().ProbeTargets);
                 }
                 if (config.OnlineProbeSeconds == 60) { config.OnlineProbeSeconds = 20; }
+                if (config.ConfirmAttempts == 3 && config.ConfirmGapMs == 1000)
+                {
+                    config.ConfirmAttempts = new AppConfig().ConfirmAttempts;
+                    config.ConfirmGapMs = new AppConfig().ConfirmGapMs;
+                }
                 config.ConfigVersion = CurrentConfigVersion;
                 try { config.Save(path); } catch { }
             }
@@ -214,6 +290,7 @@ namespace CampusNet.Core
             var builder = new StringBuilder();
             builder.AppendLine("{");
             builder.AppendLine("  " + Json.Number("ConfigVersion", ConfigVersion) + ",");
+            builder.AppendLine("  " + Json.String("PortalScheme", PortalScheme) + ",");
             builder.AppendLine("  " + Json.String("PortalHost", PortalHost) + ",");
             builder.AppendLine("  " + Json.Number("EportalPort", EportalPort) + ",");
             builder.AppendLine("  " + Json.String("StatusPath", StatusPath) + ",");
@@ -225,6 +302,7 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.Number("OfflineProbeSeconds", OfflineProbeSeconds) + ",");
             builder.AppendLine("  " + Json.Number("UpstreamProbeSeconds", UpstreamProbeSeconds) + ",");
             builder.AppendLine("  " + Json.Number("ProbeTimeoutMs", ProbeTimeoutMs) + ",");
+            builder.AppendLine("  " + Json.Number("HttpProbeTimeoutMs", HttpProbeTimeoutMs) + ",");
             builder.AppendLine("  " + Json.Number("ConfirmAttempts", ConfirmAttempts) + ",");
             builder.AppendLine("  " + Json.Number("ConfirmGapMs", ConfirmGapMs) + ",");
             builder.AppendLine("  \"ProbeTargets\": [" + JoinQuoted(ProbeTargets) + "],");
@@ -395,6 +473,36 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.String("LastForcedRelogin", LastForcedRelogin));
             builder.AppendLine("}");
             Json.WriteText(path, builder.ToString());
+        }
+
+        /// <summary>
+        /// 用磁盘上的内容刷新本对象（重载配置 / 凭据时用）。
+        /// 关键点：永远不替换对象本身——后台线程每一轮都在往同一个对象里写状态，
+        /// 换成新对象会让那一轮的写入落进旧对象（本轮结果丢失，甚至用旧内容覆盖状态文件）。
+        /// </summary>
+        public void CopyFrom(AppState other)
+        {
+            if (other == null) { return; }
+            Version = other.Version;
+            LastTrigger = other.LastTrigger;
+            LastProbe = other.LastProbe;
+            LastResult = other.LastResult;
+            Online = other.Online;
+            LastError = other.LastError;
+            ConsecutiveFailures = other.ConsecutiveFailures;
+            LastLoginAttempt = other.LastLoginAttempt;
+            LastLoginSuccess = other.LastLoginSuccess;
+            LastSessionCheck = other.LastSessionCheck;
+            LastSessionResult = other.LastSessionResult;
+            LoginWindowStart = other.LoginWindowStart;
+            LoginWindowCount = other.LoginWindowCount;
+            RunCount = other.RunCount;
+            Paused = other.Paused;
+            PauseUntil = other.PauseUntil;
+            LastMessage = other.LastMessage;
+            IgnoredPrompts = other.IgnoredPrompts;
+            LastIgnoredPrompt = other.LastIgnoredPrompt;
+            LastForcedRelogin = other.LastForcedRelogin;
         }
 
         /// <summary>引擎心跳：每轮评估都会更新，写入节流最多滞后 60 秒。</summary>

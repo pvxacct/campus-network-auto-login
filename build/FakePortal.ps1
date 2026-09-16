@@ -12,10 +12,19 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Send-Response {
-    param($Stream, [string]$Body, [string]$ContentType = 'text/html; charset=gb2312')
+    param($Stream, [string]$Body, [string]$ContentType = 'text/html; charset=gb2312', [int]$Status = 200)
     $encoding = if ($ContentType -match 'utf-8') { [System.Text.Encoding]::UTF8 } else { [System.Text.Encoding]::ASCII }
     $bytes = $encoding.GetBytes($Body)
-    $head = "HTTP/1.1 200 OK`r`nContent-Type: $ContentType`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
+    $reason = switch ($Status) {
+        200 { 'OK' }
+        204 { 'No Content' }
+        302 { 'Found' }
+        500 { 'Internal Server Error' }
+        default { 'Status' }
+    }
+    # 204 按 HTTP 规范不带响应体（这正是「只认 204」测试要的情形）
+    if ($Status -eq 204) { $bytes = New-Object byte[] 0 }
+    $head = "HTTP/1.1 $Status $reason`r`nContent-Type: $ContentType`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
     $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
     $Stream.Write($headBytes, 0, $headBytes.Length)
     $Stream.Write($bytes, 0, $bytes.Length)
@@ -53,9 +62,11 @@ $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Lo
 $listener.Start()
 Set-Content -LiteralPath $LogPath -Value "START $Scenario" -Encoding UTF8
 $counts = @{ chkstatus = 0; login = 0; logout = 0; error = 0 }
+$blackholeClients = New-Object System.Collections.Generic.List[object]
 
 while ($true) {
     $client = $listener.AcceptTcpClient()
+    $keepOpen = $false
     try {
         $stream = $client.GetStream()
         $request = Read-Request -Stream $stream
@@ -67,7 +78,12 @@ while ($true) {
         $path = if ($parts.Length -gt 1) { $parts[1] } else { '/' }
         Add-Content -LiteralPath $LogPath -Value ("$method $path") -Encoding UTF8
 
-        if ($path -like '*chkstatus*') {
+        if ($Scenario -eq 'blackhole') {
+            # 「连接得过、内容永远不来」：用来验证探测是并行的（串行会成倍变慢）
+            $blackholeClients.Add($client)
+            $keepOpen = $true
+        }
+        elseif ($path -like '*chkstatus*') {
             $counts.chkstatus++
             $online = $false
             switch ($Scenario) {
@@ -101,6 +117,12 @@ while ($true) {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_3.htm--><html>login ok</html>"
                 }
             }
+            if ($Scenario -eq 'drop-after-login') {
+                # 登录接口回「成功」，但紧接着整个 Portal 就不可达了：
+                # 用来验证「状态接口不可达 ≠ 登录成功」。
+                try { $client.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send) } catch { }
+                Start-Sleep -Milliseconds 200
+            }
         }
         elseif ($path -like '*logout*') {
             $counts.logout++
@@ -116,9 +138,13 @@ while ($true) {
             Send-Response -Stream $stream -ContentType 'application/json; charset=utf-8' `
                 -Body ("dr1({`"result`":1,`"error_code`":`"$code`",`"error_prompt_zh`":`"$prompt`"})")
         }
-        elseif ($Scenario -eq 'content-ok' -and $path -like '*connecttest.txt*') {
-            # 内容校验测试用：真的把预期关键字发回去
-            Send-Response -Stream $stream -ContentType 'text/plain; charset=utf-8' -Body 'Microsoft Connect Test'
+        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204') -and $path -like '*connecttest.txt*') {
+            # 内容校验测试用：content-ok 发关键字；content-204 发真正的 204 空响应
+            if ($Scenario -eq 'content-204') {
+                Send-Response -Stream $stream -Status 204 -Body ''
+            } else {
+                Send-Response -Stream $stream -ContentType 'text/plain; charset=utf-8' -Body 'Microsoft Connect Test'
+            }
         }
         else {
             Send-Response -Stream $stream -Body 'not found'
@@ -126,6 +152,10 @@ while ($true) {
     }
     catch { }
     finally {
-        try { $client.Close() } catch { }
+        if (-not $keepOpen) { try { $client.Close() } catch { } }
+    }
+    if ($Scenario -eq 'drop-after-login' -and $counts.login -ge 1) {
+        try { $listener.Stop() } catch { }
+        exit 0
     }
 }

@@ -47,21 +47,13 @@ namespace CampusNet.Core
                 int colon = value.IndexOf(':');
                 string scheme = value.Substring(0, colon).ToLowerInvariant();
                 string rest = value.Substring(colon + 1).Trim();
-                int bar = rest.IndexOf('|');
-                if (bar >= 0)
-                {
-                    target.Expect = rest.Substring(bar + 1).Trim();
-                    rest = rest.Substring(0, bar).Trim();
-                    // 竖线后正好是三位数字时按「期望状态码」理解（例如 generate_204 目标写 |204），
-                    // 避免被劫持时返回的 200 门户页面被误判成「网络正常」。
-                    int statusCode;
-                    if (target.Expect.Length == 3 &&
-                        int.TryParse(target.Expect, NumberStyles.Integer, CultureInfo.InvariantCulture, out statusCode))
-                    {
-                        target.ExpectStatus = statusCode;
-                        target.Expect = string.Empty;
-                    }
-                }
+                // 竖线后的写法：|期望文本、|204（只认状态码）、|期望文本|204（两者都要满足）。
+                // 以前只取第一段，写成 url|文本|204 时会把「文本|204」整串当成关键字，
+                // 于是「只认 204」的配置实际上根本没生效——现在逐段解析。
+                string[] parts = rest.Split('|');
+                rest = parts[0].Trim();
+                if (parts.Length > 1) { ApplyExpectation(target, parts[1]); }
+                if (parts.Length > 2) { ApplyExpectation(target, parts[2]); }
                 if (rest.StartsWith("//", StringComparison.Ordinal)) { rest = rest.Substring(2); }
                 if (rest.Length == 0) { return null; }
                 target.Kind = "http";
@@ -86,11 +78,27 @@ namespace CampusNet.Core
             target.Port = port;
             return string.IsNullOrEmpty(target.Host) ? null : target;
         }
+
+        /// <summary>竖线后的一段：正好三位数字按「期望状态码」理解，其余按「期望内容」理解。</summary>
+        private static void ApplyExpectation(ProbeTarget target, string token)
+        {
+            string value = (token ?? string.Empty).Trim();
+            if (value.Length == 0) { return; }
+            int statusCode;
+            if (value.Length == 3 && int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out statusCode))
+            {
+                target.ExpectStatus = statusCode;
+                return;
+            }
+            target.Expect = value;
+        }
     }
 
     public sealed class ProbeOutcome
     {
         public bool Online;
+        /// <summary>配置里一条合法探测目标都没有：既不能算在线（会让自动登录永远不触发），也不能算离线（会拿着坏配置去登录）。</summary>
+        public bool ConfigError;
         /// <summary>至少一个「内容校验」目标真的取回了预期内容（不只是握手成功）。</summary>
         public bool Verified;
         /// <summary>配置里是否存在内容校验目标（没有的话只能靠周期性会话校验兜底）。</summary>
@@ -107,6 +115,7 @@ namespace CampusNet.Core
         {
             get
             {
+                if (ConfigError) { return "探测目标配置无效（没有任何一条合法目标）"; }
                 if (Attempts == 0) { return "没有可用的探测目标"; }
                 if (Online)
                 {
@@ -143,7 +152,16 @@ namespace CampusNet.Core
                 ProbeTarget target = ProbeTarget.Parse(text);
                 if (target != null) { targets.Add(target); }
             }
-            if (targets.Count == 0) { outcome.Online = true; outcome.LossPercent = 0; return outcome; }
+            // 一条合法目标都没有：绝不能默认「在线」（那会让自动登录永远不触发），
+            // 也不能强行当「离线」（那会拿着坏配置反复登录）。显式报配置错误，由上层停下来提示用户。
+            if (targets.Count == 0)
+            {
+                outcome.ConfigError = true;
+                outcome.Online = false;
+                outcome.LossPercent = 100;
+                outcome.Failures.Add("ProbeTargets 里没有任何一条合法目标");
+                return outcome;
+            }
 
             foreach (ProbeTarget target in targets)
             {
@@ -152,14 +170,21 @@ namespace CampusNet.Core
 
             var detailMap = new Dictionary<string, string>();
             int round = Math.Max(1, rounds);
+            int count = targets.Count;
+            var okFlags = new bool[count];
+            var latencies = new int[count];
             for (int i = 0; i < round; i++)
             {
                 if (i > 0 && gapMs > 0) { System.Threading.Thread.Sleep(gapMs); }
-                foreach (ProbeTarget target in targets)
+                // 并行跑一轮：整轮耗时 ≈ 最慢的那一条目标（约一次超时），
+                // 而不是所有目标的超时相加。完全断网时这是「秒级」和「几十秒」的区别。
+                RunParallel(config, targets, okFlags, latencies);
+                for (int t = 0; t < count; t++)
                 {
+                    ProbeTarget target = targets[t];
+                    bool ok = okFlags[t];
+                    int latency = latencies[t];
                     outcome.Attempts++;
-                    int latency;
-                    bool ok = RunTarget(config, target, out latency);
                     if (ok)
                     {
                         outcome.Successes++;
@@ -198,10 +223,63 @@ namespace CampusNet.Core
             if (target.Kind == "icmp") { return PingTarget(target.Host, config.ProbeTimeoutMs, out latencyMs); }
             if (target.Kind == "http")
             {
+                // HTTP 探测用单独的超时：内容校验目标（204 / connecttest）正常只要几十毫秒，
+                // 沿用 TCP 握手那种上限会让断网判定慢一大截，而这正是「被踢下线后多久能重连」。
                 return HttpTarget(target.Url, target.Expect, target.ExpectStatus,
-                    Math.Max(5000, config.ProbeTimeoutMs), out latencyMs);
+                    Math.Max(500, config.HttpProbeTimeoutMs), out latencyMs);
             }
             return TcpTarget(target.Host, target.Port, config.ProbeTimeoutMs, out latencyMs);
+        }
+
+        /// <summary>
+        /// 每条目标一个后台线程并行跑，各自有自己的超时；整轮的总等待用一个共享预算封顶，
+        /// 个别目标卡在 DNS 解析上也不会拖住整轮（超预算的按失败处理）。
+        /// </summary>
+        private static void RunParallel(AppConfig config, List<ProbeTarget> targets, bool[] okFlags, int[] latencies)
+        {
+            int count = targets.Count;
+            // 每轮都用全新的结果数组：万一某条目标超预算没结束（例如 DNS 卡住），
+            // 它稍后写回的是自己那一轮的结果，不会污染下一轮。
+            var roundOk = new bool[count];
+            var roundLatency = new int[count];
+            var threads = new System.Threading.Thread[count];
+            for (int i = 0; i < count; i++)
+            {
+                int index = i;
+                var thread = new System.Threading.Thread(delegate()
+                {
+                    int latency = -1;
+                    bool ok = false;
+                    try { ok = RunTarget(config, targets[index], out latency); }
+                    catch { ok = false; latency = -1; }
+                    roundOk[index] = ok;
+                    roundLatency[index] = latency;
+                });
+                thread.IsBackground = true;
+                thread.Name = "CampusNet-Probe-" + index;
+                threads[i] = thread;
+                thread.Start();
+            }
+
+            int budget = Math.Max(Math.Max(config.HttpProbeTimeoutMs, config.ProbeTimeoutMs), 500) + 1500;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < count; i++)
+            {
+                int remain = budget - (int)watch.ElapsedMilliseconds;
+                if (remain < 0) { remain = 0; }
+                bool finished = false;
+                try { finished = threads[i].Join(remain); } catch { }
+                if (!finished)
+                {
+                    okFlags[i] = false;
+                    latencies[i] = -1;
+                }
+                else
+                {
+                    okFlags[i] = roundOk[i];
+                    latencies[i] = roundLatency[i];
+                }
+            }
         }
 
         /// <summary>
@@ -218,19 +296,24 @@ namespace CampusNet.Core
                 ProbeTarget target = ProbeTarget.Parse(text);
                 if (target != null && target.ContentVerified) { targets.Add(target); }
             }
-            foreach (ProbeTarget target in targets)
+            if (targets.Count == 0) { return false; }
+
+            var okFlags = new bool[targets.Count];
+            var latencies = new int[targets.Count];
+            // 两轮并行复核（每轮同时跑所有内容校验目标）：
+            // 这张校园网偶尔会「第一次握手成功但内容不来」，补测一轮比立刻去打扰 Portal 更省事；
+            // 而并行保证了补测最多只多花一次超时，不会随目标条数线性变慢。
+            for (int round = 0; round < 2; round++)
             {
-                for (int attempt = 0; attempt < 2; attempt++)
+                if (round > 0) { System.Threading.Thread.Sleep(ContentRetryGapMs); }
+                RunParallel(config, targets, okFlags, latencies);
+                for (int i = 0; i < targets.Count; i++)
                 {
-                    int value;
-                    if (RunTarget(config, target, out value))
+                    if (okFlags[i])
                     {
-                        latencyMs = value;
+                        latencyMs = latencies[i];
                         return true;
                     }
-                    // 这张校园网偶尔会「第一次握手成功但内容不来」：稍等再试同一条目标，
-                    // 比立刻去打扰 Portal 更省事，也更不容易把抖动误判成掉线。
-                    if (attempt == 0) { System.Threading.Thread.Sleep(ContentRetryGapMs); }
                 }
             }
             return false;
@@ -641,18 +724,21 @@ namespace CampusNet.Core
 
         private string Get(string url, int timeoutSec)
         {
-            HttpWebRequest request = CreateRequest(url, timeoutSec, "GET");
+            HttpWebRequest request = CreateRequest(url, timeoutSec, "GET", true);
             using (var response = (HttpWebResponse)request.GetResponse())
             {
+                EnsureSameHost(request, response);
                 return ReadText(response, request);
             }
         }
 
         private string Post(string url, List<KeyValuePair<string, string>> fields, int timeoutSec)
         {
-            HttpWebRequest request = CreateRequest(url, timeoutSec, "POST");
+            // 登录请求带着账号密码，绝不能自动跟随跳转：
+            // 一个 307/308 就能把「账号 + 密码」原样转发到别的地址。
+            HttpWebRequest request = CreateRequest(url, timeoutSec, "POST", false);
             request.ContentType = "application/x-www-form-urlencoded";
-            request.Referer = "http://" + _config.PortalHost + "/";
+            request.Referer = _config.PortalBase + "/";
             var body = new StringBuilder();
             foreach (var pair in fields)
             {
@@ -667,17 +753,32 @@ namespace CampusNet.Core
             }
             using (var response = (HttpWebResponse)request.GetResponse())
             {
+                EnsureSameHost(request, response);
                 return ReadText(response, request);
             }
         }
 
-        private HttpWebRequest CreateRequest(string url, int timeoutSec, string method)
+        /// <summary>
+        /// 响应必须来自我们请求的那台主机。跨主机跳转（含 DNS 改指过来的页面）一律丢弃，
+        /// 免得把别人的页面当成 Portal 的回答——尤其是「登录成功」这种结论。
+        /// </summary>
+        private static void EnsureSameHost(HttpWebRequest request, HttpWebResponse response)
+        {
+            string expected = request.RequestUri == null ? string.Empty : request.RequestUri.Host;
+            string actual = response.ResponseUri == null ? expected : response.ResponseUri.Host;
+            if (!string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new IOException("响应来自非预期主机（" + actual + "，期望 " + expected + "），已丢弃。");
+            }
+        }
+
+        private HttpWebRequest CreateRequest(string url, int timeoutSec, string method, bool allowRedirect)
         {
             var request = (HttpWebRequest)WebRequest.Create(url);
             request.Method = method;
             request.Timeout = timeoutSec * 1000;
             request.ReadWriteTimeout = timeoutSec * 1000;
-            request.AllowAutoRedirect = true;
+            request.AllowAutoRedirect = allowRedirect;
             request.UserAgent = _config.UserAgent;
             request.KeepAlive = false;
             request.Accept = "*/*";

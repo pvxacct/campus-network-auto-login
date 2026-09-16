@@ -49,6 +49,8 @@ namespace CampusNet.Core
                     case "no-credential":
                     case "bad-credential":
                     case "login-failed":
+                    case "config-invalid":
+                    case "probe-config":
                     case "unreachable": return "red";
                     // 其余（含 verifying / tcp-only / session-check / login-wait / login-throttled）统一为黄色
                     default: return "amber";
@@ -81,7 +83,7 @@ namespace CampusNet.Core
 
         private AppConfig _config;
         private Credential _credential;
-        private AppState _state;
+        private readonly AppState _state = new AppState();
         private PortalClient _portal;
         private EngineSnapshot _snapshot = new EngineSnapshot();
         private Thread _worker;
@@ -122,13 +124,30 @@ namespace CampusNet.Core
 
         public void Reload()
         {
+            // 先在锁外把新的一整套读出来（读盘慢），再在锁里一次性换上。
+            // 后台线程每一轮开头会把它们抓成局部变量，于是每一轮评估要么全程用旧的、
+            // 要么全程用新的，不会出现「旧凭据 + 新 Portal」这种半截状态。
+            AppConfig config = AppConfig.Load(AppPaths.ConfigFile);
+            var portal = new PortalClient(config);
+            Credential credential;
+            try { credential = CredentialStore.Load(AppPaths.CredentialFile); }
+            catch (Exception ex)
+            {
+                credential = null;
+                _log.Error("读取凭据失败（凭据与当前 Windows 用户绑定，换用户后需要重新保存）：" + ex.Message);
+            }
+            AppState loaded = AppState.Load(AppPaths.StateFile);
+
             lock (_gate)
             {
-                _config = AppConfig.Load(AppPaths.ConfigFile);
-                _portal = new PortalClient(_config);
-                try { _credential = CredentialStore.Load(AppPaths.CredentialFile); }
-                catch (Exception ex) { _credential = null; _log.Error("读取凭据失败（凭据与当前 Windows 用户绑定，换用户后需要重新保存）：" + ex.Message); }
-                _state = AppState.Load(AppPaths.StateFile);
+                _config = config;
+                _portal = portal;
+                _credential = credential;
+                // 状态对象永远不换新的：后台线程正握着自己的引用往状态里写，
+                // 换掉对象会让这一轮结果写进被丢弃的对象（状态丢失，甚至用旧内容覆盖状态文件）。
+                _state.CopyFrom(loaded);
+                _snapshot.HasCredential = credential != null && credential.IsUsable;
+                _snapshot.UserName = credential != null ? credential.UserName : string.Empty;
                 ResetPersistGate();
                 _startedAt = DateTime.Now;
             }
@@ -251,8 +270,20 @@ namespace CampusNet.Core
         public void PrimeForDisplay()
         {
             RebuildSnapshot();
-            ProbeOutcome probe = NetworkProbe.Probe(_config, 1, 0);
+            AppConfig config;
+            lock (_gate) { config = _config; }
+            if (config.Corrupted)
+            {
+                SetStatus("config-invalid", "配置文件损坏，已停止自动登录");
+                return;
+            }
+            ProbeOutcome probe = NetworkProbe.Probe(config, 1, 0);
             UpdateNetwork(probe);
+            if (probe.ConfigError)
+            {
+                SetStatus("probe-config", "探测目标配置无效，已停止自动登录");
+                return;
+            }
             Persist(probe.LatencyMs, probe.LossPercent);
             SetStatus(probe.Online ? "online" : "unreachable",
                 probe.Online ? "在线（延迟 " + probe.LatencyMs + " ms）" : "当前探测不通");
@@ -290,14 +321,33 @@ namespace CampusNet.Core
             bool relogin;
             AppConfig config;
             Credential credential;
+            PortalClient portal;
             lock (_gate)
             {
                 relogin = _pendingRelogin;
                 _pendingRelogin = false;
                 config = _config;
                 credential = _credential;
+                portal = _portal;
                 _state.RunCount++;
                 _state.LastTrigger = AppPaths.FormatTime(now);
+            }
+
+            // ---------- 配置体检：损坏时必须停下来 ----------
+            if (config.Corrupted)
+            {
+                lock (_gate)
+                {
+                    _state.Online = false;
+                    _state.LastResult = "config-invalid";
+                    _state.LastMessage = "配置文件损坏，已停止自动登录";
+                    _state.LastError = "配置文件无法解析：" + config.CorruptedReason;
+                }
+                SetStatus("config-invalid", "配置文件损坏，已停止自动登录");
+                _log.WarnOnce("config-invalid", "配置文件无法解析（" + config.CorruptedReason + "），已停止自动登录："
+                    + "配置读失败时会退回默认 Portal，继续登录有把账号密码发到错误地址的风险。请检查 " + AppPaths.ConfigFile);
+                Persist(-1, -1);
+                return 60;
             }
 
             // ---------- 暂停 ----------
@@ -321,6 +371,23 @@ namespace CampusNet.Core
 
             // ---------- 探测（不发任何 Portal 请求）----------
             ProbeOutcome probe = NetworkProbe.Probe(config, 1, 0);
+            if (probe.ConfigError)
+            {
+                // 探测目标全非法：既不敢当在线（自动登录会永远不触发），
+                // 也不该拿着坏配置去反复登录，只能停下来把问题摆到用户面前。
+                lock (_gate)
+                {
+                    _state.Online = false;
+                    _state.LastResult = "probe-config";
+                    _state.LastMessage = "探测目标配置无效，已停止自动登录";
+                    _state.LastError = "ProbeTargets 里没有任何一条合法目标";
+                }
+                SetStatus("probe-config", "探测目标配置无效，已停止自动登录");
+                _log.WarnOnce("probe-config", "探测目标（ProbeTargets）里没有任何一条合法目标，无法判断网络是否正常，"
+                    + "已停止自动登录。请在 config.json 或「高级设置」里修正探测目标（例如 http:connect.rom.miui.com/generate_204|204）。");
+                Persist(-1, 100);
+                return 60;
+            }
             // 联网状态发生翻转时立即刷新网卡信息缓存，平时走短时缓存，不每轮枚举网卡
             if (probe.Online != _state.Online) { NetworkProbe.InvalidateNetworkInfo(); }
             UpdateNetwork(probe);
@@ -381,7 +448,7 @@ namespace CampusNet.Core
                         SetStatus("session-check", "正在核对 Portal 会话（在线巡检）");
                     }
 
-                    StatusResult check = _portal.GetStatus();
+                    StatusResult check = portal.GetStatus();
                     RecordSessionCheck(check);
 
                     if (!check.Reachable)
@@ -395,7 +462,7 @@ namespace CampusNet.Core
                     {
                         _log.Warn("Portal 会话核对显示账号已离线，立即进入登录流程。");
                         SetStatus("offline-detected", "Portal 显示已离线，准备登录");
-                        return LoginFlow(probe, check, false);
+                        return LoginFlow(probe, check, false, config, credential, portal);
                     }
                     if (ShouldForceRelogin(config, suspect))
                     {
@@ -407,7 +474,7 @@ namespace CampusNet.Core
                         _log.Warn("本机探测已连续 " + (int)stuckSeconds + " 秒不通，但 Portal 显示账号在线："
                             + "判定为残留会话，自动注销后重新登录。");
                         SetStatus("stuck-relogin", "疑似残留会话，正在注销并重新登录");
-                        return LoginFlow(probe, check, true);
+                        return LoginFlow(probe, check, true, config, credential, portal);
                     }
                     OnOnline(probe, suspect ? "TCP 可连（内容校验未通过，但 Portal 确认账号在线）" : "网络正常");
                     Persist(probe.LatencyMs, probe.LossPercent);
@@ -455,7 +522,7 @@ namespace CampusNet.Core
             }
 
             // ---------- 探测不通：只有这时才查询 Portal ----------
-            StatusResult status = _portal.GetStatus();
+            StatusResult status = portal.GetStatus();
             if (!status.Reachable)
             {
                 SetStatus("unreachable", "连不上校园网，等待网络恢复");
@@ -472,19 +539,18 @@ namespace CampusNet.Core
                 return config.UpstreamProbeSeconds;
             }
 
-            return LoginFlow(probe, status, relogin);
+            return LoginFlow(probe, status, relogin, config, credential, portal);
         }
 
-        private int LoginFlow(ProbeOutcome probe, StatusResult status, bool relogin)
+        private int LoginFlow(ProbeOutcome probe, StatusResult status, bool relogin,
+            AppConfig config, Credential credential, PortalClient portal)
         {
             DateTime now = DateTime.Now;
-            AppConfig config = _config;
-            Credential credential = _credential;
 
             if (relogin)
             {
                 _log.Info("立即重连：先注销当前会话。");
-                bool loggedOut = _portal.Logout();
+                bool loggedOut = portal.Logout();
                 if (loggedOut)
                 {
                     _log.Info("注销成功，等待 " + ReloginWaitSec + " 秒（Portal 要求至少 3 秒）。");
@@ -540,7 +606,7 @@ namespace CampusNet.Core
             if (config.LoginConfirmDelaySec > 0 && !relogin)
             {
                 Thread.Sleep(config.LoginConfirmDelaySec * 1000);
-                StatusResult confirm = _portal.GetStatus();
+                StatusResult confirm = portal.GetStatus();
                 if (!confirm.Reachable)
                 {
                     SetStatus("unreachable", "连不上校园网，等待网络恢复");
@@ -573,32 +639,43 @@ namespace CampusNet.Core
             }
 
             bool success = false;
+            bool unconfirmed = false;
             string lastMessage = string.Empty;
             string limitReason = string.Empty;
             string ignoredPrompt = string.Empty;
             for (int attempt = 1; attempt <= config.RetryCount; attempt++)
             {
                 _log.Info("第 " + attempt + "/" + config.RetryCount + " 次尝试登录（账号 " + credential.UserName + "）。");
-                PortalLoginResult result = _portal.Login(credential.UserName, credential.Password);
+                PortalLoginResult result = portal.Login(credential.UserName, credential.Password);
                 lastMessage = result.Message;
                 string how = string.Empty;
 
                 if (result.Success)
                 {
                     Thread.Sleep(2000);
-                    StatusResult after = _portal.GetStatus();
-                    if (after.Online || !after.Reachable)
+                    StatusResult after = portal.GetStatus();
+                    // 只有 Portal 明确回答「在线」才算成功。
+                    // 老代码写成 after.Online || !after.Reachable：状态接口不可达也当成功，
+                    // 于是「Portal 挂了 + 实际上没联上网」会被记成 login-ok，然后长时间不再重试。
+                    if (after.Online) { success = true; break; }
+                    if (!after.Reachable)
                     {
-                        success = true;
-                        break;
+                        unconfirmed = true;
+                        _log.Warn("登录接口返回成功，但状态接口不可达（" + after.Error
+                            + "）：无法确认是否真的联网，先按「待确认」处理，不记为登录成功。");
                     }
-                    _log.Warn("登录接口返回成功，但复检仍未在线，继续做几次轻量复检。");
-                    if (WaitForRecovery(config, out how))
+                    else
+                    {
+                        _log.Warn("登录接口返回成功，但复检仍未在线，继续做几次轻量复检。");
+                    }
+                    if (WaitForRecovery(config, portal, out how))
                     {
                         success = true;
                         _log.Info("复检确认网络已恢复（" + how + "）。");
                         break;
                     }
+                    // 状态接口本身不通：再打登录接口也没法验证结果，直接进入「待确认」。
+                    if (unconfirmed) { break; }
                 }
                 else if (result.RateLimited)
                 {
@@ -613,7 +690,7 @@ namespace CampusNet.Core
                     ignoredPrompt = result.Message;
                     _log.WarnOnce("portal-prompt:" + lastMessage,
                         "Portal 提示（已忽略，继续按最小间隔重试）：" + lastMessage);
-                    if (WaitForRecovery(config, out how))
+                    if (WaitForRecovery(config, portal, out how))
                     {
                         success = true;
                         _log.Info("Portal 提示已忽略，复检确认网络已恢复（" + how + "）。");
@@ -645,6 +722,21 @@ namespace CampusNet.Core
                 SetStatus("online", "在线（刚刚自动登录）");
                 Persist(-1, 0);
                 return config.OnlineProbeSeconds;
+            }
+
+            if (unconfirmed)
+            {
+                lock (_gate)
+                {
+                    _state.Online = false;
+                    _state.LastResult = "login-unconfirmed";
+                    _state.LastMessage = "登录已提交，但 Portal 状态接口不可达，还没确认";
+                    _state.LastError = "登录请求已提交，但状态接口不可达，无法确认是否已联网";
+                }
+                SetStatus("login-unconfirmed", "登录已提交，等待确认（Portal 状态接口暂时不可达）");
+                _log.Warn("本次不记为登录成功（未确认），按 " + Math.Max(5, config.OfflineProbeSeconds) + " 秒的节奏继续复检。");
+                Persist(probe.LatencyMs, probe.LossPercent);
+                return Math.Max(5, config.OfflineProbeSeconds);
             }
 
             if (!string.IsNullOrEmpty(limitReason))
@@ -721,7 +813,7 @@ namespace CampusNet.Core
         /// 登录返回「账号已在别处在线 / 密码错误」这类提示后，会话往往还要几秒才真正生效。
         /// 按 3 / 5 / 12 秒做几次轻量复检（只读 chkstatus + 本地内容校验），通了就立刻算成功。
         /// </summary>
-        private bool WaitForRecovery(AppConfig config, out string how)
+        private bool WaitForRecovery(AppConfig config, PortalClient portal, out string how)
         {
             how = string.Empty;
             int elapsed = 0;
@@ -730,7 +822,7 @@ namespace CampusNet.Core
             {
                 Thread.Sleep(Math.Max(1, wait) * 1000);
                 elapsed += wait;
-                StatusResult status = _portal.GetStatus();
+                StatusResult status = portal.GetStatus();
                 if (status.Reachable && status.Online)
                 {
                     how = "Portal 显示账号已在线（+" + elapsed + " 秒）";

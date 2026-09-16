@@ -39,6 +39,7 @@ function Write-Config {
         OnlineProbeSeconds     = $OnlineProbe
         OfflineProbeSeconds    = $OfflineProbe
         ProbeTimeoutMs         = 500
+        HttpProbeTimeoutMs     = 1200
         ConfirmAttempts        = 2
         ConfirmGapMs           = 200
         ProbeTargets           = @($Targets)
@@ -53,6 +54,12 @@ function Write-Config {
         StaticFields           = [ordered]@{ '0MKKey' = '123456'; 'R1' = '0'; 'R2' = '0'; 'para' = '00' }
     }
     ($config | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+# 保存账号密码：密码走标准输入（命令行里传密码已经在 pre.7 被拒绝，避免落进命令历史）
+function Set-TestCredentials {
+    param([string]$Dir, [string]$User = 'testuser', [string]$Password = 'testpass')
+    $Password | & $Exe '--set-credentials' $User '--password-stdin' '--data-dir' $Dir | Out-Null
 }
 
 function Invoke-Scenario {
@@ -78,7 +85,7 @@ function Invoke-Scenario {
     Start-Sleep -Milliseconds 900
 
     try {
-        & $Exe '--set-credentials' 'testuser' 'testpass' '--data-dir' $dataDir | Out-Null
+        Set-TestCredentials -Dir $dataDir
         $output = & $Exe '--run-seconds' $Seconds '--data-dir' $dataDir 2>&1 | Out-String
     }
     finally {
@@ -185,7 +192,7 @@ function Invoke-ConfigMigration {
         ProbeTargets           = @('tcp:127.0.0.1:65001')
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
-    & $Exe '--set-credentials' 'testuser' 'testpass' '--data-dir' $dir | Out-String | Out-Null
+    Set-TestCredentials -Dir $dir
     & $Exe '--run-seconds' 4 '--data-dir' $dir | Out-String | Out-Null
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
@@ -205,7 +212,7 @@ function Invoke-TargetsMigration {
         ProbeTargets           = @($Targets)
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
-    & $Exe '--set-credentials' 'testuser' 'testpass' '--data-dir' $dir | Out-String | Out-Null
+    Set-TestCredentials -Dir $dir
     & $Exe '--run-seconds' 4 '--data-dir' $dir | Out-String | Out-Null
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
@@ -219,11 +226,11 @@ Assert '迁移后探测目标共 4 项' ($migratedTargets.ProbeTargets.Count -eq
 $legacyV3 = @('http:www.msftconnecttest.com/connecttest.txt|Microsoft Connect Test', 'tcp:223.5.5.5:443', 'tcp:114.114.114.114:53')
 $migratedV3 = Invoke-TargetsMigration -Name 's8-legacy-v3-targets' -Targets $legacyV3
 Assert 'pre.5 默认探测列表被换成新的四条' ($migratedV3.ProbeTargets.Count -eq 4 -and $migratedV3.ProbeTargets[0] -eq 'http:connect.rom.miui.com/generate_204|204') "ProbeTargets=$($migratedV3.ProbeTargets -join ',')"
-Assert 'pre.5 配置迁移后写入 ConfigVersion=4' ($migratedV3.ConfigVersion -eq 4) "ConfigVersion=$($migratedV3.ConfigVersion)"
+Assert 'pre.5 配置迁移后写入 ConfigVersion=5' ($migratedV3.ConfigVersion -eq 5) "ConfigVersion=$($migratedV3.ConfigVersion)"
 
 $migrated = Invoke-ConfigMigration -Name 's8-migrate' -OnlineProbe 60
 Assert '旧默认 60 秒迁移为 20 秒' ($migrated.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($migrated.OnlineProbeSeconds)"
-Assert '迁移后写入 ConfigVersion=4' ($migrated.ConfigVersion -eq 4) "ConfigVersion=$($migrated.ConfigVersion)"
+Assert '迁移后写入 ConfigVersion=5' ($migrated.ConfigVersion -eq 5) "ConfigVersion=$($migrated.ConfigVersion)"
 Assert '迁移后剔除 LoginCooldownMinutes' (-not ($migrated.PSObject.Properties.Name -contains 'LoginCooldownMinutes')) '仍存在该键'
 Assert '迁移后保留自定义 ProbeTargets' (($migrated.ProbeTargets -join ',') -eq 'tcp:127.0.0.1:65001') "ProbeTargets=$($migrated.ProbeTargets -join ',')"
 
@@ -233,7 +240,7 @@ Assert '自定义 45 秒不会被改写' ($custom.OnlineProbeSeconds -eq 45) "On
 # 场景 9：全新数据目录 → 默认配置就是「在线 20 秒 + 兜底 300 秒」
 $freshDir = Join-Path $work 's9-default'
 New-Item -ItemType Directory -Force -Path $freshDir | Out-Null
-& $Exe '--set-credentials' 'testuser' 'testpass' '--data-dir' $freshDir | Out-String | Out-Null
+Set-TestCredentials -Dir $freshDir
 & $Exe '--run-seconds' 4 '--data-dir' $freshDir | Out-String | Out-Null
 $fresh = Get-Content -LiteralPath (Join-Path $freshDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert '新配置默认在线探测 20 秒' ($fresh.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($fresh.OnlineProbeSeconds)"
@@ -243,7 +250,10 @@ Assert '新配置默认共 4 条探测目标' ($fresh.ProbeTargets.Count -eq 4) 
 Assert '新配置默认保留微软内容校验目标' (($fresh.ProbeTargets -join ' ') -match 'msftconnecttest') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
 Assert '新配置默认会话校验 300 秒' ($fresh.SessionCheckSeconds -eq 300) "SessionCheckSeconds=$($fresh.SessionCheckSeconds)"
 Assert '新配置默认残留重登 60 秒' ($fresh.StuckReloginSeconds -eq 60) "StuckReloginSeconds=$($fresh.StuckReloginSeconds)"
-Assert '新配置写入 ConfigVersion=4' ($fresh.ConfigVersion -eq 4) "ConfigVersion=$($fresh.ConfigVersion)"
+Assert '新配置写入 ConfigVersion=5' ($fresh.ConfigVersion -eq 5) "ConfigVersion=$($fresh.ConfigVersion)"
+Assert '新配置默认 HTTP 探测超时 3000 毫秒' ($fresh.HttpProbeTimeoutMs -eq 3000) "HttpProbeTimeoutMs=$($fresh.HttpProbeTimeoutMs)"
+Assert '新配置默认复检 2 轮 / 500 毫秒' ($fresh.ConfirmAttempts -eq 2 -and $fresh.ConfirmGapMs -eq 500) "Attempts=$($fresh.ConfirmAttempts) Gap=$($fresh.ConfirmGapMs)"
+Assert '新配置默认 Portal 协议为 http' ($fresh.PortalScheme -eq 'http') "PortalScheme=$($fresh.PortalScheme)"
 
 # 场景 10：TCP 能连、内容校验失败（网关代答导致「假在线」）→ 必须查 Portal 并登录
 $n = Invoke-Scenario -Name 's10-content-fail' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
@@ -277,12 +287,19 @@ $n = Invoke-Scenario -Name 's13-content-pass' -Scenario 'content-ok' -PortalHost
 Assert '内容校验通过时不请求 Portal' ($n.Status -eq 0 -and $n.Login -eq 0) "chkstatus=$($n.Status) login=$($n.Login)"
 Assert '内容校验通过后状态为 online' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
 
-# 场景 14：只认 204 的目标拿到 200（典型的门户劫持页）→ 判失败并自动恢复
+# 场景 14a：既要求内容、又只认 204 的目标拿到 200 + 劫持页 → 判失败并自动恢复
+#（以前写成 url|文本|204，解析器只认一个竖线，于是「期望 204」其实从未生效——本次修正并真正测到）
 $n = Invoke-Scenario -Name 's14-expect-204' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
     -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test|204") -Seconds 16 -OnlineProbe 2 -OfflineProbe 2
 Assert '期望 204 却拿到 200 时判定为不在线' ($n.Status -ge 1) "chkstatus=$($n.Status)"
 Assert '期望 204 失败后会自动登录' ($n.Login -eq 1) "login=$($n.Login)"
 Assert '恢复后状态为 login-ok' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
+
+# 场景 14b：假 Portal 真的回 204（generate_204 的正常情形）→ 判定在线，一个 Portal 请求都不发
+$n = Invoke-Scenario -Name 's14b-real-204' -Scenario 'content-204' -PortalHost "127.0.0.1:$Port" `
+    -Targets @("http:127.0.0.1:$Port/connecttest.txt|204") -Seconds 10 -OnlineProbe 2
+Assert '真的拿到 204 时判为在线' ($n.Status -eq 0 -and $n.Login -eq 0) "chkstatus=$($n.Status) login=$($n.Login)"
+Assert '真 204 后状态为 online' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
 
 # 场景 15：登录接口回「已在别处在线」，但复检确认网络其实已恢复 → 直接算成功
 $n = Invoke-Scenario -Name 's15-error2-recovered' -Scenario 'conflict-then-online' -PortalHost "127.0.0.1:$Port" `
@@ -291,19 +308,46 @@ Assert 'error2 后复检在线即算登录成功' ($n.State.LastResult -eq 'logi
 Assert 'error2 恢复场景只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
 
 # 场景 16：守护自检（--watchdog --check-only）的判定与退出码
-$watchDir = Join-Path $work 's16-watchdog'
-New-Item -ItemType Directory -Force -Path $watchDir | Out-Null
-$watchOut = Join-Path $watchDir 'watchdog-out.txt'
-$watch = Start-Process -FilePath $Exe -ArgumentList '--watchdog', '--check-only', '--data-dir', $watchDir `
-    -RedirectStandardOutput $watchOut -Wait -PassThru
-$watchText = if (Test-Path -LiteralPath $watchOut) { Get-Content -LiteralPath $watchOut -Raw -Encoding UTF8 } else { '' }
-$mainRunning = @(Get-Process -Name 'CampusNet' -ErrorAction SilentlyContinue).Count -gt 0
-if ($mainRunning) {
-    Assert '主程序在跑时守护判定为存活' ($watch.ExitCode -in @(0, 1)) "exit=$($watch.ExitCode) out=$watchText"
-} else {
-    Assert '主程序不在时守护判定为 dead（退出码 2）' ($watch.ExitCode -eq 2) "exit=$($watch.ExitCode) out=$watchText"
+# 以前「主程序在跑」时 0 和 1 都算通过——判定成 stale（引擎卡死）也能蒙混过关，这里逐项严格断言。
+function Invoke-WatchdogCheck {
+    param([string]$DataDir)
+    $out = Join-Path $DataDir 'watchdog-out.txt'
+    $p = Start-Process -FilePath $Exe -ArgumentList '--watchdog', '--check-only', '--data-dir', $DataDir `
+        -RedirectStandardOutput $out -Wait -PassThru
+    $text = if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw -Encoding UTF8 } else { '' }
+    return [pscustomobject]@{ Exit = $p.ExitCode; Text = $text }
 }
-Assert '守护自检不写状态文件' (-not (Test-Path -LiteralPath (Join-Path $watchDir 'state.json'))) '状态文件被写出来了'
+
+function Write-TestState {
+    param([string]$Dir, [int]$AgeSeconds)
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    $stamp = (Get-Date).AddSeconds(-$AgeSeconds).ToString('yyyy-MM-dd HH:mm:ss')
+    $json = [ordered]@{ LastTrigger = $stamp; LastResult = 'online'; Online = $true } | ConvertTo-Json
+    Set-Content -LiteralPath (Join-Path $Dir 'state.json') -Value $json -Encoding UTF8
+}
+
+$watchFreshDir = Join-Path $work 's16-fresh'
+$watchStaleDir = Join-Path $work 's16-stale'
+$watchEmptyDir = Join-Path $work 's16-empty'
+Write-TestState -Dir $watchFreshDir -AgeSeconds 5
+Write-TestState -Dir $watchStaleDir -AgeSeconds 900
+New-Item -ItemType Directory -Force -Path $watchEmptyDir | Out-Null
+
+$mainRunning = @(Get-Process -Name 'CampusNet' -ErrorAction SilentlyContinue).Count -gt 0
+$watchFresh = Invoke-WatchdogCheck -DataDir $watchFreshDir
+$watchStale = Invoke-WatchdogCheck -DataDir $watchStaleDir
+$watchEmpty = Invoke-WatchdogCheck -DataDir $watchEmptyDir
+if ($mainRunning) {
+    Assert '主程序在跑 + 心跳新鲜 → 判定 alive（退出码 0）' ($watchFresh.Exit -eq 0) "exit=$($watchFresh.Exit) out=$($watchFresh.Text)"
+    Assert '主程序在跑 + 心跳过期 → 判定 stale（退出码 1）' ($watchStale.Exit -eq 1) "exit=$($watchStale.Exit) out=$($watchStale.Text)"
+} else {
+    Assert '主程序不在 → 判定 dead（退出码 2）' ($watchFresh.Exit -eq 2 -and $watchStale.Exit -eq 2) "fresh=$($watchFresh.Exit) stale=$($watchStale.Exit)"
+}
+$emptyExpected = if ($mainRunning) { 1 } else { 2 }
+Assert '状态文件缺失时不冒充存活' ($watchEmpty.Exit -eq $emptyExpected) "exit=$($watchEmpty.Exit) out=$($watchEmpty.Text)"
+Assert '守护自检不写状态文件' (-not (Test-Path -LiteralPath (Join-Path $watchEmptyDir 'state.json'))) '状态文件被写出来了'
+# 自定义数据目录必须透传给「被拉起的主程序」，否则守护会用默认目录里的配置和账号
+Assert '守护重启命令带 --data-dir' ($watchFresh.Text -match '--data-dir' -and $watchFresh.Text.Contains($watchFreshDir)) "out=$($watchFresh.Text)"
 
 # 场景 17：常驻守护进程（--watchdog-loop）在不在跑，状态里要如实显示
 $loopDir = Join-Path $work 's17-watchdog-loop'
@@ -324,6 +368,161 @@ if (-not $preexisting) {
     Assert '守护进程退出后状态回到未开启' ($statusAfter -match '守护\s*：未开启') "输出=$($statusAfter -replace "`r?`n", ' | ')"
 }
 
+# 场景 18：登录接口回成功、但状态接口随即不可达 → 必须算「待确认」，不能算登录成功
+#（这是 pre.6 的严重误报：after.Online || !after.Reachable 会把「Portal 挂了 + 没联上网」记成 login-ok）
+$n = Invoke-Scenario -Name 's18-unconfirmed' -Scenario 'drop-after-login' -PortalHost "127.0.0.1:$Port" `
+    -Targets @('tcp:127.0.0.1:65011') -Seconds 34 -OnlineProbe 2 -OfflineProbe 2
+Assert '状态接口不可达时不算登录成功' ($n.State.LastResult -eq 'login-unconfirmed') "LastResult=$($n.State.LastResult)"
+Assert '待确认时不写「登录成功」时间' ([string]::IsNullOrEmpty($n.State.LastLoginSuccess)) "LastLoginSuccess=$($n.State.LastLoginSuccess)"
+Assert '待确认时只提交一次登录' ($n.Login -eq 1) "login=$($n.Login)"
+Assert '日志写明本次不记为登录成功' ($n.Log -match '不记为登录成功|状态接口不可达') '日志里没有相关说明'
+
+# 场景 19：探测目标全部非法 → 判配置错误、停下、不登录（既不能当在线，也不能拿着坏配置打 Portal）
+$n = Invoke-Scenario -Name 's19-bad-targets' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
+    -Targets @('garbage', 'tcp:', 'http:') -Seconds 10 -OnlineProbe 2 -OfflineProbe 2
+Assert '探测目标全非法时不请求 Portal' ($n.Status -eq 0 -and $n.Login -eq 0) "chkstatus=$($n.Status) login=$($n.Login)"
+Assert '探测目标全非法时状态为 probe-config' ($n.State.LastResult -eq 'probe-config') "LastResult=$($n.State.LastResult)"
+Assert '探测目标全非法时日志给出提示' ($n.Log -match '没有任何一条合法目标') '日志里没有相关说明'
+
+# ------------------------------------------------------------------ 原始配置场景（自备 config.json）
+function Invoke-RawScenario {
+    param([string]$Name, [string]$Scenario, [string]$ConfigText, [int]$Seconds = 8, [switch]$SkipCredentials)
+    $dir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir 'config.json') -Value $ConfigText -Encoding UTF8
+    $logPath = Join-Path $dir 'portal-requests.log'
+    $portal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
+        -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', $Scenario, '-Port', $Port, '-LogPath', $logPath
+    Start-Sleep -Milliseconds 900
+    try {
+        if (-not $SkipCredentials) { Set-TestCredentials -Dir $dir }
+        $output = & $Exe '--run-seconds' $Seconds '--data-dir' $dir 2>&1 | Out-String
+    }
+    finally {
+        try { Stop-Process -Id $portal.Id -Force -ErrorAction SilentlyContinue } catch { }
+        Start-Sleep -Milliseconds 200
+    }
+    $requests = @()
+    if (Test-Path -LiteralPath $logPath) { $requests = Get-Content -LiteralPath $logPath | Where-Object { $_ -match '^(GET|POST) ' } }
+    $stateFile = Join-Path $dir 'state.json'
+    if (Test-Path -LiteralPath $stateFile) {
+        $state = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    } else {
+        $state = [pscustomobject]@{ LastResult = ''; LastError = '' }
+    }
+    $logContent = ''
+    $localLog = Join-Path $dir 'login.log'
+    if (Test-Path -LiteralPath $localLog) { $logContent = Get-Content -LiteralPath $localLog -Raw -Encoding UTF8 }
+    return [pscustomobject]@{
+        Dir = $dir; Requests = $requests; State = $state; Log = $logContent; Output = $output
+        Status = (@($requests | Where-Object { $_ -match 'chkstatus' }).Count)
+        Login = (@($requests | Where-Object { $_ -match 'login' }).Count)
+    }
+}
+
+# 场景 20：config.json 损坏 → 停止自动登录、提示用户、一个 Portal 请求都不发
+$corruptConfig = '{ "PortalHost": "127.0.0.1:' + $Port + '", "ProbeTargets": ["tcp:127.0.0.1:65012"'
+$n = Invoke-RawScenario -Name 's20-corrupt-config' -Scenario 'online' -ConfigText $corruptConfig -Seconds 8
+Assert '配置损坏时不请求 Portal' ($n.Status -eq 0 -and $n.Login -eq 0) "chkstatus=$($n.Status) login=$($n.Login)"
+Assert '配置损坏时状态为 config-invalid' ($n.State.LastResult -eq 'config-invalid') "LastResult=$($n.State.LastResult)"
+Assert '配置损坏时日志写明原因' ($n.Log -match '配置文件无法解析') '日志里没有相关说明'
+Assert '损坏的配置不会被默认配置悄悄覆盖' ((Get-Content -LiteralPath (Join-Path $n.Dir 'config.json') -Raw -Encoding UTF8) -match '127\.0\.0\.1') '配置文件被改写了'
+
+# 场景 21：命令行里带明文密码 → 直接拒绝（密码会留在 PowerShell 历史 / 进程列表 / 审计日志里）
+$cliDir = Join-Path $work 's21-cli-password'
+New-Item -ItemType Directory -Force -Path $cliDir | Out-Null
+$cliOut = & $Exe '--set-credentials' 'testuser' 'testpass' '--data-dir' $cliDir 2>&1 | Out-String
+$cliCode = $LASTEXITCODE
+Assert '命令行传明文密码被拒绝（退出码 2）' ($cliCode -eq 2) "exit=$cliCode out=$cliOut"
+Assert '被拒绝时不写凭据文件' (-not (Test-Path -LiteralPath (Join-Path $cliDir 'credentials.dat'))) '凭据文件被写出来了'
+Assert '拒绝时提示安全写法' ($cliOut -match 'password-stdin') "out=$cliOut"
+
+# 场景 22：并行探测——4 个「连得上但永不回内容」的目标，耗时不能随条数线性增长
+function New-BlackholeConfig {
+    param([int]$TargetCount)
+    $targets = @()
+    for ($i = 0; $i -lt $TargetCount; $i++) { $targets += "http:127.0.0.1:$Port/blackhole$i" }
+    $cfg = [ordered]@{
+        PortalHost          = "127.0.0.1:$Port"
+        EportalPort         = 801
+        StatusPath          = '/drcom/chkstatus'
+        LoginPath           = '/drcom/login'
+        LogoutPath          = '/drcom/logout'
+        ErrorPromptPath     = '/eportal/portal/err_code/loadErrorPrompt'
+        OnlineProbeSeconds  = 20
+        OfflineProbeSeconds = 2
+        ProbeTimeoutMs      = 500
+        HttpProbeTimeoutMs  = 1200
+        ConfirmAttempts     = 2
+        ConfirmGapMs        = 200
+        ProbeTargets        = @($targets)
+        LoginConfirmDelaySec = 1
+        LoginMinIntervalSeconds = 60
+        LoginHourlyLimit    = 12
+        SessionCheckSeconds = 300
+        StuckReloginSeconds = 60
+        StatusTimeoutSec    = 5
+        LoginTimeoutSec     = 5
+        RetryCount          = 1
+        StaticFields        = [ordered]@{ '0MKKey' = '123456' }
+    }
+    return ($cfg | ConvertTo-Json -Depth 5)
+}
+
+$oneDir = Join-Path $work 's22-parallel-1'
+$fourDir = Join-Path $work 's22-parallel-4'
+New-Item -ItemType Directory -Force -Path $oneDir, $fourDir | Out-Null
+Set-Content -LiteralPath (Join-Path $oneDir 'config.json') -Value (New-BlackholeConfig -TargetCount 1) -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $fourDir 'config.json') -Value (New-BlackholeConfig -TargetCount 4) -Encoding UTF8
+$bhLog = Join-Path $work 's22-portal.log'
+$bhPortal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
+    -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', 'blackhole', '-Port', $Port, '-LogPath', $bhLog
+Start-Sleep -Milliseconds 900
+try {
+    $swOne = [System.Diagnostics.Stopwatch]::StartNew()
+    $outOne = & $Exe '--diagnose' '--data-dir' $oneDir 2>&1 | Out-String
+    $swOne.Stop()
+    $swFour = [System.Diagnostics.Stopwatch]::StartNew()
+    $outFour = & $Exe '--diagnose' '--data-dir' $fourDir 2>&1 | Out-String
+    $swFour.Stop()
+}
+finally {
+    try { Stop-Process -Id $bhPortal.Id -Force -ErrorAction SilentlyContinue } catch { }
+    Start-Sleep -Milliseconds 200
+}
+$delta = [math]::Round($swFour.Elapsed.TotalSeconds - $swOne.Elapsed.TotalSeconds, 2)
+Assert '探测目标并行执行（4 条不比 1 条慢多少）' ($delta -lt 1.0) `
+    "1 条=$([math]::Round($swOne.Elapsed.TotalSeconds, 2))s，4 条=$([math]::Round($swFour.Elapsed.TotalSeconds, 2))s，差 $delta s（串行会差约 3.6s）"
+Assert '黑洞目标如实报「不通」' ($outOne -match '不通' -or $outOne -match '失败') '诊断输出没有体现探测失败'
+
+# 场景 23：pre.6 的复检参数（3 轮 / 1000 毫秒）迁移为 2 轮 / 500 毫秒，自定义值原样保留
+function Invoke-ConfirmMigration {
+    param([string]$Name, [int]$Attempts, [int]$Gap)
+    $dir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $legacy = [ordered]@{
+        ConfigVersion        = 4
+        PortalHost           = "127.0.0.1:$Port"
+        OnlineProbeSeconds   = 20
+        OfflineProbeSeconds  = 2
+        ProbeTimeoutMs       = 500
+        ConfirmAttempts      = $Attempts
+        ConfirmGapMs         = $Gap
+        ProbeTargets         = @("tcp:127.0.0.1:65013")
+    }
+    ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
+    Set-TestCredentials -Dir $dir
+    & $Exe '--run-seconds' 4 '--data-dir' $dir | Out-String | Out-Null
+    return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+$confirmMigrated = Invoke-ConfirmMigration -Name 's23-migrate' -Attempts 3 -Gap 1000
+Assert 'pre.6 的复检节奏迁移为 2 轮 / 500 毫秒' ($confirmMigrated.ConfirmAttempts -eq 2 -and $confirmMigrated.ConfirmGapMs -eq 500) `
+    "Attempts=$($confirmMigrated.ConfirmAttempts) Gap=$($confirmMigrated.ConfirmGapMs)"
+Assert '迁移后写入 ConfigVersion=5' ($confirmMigrated.ConfigVersion -eq 5) "ConfigVersion=$($confirmMigrated.ConfigVersion)"
+$confirmCustom = Invoke-ConfirmMigration -Name 's23-custom' -Attempts 4 -Gap 1500
+Assert '自定义复检参数不被改写' ($confirmCustom.ConfirmAttempts -eq 4 -and $confirmCustom.ConfirmGapMs -eq 1500) `
+    "Attempts=$($confirmCustom.ConfirmAttempts) Gap=$($confirmCustom.ConfirmGapMs)"
 Write-Host ''
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ''

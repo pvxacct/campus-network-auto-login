@@ -233,10 +233,11 @@ namespace CampusNet
             OnlineProbeBox.Text = config.OnlineProbeSeconds.ToString(CultureInfo.InvariantCulture);
             OfflineProbeBox.Text = config.OfflineProbeSeconds.ToString(CultureInfo.InvariantCulture);
             HourlyLimitBox.Text = config.LoginHourlyLimit.ToString(CultureInfo.InvariantCulture);
-            PortalHostBox.Text = config.PortalHost;
+            PortalHostBox.Text = config.PortalBase;   // 连协议一起显示，写成 https://… 也认
             MinIntervalBox.Text = config.LoginMinIntervalSeconds.ToString(CultureInfo.InvariantCulture);
             UpstreamProbeBox.Text = config.UpstreamProbeSeconds.ToString(CultureInfo.InvariantCulture);
             ProbeTimeoutBox.Text = config.ProbeTimeoutMs.ToString(CultureInfo.InvariantCulture);
+            HttpProbeTimeoutBox.Text = config.HttpProbeTimeoutMs.ToString(CultureInfo.InvariantCulture);
             SessionCheckBox.Text = config.SessionCheckSeconds.ToString(CultureInfo.InvariantCulture);
             StuckReloginBox.Text = config.StuckReloginSeconds.ToString(CultureInfo.InvariantCulture);
             EngineSnapshot snapshot = _engine.Snapshot();
@@ -281,6 +282,7 @@ namespace CampusNet
             { "LoginMinIntervalSeconds", new[] { 0, 3600 } },
             { "UpstreamProbeSeconds", new[] { 30, 3600 } },
             { "ProbeTimeoutMs", new[] { 200, 10000 } },
+            { "HttpProbeTimeoutMs", new[] { 500, 10000 } },
             { "SessionCheckSeconds", new[] { 0, 3600 } },
             { "StuckReloginSeconds", new[] { 0, 3600 } }
         };
@@ -357,25 +359,31 @@ namespace CampusNet
         {
             AppConfig config = _engine.Config;
             string host = (PortalHostBox.Text ?? string.Empty).Trim();
+            string scheme = config.PortalScheme;
+            // 允许直接把协议写进地址（https://10.66.209.2）——存盘时拆成 PortalScheme + PortalHost
+            if (host.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) { scheme = "https"; host = host.Substring(8); }
+            else if (host.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) { scheme = "http"; host = host.Substring(7); }
             if (string.IsNullOrEmpty(host))
             {
-                PortalHostBox.Text = config.PortalHost;
-                AdvancedHint.Text = "Portal 地址不能为空，已还原为 " + config.PortalHost + "。";
+                PortalHostBox.Text = config.PortalBase;
+                AdvancedHint.Text = "Portal 地址不能为空，已还原为 " + config.PortalBase + "。";
                 return;
             }
-            if (string.Equals(host, config.PortalHost, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(host, config.PortalHost, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(scheme, config.PortalScheme, StringComparison.OrdinalIgnoreCase))
             {
-                PortalHostBox.Text = config.PortalHost;
+                PortalHostBox.Text = config.PortalBase;
                 return;
             }
             config.PortalHost = host;
+            config.PortalScheme = scheme;
             try
             {
                 config.Save(AppPaths.ConfigFile);
                 _engine.Reload();
                 LoadSettingsIntoUi();
-                AdvancedHint.Text = "已保存并立即生效：Portal 地址 = " + host + "。";
-                _log.Info("设置已更新：Portal 地址 = " + host + "。");
+                AdvancedHint.Text = "已保存并立即生效：Portal 地址 = " + config.PortalBase + "。";
+                _log.Info("设置已更新：Portal 地址 = " + config.PortalBase + "。");
                 RefreshLog();
             }
             catch (Exception ex)
@@ -394,6 +402,7 @@ namespace CampusNet
                 case "LoginMinIntervalSeconds": return config.LoginMinIntervalSeconds;
                 case "UpstreamProbeSeconds": return config.UpstreamProbeSeconds;
                 case "ProbeTimeoutMs": return config.ProbeTimeoutMs;
+                case "HttpProbeTimeoutMs": return config.HttpProbeTimeoutMs;
                 case "SessionCheckSeconds": return config.SessionCheckSeconds;
                 case "StuckReloginSeconds": return config.StuckReloginSeconds;
                 default: return 0;
@@ -410,6 +419,7 @@ namespace CampusNet
                 case "LoginMinIntervalSeconds": config.LoginMinIntervalSeconds = value; break;
                 case "UpstreamProbeSeconds": config.UpstreamProbeSeconds = value; break;
                 case "ProbeTimeoutMs": config.ProbeTimeoutMs = value; break;
+                case "HttpProbeTimeoutMs": config.HttpProbeTimeoutMs = value; break;
                 case "SessionCheckSeconds": config.SessionCheckSeconds = value; break;
                 case "StuckReloginSeconds": config.StuckReloginSeconds = value; break;
             }
@@ -425,6 +435,7 @@ namespace CampusNet
                 case "LoginMinIntervalSeconds": return "登录最小间隔";
                 case "UpstreamProbeSeconds": return "兜底巡检间隔";
                 case "ProbeTimeoutMs": return "探测超时";
+                case "HttpProbeTimeoutMs": return "HTTP 探测超时";
                 case "SessionCheckSeconds": return "会话校验间隔";
                 case "StuckReloginSeconds": return "残留会话自动重登";
                 default: return field;
@@ -632,6 +643,9 @@ namespace CampusNet
                 case "login-wait": return "等待下次登录";
                 case "login-throttled": return "已触发频率上限";
                 case "login-retry": return "已忽略 Portal 提示，继续重试";
+                case "login-unconfirmed": return "登录已提交，等待确认";
+                case "config-invalid": return "配置文件损坏，已停止登录";
+                case "probe-config": return "探测目标配置无效，已停止登录";
                 case "stuck-relogin": return "残留会话：正在强制重新登录";
                 case "verifying": return "正在核对网络状态";
                 case "tcp-only": return "只有 TCP 握手通过";

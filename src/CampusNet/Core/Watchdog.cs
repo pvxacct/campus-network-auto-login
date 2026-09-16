@@ -40,6 +40,7 @@ namespace CampusNet.Core
             {
                 ConsoleBridge.Attach();
                 ConsoleBridge.Line(decision + "：" + detail);
+                ConsoleBridge.Line("重启命令：" + MainCommandLine(ResolveExe()));
                 return decision == "alive" ? 0 : (decision == "stale" ? 1 : 2);
             }
 
@@ -90,10 +91,12 @@ namespace CampusNet.Core
 
                 Log("守护进程启动（PID " + Process.GetCurrentProcess().Id + "，每 " + LoopIntervalSeconds + " 秒检查一次）");
                 int fastCrashes = 0;
+                // 降速后的节奏必须跨轮保留：以前 wait 在循环里被重新赋值为 LoopIntervalSeconds，
+                // 于是「放慢到 300 秒」从来没能生效，一直在按 30 秒拉起崩溃的程序。
+                int wait = LoopIntervalSeconds;
                 DateTime? lastStart = null;
                 while (true)
                 {
-                    int wait = LoopIntervalSeconds;
                     // 先等一轮再检查：守护总是由活着的主程序启动的，刚启动时立刻判定没有意义
                     // （主程序可能还没来得及写第一份 state.json）；等待期间也随时响应「主动退出」。
                     if (stop == null)
@@ -115,7 +118,7 @@ namespace CampusNet.Core
                             bool quick = lastStart.HasValue
                                 && (DateTime.Now - lastStart.Value).TotalSeconds < FastCrashSeconds;
                             fastCrashes = quick ? fastCrashes + 1 : 0;
-                            if (fastCrashes >= FastCrashLimit)
+                            if (fastCrashes >= FastCrashLimit && wait != SlowIntervalSeconds)
                             {
                                 wait = SlowIntervalSeconds;
                                 Log("短时间内已第 " + fastCrashes + " 次拉起，放慢到每 " + SlowIntervalSeconds + " 秒一次");
@@ -136,6 +139,12 @@ namespace CampusNet.Core
                             {
                                 Log("拉起失败，等下一轮再试");
                             }
+                        }
+                        else if (wait != LoopIntervalSeconds)
+                        {
+                            wait = LoopIntervalSeconds;
+                            fastCrashes = 0;
+                            Log("主程序恢复正常，守护节奏回到每 " + LoopIntervalSeconds + " 秒一次");
                         }
                     }
                     catch (Exception ex)
@@ -187,13 +196,13 @@ namespace CampusNet.Core
             if (IsRunning) { return true; }
             try
             {
-                string exe = File.Exists(AppPaths.InstalledExe) ? AppPaths.InstalledExe : AppPaths.CurrentExe;
-                var info = new ProcessStartInfo(exe, "--watchdog-loop");
+                string exe = ResolveExe();
+                var info = new ProcessStartInfo(exe, "--watchdog-loop" + DataDirArgument());
                 // UseShellExecute：让守护成为独立进程，主程序退出/崩溃都不会带走它
                 info.UseShellExecute = true;
                 info.WorkingDirectory = Path.GetDirectoryName(exe);
                 Process.Start(info);
-                Log("已启动守护进程：" + exe + " --watchdog-loop");
+                Log("已启动守护进程：" + exe + " --watchdog-loop" + DataDirArgument());
                 if (log != null)
                 {
                     log.Info("守护进程已启动（每 " + LoopIntervalSeconds + " 秒检查一次，主程序崩溃或卡死会自动拉起）。");
@@ -286,8 +295,10 @@ namespace CampusNet.Core
         {
             try
             {
-                string exe = File.Exists(AppPaths.InstalledExe) ? AppPaths.InstalledExe : AppPaths.CurrentExe;
-                var info = new ProcessStartInfo(exe, "--tray");
+                string exe = ResolveExe();
+                // 数据目录必须原样透传：主程序支持 --data-dir，守护却按默认目录拉起的话，
+                // 会用错的配置和错的账号把程序重新拉起来（自定义数据目录的场景直接崩坏）。
+                var info = new ProcessStartInfo(exe, "--tray" + DataDirArgument());
                 info.UseShellExecute = false;
                 info.CreateNoWindow = true;
                 info.WorkingDirectory = Path.GetDirectoryName(exe);
@@ -299,6 +310,25 @@ namespace CampusNet.Core
                 Log("启动失败：" + ex.Message);
                 return false;
             }
+        }
+
+        /// <summary>要拉起的可执行文件：装过就用安装目录里的，否则用当前正在跑的这份。</summary>
+        private static string ResolveExe()
+        {
+            return File.Exists(AppPaths.InstalledExe) ? AppPaths.InstalledExe : AppPaths.CurrentExe;
+        }
+
+        /// <summary>`--data-dir "…"`：守护进程自己就是带着它启动的，拉起别人时必须原样透传。</summary>
+        public static string DataDirArgument()
+        {
+            string dir = AppPaths.DataDir;
+            return string.IsNullOrEmpty(dir) ? string.Empty : " --data-dir \"" + dir + "\"";
+        }
+
+        /// <summary>守护拉起主程序时用的完整命令行（--watchdog --check-only 会打印它，便于排查）。</summary>
+        public static string MainCommandLine(string exe)
+        {
+            return "\"" + exe + "\" --tray" + DataDirArgument();
         }
 
         /// <summary>守护自己的小日志：只保留最近一小段，避免无限增长。</summary>
