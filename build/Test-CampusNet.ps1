@@ -799,6 +799,40 @@ if ($null -ne $mainScroller) {
 Assert '主体内容被 ScrollViewer 包裹（最后一行不再被裁掉）' ($wrappedRows -ge 1) `
     "ScrollViewer 里没有找到带行定义的 Grid（找到 $wrappedRows 个）"
 
+# 日志里两条记录相差多少秒（找不到任意一条返回 -1）
+function Get-LogSecondsBetween {
+    param([string]$Log, [string]$FromPattern, [string]$ToPattern)
+    $a = [regex]::Match($Log, '(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[^\r\n]*' + $FromPattern)
+    $b = [regex]::Match($Log, '(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[^\r\n]*' + $ToPattern)
+    if (-not $a.Success -or -not $b.Success) { return -1 }
+    $t1 = [datetime]::ParseExact($a.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $null)
+    $t2 = [datetime]::ParseExact($b.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $null)
+    return [math]::Round(($t2 - $t1).TotalSeconds, 0)
+}
+
+# 场景 33：最小间隔等待期内不再「睡满剩余间隔」（本机 2026-09-17 23:10:21→23:10:54 那次空窗）
+# 假 Portal：登录回 error2、chkstatus 始终说离线、内容校验要等登录后 30 秒才通过。
+# 复检阶梯只有 3/5/12 秒，够不着这个恢复时刻；老写法接下来会一路睡到 60 秒窗口结束，
+# 期间一次探测都不做 —— 新写法在等待期按约 5 秒的节奏只做本地探测，网络一通就立刻确认。
+$n = Invoke-RawRun -Name 's33-login-wait-watch' -Scenario 'late-content' -Seconds 45 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" `
+        -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -OfflineProbe 2 -MinInterval 60)
+Assert '等待期内本地探测到恢复（state 变在线）' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
+Assert '日志写明等待期内检测到网络恢复' ($n.Log -match '最小间隔等待期内检测到网络恢复') '日志里没有等待期恢复的说明'
+Assert '等待期内不再发 Portal 查询' ($n.Status -le 5) "chkstatus=$($n.Status)，等待期内每轮都不该再查 Portal"
+Assert '等待期恢复后仍然只提交 1 次登录' ($n.Login -eq 1) "login=$($n.Login)"
+$recoverDelta = Get-LogSecondsBetween -Log $n.Log -FromPattern '次尝试登录' -ToPattern '网络已恢复'
+Assert '登录后 25~40 秒内确认恢复（老写法要等满 60 秒窗口）' ($recoverDelta -ge 25 -and $recoverDelta -le 40) `
+    "登录到恢复相隔 $recoverDelta 秒"
+
+# 场景 34：登录后先立刻做一次本地内容校验（0 秒），不再固定白等 3 秒
+$n = Invoke-RawRun -Name 's34-instant-content' -Scenario 'instant-content' -Seconds 12 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" `
+        -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -OfflineProbe 2 -MinInterval 60)
+Assert '登录后立刻复检命中（日志出现 +0 秒）' ($n.Log -match '\+0 秒') '日志里没有「+0 秒」的复检记录'
+Assert '瞬时生效直接判为登录成功' ($n.State.LastResult -eq 'login-ok' -or $n.State.LastResult -eq 'online') `
+    "LastResult=$($n.State.LastResult)"
+
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ''
 if ($failures -gt 0) {

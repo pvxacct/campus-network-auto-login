@@ -63,6 +63,8 @@ $listener.Start()
 Set-Content -LiteralPath $LogPath -Value "START $Scenario" -Encoding UTF8
 $counts = @{ chkstatus = 0; login = 0; logout = 0; error = 0 }
 $blackholeClients = New-Object System.Collections.Generic.List[object]
+# 内容校验何时开始返回关键字：late-content 用来复现「登录已经生效、程序却还在等」的场景
+$loginAt = $null
 
 while ($true) {
     $client = $listener.AcceptTcpClient()
@@ -102,11 +104,23 @@ while ($true) {
         }
         elseif ($path -like '*login*') {
             $counts.login++
+            if ($null -eq $loginAt -and ($Scenario -eq 'late-content' -or $Scenario -eq 'instant-content')) {
+                $loginAt = Get-Date
+            }
             switch ($Scenario) {
                 'rate-limited' {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='error5 waitsec 3';</script>"
                 }
                 'conflict' {
+                    Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='userid error2';</script>"
+                }
+                # 登录回了「已在别处在线 / 密码错误」，但网络稍后真的通了：
+                # instant-content 立刻通，late-content 登录后 30 秒才通（复检阶梯 3/5/12 秒够不着，
+                # 只能靠最小间隔等待期的本地监视发现）。
+                'instant-content' {
+                    Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='userid error2';</script>"
+                }
+                'late-content' {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='userid error2';</script>"
                 }
                 'login-fail' {
@@ -148,12 +162,26 @@ while ($true) {
             Send-Response -Stream $stream -ContentType 'application/json; charset=utf-8' `
                 -Body ("dr1({`"result`":1,`"error_code`":`"$code`",`"error_prompt_zh`":`"$prompt`"})")
         }
-        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204') -and $path -like '*connecttest.txt*') {
-            # 内容校验测试用：content-ok 发关键字；content-204 发真正的 204 空响应
+        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204' -or $Scenario -eq 'late-content' -or $Scenario -eq 'instant-content') -and $path -like '*connecttest.txt*') {
+            # 内容校验测试用：content-ok 发关键字；content-204 发真正的 204 空响应；
+            # instant-content 在登录后立刻发关键字；late-content 要等登录后 30 秒才发。
+            $serve = $true
+            if ($Scenario -eq 'instant-content' -or $Scenario -eq 'late-content') {
+                $serve = $false
+                if ($null -ne $loginAt) {
+                    $waitSec = if ($Scenario -eq 'late-content') { 30 } else { 0 }
+                    $serve = ((Get-Date) - $loginAt).TotalSeconds -ge $waitSec
+                }
+            }
             if ($Scenario -eq 'content-204') {
                 Send-Response -Stream $stream -Status 204 -Body ''
-            } else {
+            }
+            elseif ($serve) {
                 Send-Response -Stream $stream -ContentType 'text/plain; charset=utf-8' -Body 'Microsoft Connect Test'
+            }
+            else {
+                # 登录还没发生 / 还没到时间：回「连得上但没有关键字」，等价于账号没通
+                Send-Response -Stream $stream -Body 'not found'
             }
         }
         else {

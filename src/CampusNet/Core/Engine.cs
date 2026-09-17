@@ -83,7 +83,7 @@ namespace CampusNet.Core
         /// 与登录风控无关。20 秒是折中 —— 被踢下线后约 20~40 秒就能发现，又不至于每轮都去打扰 Portal。
         /// </summary>
         private const int SuspectVerifyMinSeconds = 20;
-        /// <summary>忽略 Portal 业务提示后的复检节奏：3 / 5 / 12 秒，累计约 20 秒。</summary>
+        /// <summary>忽略 Portal 业务提示后的复检节奏：先立刻看一眼，再按 3 / 5 / 12 秒复检（累计约 20 秒）。</summary>
         private const int RecoveryFirstDelaySec = 3;
         private const int RecoverySecondDelaySec = 5;
         private const int RecoveryThirdDelaySec = 12;
@@ -116,6 +116,13 @@ namespace CampusNet.Core
         private DateTime? _lastSuspectVerifyUtc;
         /// <summary>本轮疑似掉线是否已经自动注销重登过一次（避免热循环）。</summary>
         private bool _stuckReloginRequested;
+
+        /// <summary>
+        /// 最小间隔等待期的结束时间。等待期内只做本地探测（不发任何 Portal 请求），
+        /// 网络一恢复就立刻确认在线 —— 真机实测（2026-09-17 23:10:21→23:10:54）老写法会让
+        /// 工作线程睡满剩余间隔，这 33 秒里网络其实已经恢复却没人去确认。
+        /// </summary>
+        private DateTime _loginWaitUntil = DateTime.MinValue;
 
         private DateTime _lastPersistUtc = DateTime.MinValue;
         private string _persistedStatusKey;
@@ -170,6 +177,8 @@ namespace CampusNet.Core
                 _snapshot.UserName = credential != null ? credential.UserName : string.Empty;
                 ResetPersistGate();
                 _startedAt = DateTime.Now;
+                // 换了配置或凭据就重新判断，别把旧的等待窗口带过来。
+                _loginWaitUntil = DateTime.MinValue;
             }
         }
 
@@ -210,6 +219,22 @@ namespace CampusNet.Core
                 if (!windowStart.HasValue || (now - windowStart.Value).TotalHours >= 1) { return 0; }
                 return _state.LoginWindowCount;
             }
+        }
+
+        /// <summary>
+        /// 等待期与「恢复监视」的轮询间隔：跟随 OfflineProbeSeconds（默认约 5 秒），最低 3 秒。
+        /// 这个节奏只影响纯本地探测，不产生任何 Portal 请求。
+        /// </summary>
+        private static int WatchIntervalSeconds(AppConfig config)
+        {
+            return Math.Max(3, config.OfflineProbeSeconds);
+        }
+
+        /// <summary>登记「最早什么时候可以再登录」：真正提交登录、或被最小间隔闸门拦下时调用。</summary>
+        private void SetLoginWait(int seconds)
+        {
+            if (seconds <= 0) { return; }
+            _loginWaitUntil = DateTime.Now.AddSeconds(seconds);
         }
 
         public void Start()
@@ -534,6 +559,29 @@ namespace CampusNet.Core
             UpdateNetwork(probe);
             _state.LastProbe = AppPaths.FormatTime(now);
 
+            // ---------- 最小间隔等待期：只做本地探测，不发任何 Portal 请求 ----------
+            // 真机实测（2026-09-17 23:10:21 → 23:10:54）：闸门 1 让工作线程睡满剩余间隔，
+            // 这 33 秒里网络其实已经恢复，却没人去确认。现在改成按约 5 秒的节奏复测：
+            // 探测恢复正常就往下走（交给既有的「内容校验通过 → 网络已恢复」路径），
+            // 仍然不通就继续短间隔复测。这一段不发 chkstatus、不发 login，登录风控闸门一概不变。
+            if (!relogin && now < _loginWaitUntil)
+            {
+                bool stillTrouble = !probe.Online || (probe.HasVerifiedTargets && !probe.Verified);
+                if (stillTrouble)
+                {
+                    int remain = (int)Math.Ceiling((_loginWaitUntil - now).TotalSeconds);
+                    if (remain < 0) { remain = 0; }
+                    SetStatus("login-wait", "刚登录过，约 " + remain + " 秒后再试（正在本地监视网络恢复）");
+                    _log.WarnOnce("login-watch", "处于最小间隔等待期：本轮只做本地探测，不发 Portal 请求；网络一恢复就立即确认。");
+                    Persist(probe.LatencyMs, probe.LossPercent);
+                    return WatchIntervalSeconds(config);
+                }
+                if (!_state.Online)
+                {
+                    _log.Info("最小间隔等待期内检测到网络恢复（本地探测通过，未发 Portal 请求）。");
+                }
+            }
+
             if (probe.Online && !relogin)
             {
                 // 「TCP 能连」不等于「能上网」：有的网关会替任意地址代答 TCP 握手，
@@ -715,9 +763,12 @@ namespace CampusNet.Core
                     if (elapsed < config.LoginMinIntervalSeconds)
                     {
                         int wait = (int)Math.Ceiling(config.LoginMinIntervalSeconds - elapsed);
-                        SetStatus("login-wait", "刚登录过，约 " + wait + " 秒后再试");
+                        // 记下窗口结束时间：之后每一轮只做本地探测（不发 Portal 请求），
+                        // 网络一恢复立刻确认，不再让工作线程傻等剩余秒数。
+                        _loginWaitUntil = reference.Value.AddSeconds(config.LoginMinIntervalSeconds);
+                        SetStatus("login-wait", "刚登录过，约 " + wait + " 秒后再试（正在本地监视网络恢复）");
                         Persist(probe.LatencyMs, probe.LossPercent);
-                        return Math.Max(5, wait);
+                        return WatchIntervalSeconds(config);
                     }
                 }
             }
@@ -808,6 +859,9 @@ namespace CampusNet.Core
                     + Redact.MaskUser(credential.UserName) + "）。");
                 PortalLoginResult result = portal.Login(credential.UserName, credential.Password);
                 lastSubmit = DateTime.Now;
+                // 提交过登录请求就开始计时：最小间隔以内不再发第二次登录请求，
+                // 这段时间里的每一轮只做本地探测（见 EvaluateCore 的等待期分支）。
+                SetLoginWait(config.LoginMinIntervalSeconds);
                 lastMessage = result.Message;
                 string how = string.Empty;
 
@@ -961,6 +1015,8 @@ namespace CampusNet.Core
             _suspectStreak = 0;
             _suspectSince = null;
             _stuckReloginRequested = false;
+            // 已经恢复正常，等待期监视随之结束（登录风控仍按 LastLoginAttempt 计算，不受影响）。
+            _loginWaitUntil = DateTime.MinValue;
         }
 
         /// <summary>
@@ -980,11 +1036,19 @@ namespace CampusNet.Core
 
         /// <summary>
         /// 登录返回「账号已在别处在线 / 密码错误」这类提示后，会话往往还要几秒才真正生效。
-        /// 按 3 / 5 / 12 秒做几次轻量复检（只读 chkstatus + 本地内容校验），通了就立刻算成功。
+        /// 先立刻做一次本地内容校验（0 延迟、不发 Portal 请求），再按 3 / 5 / 12 秒做几轮
+        /// 轻量复检（只读 chkstatus + 本地内容校验），通了就立刻算成功。
         /// </summary>
         private bool WaitForRecovery(AppConfig config, PortalClient portal, out string how)
         {
             how = string.Empty;
+            // 第 0 轮：立刻看一眼。登录瞬间生效时不必先白等 3 秒（老写法固定先睡 3 秒再查）。
+            int initialLatency;
+            if (NetworkProbe.ContentCheck(config, out initialLatency))
+            {
+                how = "本地内容校验通过（+0 秒）";
+                return true;
+            }
             int elapsed = 0;
             int[] waits = new[] { RecoveryFirstDelaySec, RecoverySecondDelaySec, RecoveryThirdDelaySec };
             foreach (int wait in waits)
@@ -1010,6 +1074,7 @@ namespace CampusNet.Core
         private void OnOnline(ProbeOutcome probe, string message)
         {
             bool wasOnline = _state.Online;
+            _loginWaitUntil = DateTime.MinValue;
             lock (_gate)
             {
                 _state.Online = true;
