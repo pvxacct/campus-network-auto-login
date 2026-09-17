@@ -496,8 +496,12 @@ finally {
     Start-Sleep -Milliseconds 200
 }
 $delta = [math]::Round($swFour.Elapsed.TotalSeconds - $swOne.Elapsed.TotalSeconds, 2)
-Assert '探测目标并行执行（4 条不比 1 条慢多少）' ($delta -lt 1.0) `
-    "1 条=$([math]::Round($swOne.Elapsed.TotalSeconds, 2))s，4 条=$([math]::Round($swFour.Elapsed.TotalSeconds, 2))s，差 $delta s（串行会差约 3.6s）"
+$ratio = [math]::Round($swFour.Elapsed.TotalSeconds / [math]::Max(0.01, $swOne.Elapsed.TotalSeconds), 2)
+# 判定用「比值」而不是绝对秒数：CI runner 上进程启动 + 首次连通往往比本机慢一倍以上，
+# 绝对差值会随机器负载漂移（2.0.0-pre.10 的 CI 就因此误报过一次）。
+# 串行会接近 4 倍，并行应当明显低于 2.6 倍——判别力比绝对差值更强。
+Assert '探测目标并行执行（4 条不比 1 条慢多少）' ($ratio -lt 2.6) `
+    "1 条=$([math]::Round($swOne.Elapsed.TotalSeconds, 2))s，4 条=$([math]::Round($swFour.Elapsed.TotalSeconds, 2))s，差 $delta s，比值 $ratio（串行约 4 倍）"
 Assert '黑洞目标如实报「不通」' ($outOne -match '不通' -or $outOne -match '失败') '诊断输出没有体现探测失败'
 
 # 场景 23：pre.6 的复检参数（3 轮 / 1000 毫秒）迁移为 2 轮 / 500 毫秒，自定义值原样保留
