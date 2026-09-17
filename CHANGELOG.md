@@ -45,7 +45,9 @@
   本工具只按明文提交。这类学校会一直收到 `userid error2 / 密码错误`，现在日志里会额外
   用一行提示说明原因（限频一次），`docs/TROUBLESHOOTING.md` 也补了说明。
 - **发布链路硬门禁**：构建脚本新增源码指纹 `dist/CampusNet.exe.src.sha256`
-  （由 csproj + `src/**/*.cs` + 构建脚本算出）。`build-verify` 与 `create-release`
+  （由 csproj + `src/**/*.cs` + `src/**/*.xaml` + 构建脚本算出，**排除 `bin/` 与 `obj/` 里的
+  编译生成文件**——那里的 `App.g.cs`、`*.AssemblyInfo.cs` 带本机绝对路径，谁算谁不一样）。
+  `build-verify` 与 `create-release`
   在指纹不一致时**直接失败**，堵住「改了源码忘重建就发版」；二进制逐字节比对仍为警告，
   因为不同编译器版本会差几十字节（同样源码实测差 100 字节）。
 
