@@ -113,6 +113,14 @@ while ($true) {
                 'garbage' {
                     Send-Response -Stream $stream -Body '<html>something entirely unexpected</html>'
                 }
+                'echo-form' {
+                    # 模拟「Portal 把提交的表单回显在错误页里」：用来验证密码/账号不会跟着落盘。
+                    # 只回显请求体（含 DDDDD=账号&upass=密码），不发别的敏感内容。
+                    $body = ''
+                    $split = $request.IndexOf("`r`n`r`n")
+                    if ($split -ge 0) { $body = $request.Substring($split + 4) }
+                    Send-Response -Stream $stream -Body ('<html>form echo: ' + $body + '</html>')
+                }
                 default {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_3.htm--><html>login ok</html>"
                 }

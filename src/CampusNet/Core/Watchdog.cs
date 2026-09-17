@@ -20,8 +20,10 @@ namespace CampusNet.Core
         public const string LoopMutexName = @"Local\CampusNet.Watchdog";
         /// <summary>「用户主动退出」信号：置位后守护不再拉起主程序，而是自己退出。</summary>
         public const string IntentionalExitEventName = @"Local\CampusNet.IntentionalExit";
-        /// <summary>state.json 里的最近触发时间超过这个秒数，就认为引擎卡死。</summary>
+        /// <summary>state.json 里的最近触发时间超过这个秒数（且没有正在进行的登录）就认为引擎卡死。</summary>
         public const int StaleSeconds = 180;
+        /// <summary>动态阈值的上限：再怎么算也不能无限等下去。</summary>
+        public const int MaxStaleSeconds = 900;
         /// <summary>守护进程的检查间隔。</summary>
         public const int LoopIntervalSeconds = 30;
         private const int RestartCooldownSeconds = 15;
@@ -40,6 +42,8 @@ namespace CampusNet.Core
             {
                 ConsoleBridge.Attach();
                 ConsoleBridge.Line(decision + "：" + detail);
+                ConsoleBridge.Line("卡死阈值：" + EffectiveStaleSeconds() + " 秒（按当前配置的重试次数与超时算出，默认 "
+                    + StaleSeconds + " 秒，上限 " + MaxStaleSeconds + " 秒）");
                 ConsoleBridge.Line("重启命令：" + MainCommandLine(ResolveExe()));
                 return decision == "alive" ? 0 : (decision == "stale" ? 1 : 2);
             }
@@ -241,14 +245,46 @@ namespace CampusNet.Core
                 return "stale";
             }
 
+            int limit = EffectiveStaleSeconds();
             double age = (DateTime.Now - heartbeat.Value).TotalSeconds;
-            if (age > StaleSeconds)
+            if (age > limit)
             {
-                detail = "引擎已经 " + (int)age + " 秒没有动静";
+                detail = "引擎已经 " + (int)age + " 秒没有动静（阈值 " + limit + " 秒）";
                 return "stale";
             }
-            detail = "最近一次检查在 " + (int)Math.Max(0, age) + " 秒前";
+            detail = "最近一次检查在 " + (int)Math.Max(0, age) + " 秒前（阈值 " + limit + " 秒）";
             return "alive";
+        }
+
+        /// <summary>
+        /// 「卡死」阈值不能永远是 180 秒：把 RetryCount 调大后，一次登录流程本身就可能超过 180 秒
+        /// （每次提交都要等登录超时 + 状态查询超时），守护会把正在登录的进程杀掉重启，
+        /// 反而让网络更久不能恢复。这里按当前配置算出「一轮评估最多能花多久」，再加 90 秒余量，
+        /// 并夹在 [180, 900] 秒之间；引擎在登录流程里也会强制刷新心跳，两边互为保险。
+        /// </summary>
+        public static int EffectiveStaleSeconds()
+        {
+            int budgetSeconds = 0;
+            try
+            {
+                AppConfig config = AppConfig.Load(AppPaths.ConfigFile);
+                if (!config.Corrupted)
+                {
+                    // 探测：并行的每一轮约等于单条目标超时，复检 N 轮 + 内容补测两轮
+                    int perProbeMs = Math.Max(500, Math.Max(config.HttpProbeTimeoutMs, config.ProbeTimeoutMs)) + 1500;
+                    int probeRounds = Math.Max(1, config.ConfirmAttempts) + 2;
+                    // 登录：每次提交 = 登录超时 + 状态查询超时 + 固定等待（2 秒复检 + 1 秒余量）
+                    int perAttemptSeconds = Math.Max(1, config.LoginTimeoutSec) + Math.Max(1, config.StatusTimeoutSec) + 3;
+                    int loginSeconds = Math.Max(1, config.RetryCount) * perAttemptSeconds;
+                    budgetSeconds = (probeRounds * perProbeMs) / 1000
+                        + loginSeconds
+                        + Math.Max(0, config.LoginConfirmDelaySec)
+                        + (Math.Max(0, config.ConfirmGapMs) / 1000) + 1;
+                }
+            }
+            catch { }
+            int value = Math.Max(StaleSeconds, budgetSeconds + 90);
+            return Math.Min(MaxStaleSeconds, value);
         }
 
         private static bool IsMainInstanceRunning()

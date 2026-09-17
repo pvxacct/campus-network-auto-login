@@ -143,6 +143,9 @@ namespace CampusNet.Core
                 _config = config;
                 _portal = portal;
                 _credential = credential;
+                // 脱敏只认「当前这套凭据」：换账号后旧账号不该再被当成敏感词，新账号必须立刻受保护。
+                Redact.SetSecrets(credential != null ? credential.UserName : string.Empty,
+                    credential != null ? credential.Password : string.Empty);
                 // 状态对象永远不换新的：后台线程正握着自己的引用往状态里写，
                 // 换掉对象会让这一轮结果写进被丢弃的对象（状态丢失，甚至用旧内容覆盖状态文件）。
                 _state.CopyFrom(loaded);
@@ -158,6 +161,38 @@ namespace CampusNet.Core
         {
             _lastPersistUtc = DateTime.MinValue;
             _persistedStatusKey = null;
+        }
+
+        /// <summary>
+        /// 把一次「真正提交出去的登录请求」计入本小时窗口。
+        /// 关键：按请求计数，而不是按「一次登录流程」计数——否则 RetryCount 调大后
+        /// 3 次请求只算 1 次，12 次/小时的上限会被悄悄放大成 36 次。
+        /// </summary>
+        private int CountLoginAttempt(DateTime now)
+        {
+            lock (_gate)
+            {
+                DateTime? windowStart = _state.LoginWindowStartTime;
+                if (!windowStart.HasValue || (now - windowStart.Value).TotalHours >= 1)
+                {
+                    _state.LoginWindowStart = AppPaths.FormatTime(now);
+                    _state.LoginWindowCount = 0;
+                }
+                _state.LoginWindowCount++;
+                _state.LastLoginAttempt = AppPaths.FormatTime(now);
+                return _state.LoginWindowCount;
+            }
+        }
+
+        /// <summary>本小时窗口内已经提交了多少次登录（窗口过期返回 0）。</summary>
+        private int HourWindowCount(DateTime now)
+        {
+            lock (_gate)
+            {
+                DateTime? windowStart = _state.LoginWindowStartTime;
+                if (!windowStart.HasValue || (now - windowStart.Value).TotalHours >= 1) { return 0; }
+                return _state.LoginWindowCount;
+            }
         }
 
         public void Start()
@@ -625,28 +660,48 @@ namespace CampusNet.Core
             SetStatus("login-attempt", "检测到掉线，正在登录…");
             Persist(probe.LatencyMs, probe.LossPercent);
 
-            if (config.LoginHourlyLimit > 0)
-            {
-                lock (_gate)
-                {
-                    _state.LoginWindowCount++;
-                    _state.LastLoginAttempt = AppPaths.FormatTime(now);
-                }
-            }
-            else
-            {
-                lock (_gate) { _state.LastLoginAttempt = AppPaths.FormatTime(now); }
-            }
-
             bool success = false;
             bool unconfirmed = false;
             string lastMessage = string.Empty;
             string limitReason = string.Empty;
             string ignoredPrompt = string.Empty;
+            DateTime lastSubmit = now;
             for (int attempt = 1; attempt <= config.RetryCount; attempt++)
             {
-                _log.Info("第 " + attempt + "/" + config.RetryCount + " 次尝试登录（账号 " + credential.UserName + "）。");
+                // 每一次提交都要重新过闸门。RetryCount 只决定「一次触发最多提交几次」，
+                // 绝不能变成「几秒内连打 N 次」——那正是被 Portal 风控、甚至把自己会话顶掉的来源。
+                if (attempt > 1)
+                {
+                    if (config.LoginMinIntervalSeconds > 0)
+                    {
+                        double since = (DateTime.Now - lastSubmit).TotalSeconds;
+                        if (since < config.LoginMinIntervalSeconds)
+                        {
+                            _log.Info("已提交 " + (attempt - 1) + " 次登录，距最小间隔（"
+                                + config.LoginMinIntervalSeconds + " 秒）还差 "
+                                + (int)Math.Ceiling(config.LoginMinIntervalSeconds - since)
+                                + " 秒，本次不再重试，交给下一个周期。");
+                            break;
+                        }
+                    }
+                    if (config.LoginHourlyLimit > 0 && HourWindowCount(DateTime.Now) >= config.LoginHourlyLimit)
+                    {
+                        limitReason = "已达每小时登录上限";
+                        _log.Warn("本小时登录次数已达上限（" + config.LoginHourlyLimit + " 次），本次不再重试。");
+                        break;
+                    }
+                }
+
+                // 心跳：登录流程可能长时间占住评估线程（重试多、超时长），
+                // 这里每次提交前强制刷一次 state.json，免得守护进程把「正在登录」误判成「卡死」而杀掉重启。
+                lock (_gate) { _state.LastTrigger = AppPaths.FormatTime(DateTime.Now); }
+                Persist(probe.LatencyMs, probe.LossPercent, true);
+                CountLoginAttempt(now);
+
+                _log.Info("第 " + attempt + "/" + config.RetryCount + " 次尝试登录（账号 "
+                    + Redact.MaskUser(credential.UserName) + "）。");
                 PortalLoginResult result = portal.Login(credential.UserName, credential.Password);
+                lastSubmit = DateTime.Now;
                 lastMessage = result.Message;
                 string how = string.Empty;
 
@@ -690,12 +745,21 @@ namespace CampusNet.Core
                     ignoredPrompt = result.Message;
                     _log.WarnOnce("portal-prompt:" + lastMessage,
                         "Portal 提示（已忽略，继续按最小间隔重试）：" + lastMessage);
+                    if (result.AlreadyOnline || lastMessage.IndexOf("密码", StringComparison.Ordinal) >= 0)
+                    {
+                        _log.WarnOnce("en-md5-hint",
+                            "如果学校 Portal 要求 en_md5=1（密码按 MD5 提交），本工具只按明文提交，"
+                            + "会一直收到这类提示；这种情况请改用学校官方客户端。");
+                    }
                     if (WaitForRecovery(config, portal, out how))
                     {
                         success = true;
                         _log.Info("Portal 提示已忽略，复检确认网络已恢复（" + how + "）。");
                         break;
                     }
+                    // 复检没恢复就别再打第二次登录接口了：这类提示重试没有任何好处
+                    // （「账号已在别处在线」再打一次就是把刚建立的会话顶掉），交给最小间隔后的下一个周期。
+                    break;
                 }
                 else
                 {
@@ -703,7 +767,6 @@ namespace CampusNet.Core
                     _log.Warn("登录请求未成功：" + lastMessage);
                 }
 
-                if (attempt < config.RetryCount) { Thread.Sleep(2000); }
             }
 
             if (success)
@@ -905,7 +968,11 @@ namespace CampusNet.Core
             if (handler != null) { try { handler(Snapshot()); } catch { } }
         }
 
-        private void Persist(int latencyMs, int lossPercent)
+        /// <summary>
+        /// 写状态文件（带节流）。force = true 时无视节流立刻落盘，用于「登录流程心跳」这种
+        /// 守护进程必须马上看见的时刻。
+        /// </summary>
+        private void Persist(int latencyMs, int lossPercent, bool force = false)
         {
             lock (_gate)
             {
@@ -921,7 +988,7 @@ namespace CampusNet.Core
                     || _persistedIgnoredPrompts != _state.IgnoredPrompts
                     || !string.Equals(_persistedForcedRelogin, _state.LastForcedRelogin, StringComparison.Ordinal)
                     || !string.Equals(_persistedSessionCheck, _state.LastSessionCheck, StringComparison.Ordinal);
-                if (changed || (DateTime.UtcNow - _lastPersistUtc).TotalSeconds >= PersistMinIntervalSeconds)
+                if (force || changed || (DateTime.UtcNow - _lastPersistUtc).TotalSeconds >= PersistMinIntervalSeconds)
                 {
                     try { _state.Save(AppPaths.StateFile); } catch { }
                     _lastPersistUtc = DateTime.UtcNow;

@@ -449,6 +449,11 @@ namespace CampusNet.Core
 
         public void Save(string path)
         {
+            // 写盘前统一脱敏：Portal 的响应原文可能带着提交过的表单（含密码），
+            // 日志与状态文件都从这一个入口过一遍，避免哪条路径漏掉。
+            LastError = Redact.Text(LastError);
+            LastMessage = Redact.Text(LastMessage);
+            LastIgnoredPrompt = Redact.Text(LastIgnoredPrompt);
             var builder = new StringBuilder();
             builder.AppendLine("{");
             builder.AppendLine("  " + Json.String("Version", Version) + ",");

@@ -27,6 +27,12 @@ Windows 下的校园网 Portal 自动登录工具。2.0 把「自动登录」和
 - **不误报、不误发**：只有 Portal 明确回答「在线」才算登录成功（状态接口不可达记为「待确认」并继续复检）；
   登录请求禁止跟随跳转、响应必须来自同一台主机；`config.json` 损坏或探测目标全写错时会停下来提示，
   而不是拿着默认地址或坏配置继续登录。
+- **不往磁盘里写密码**：日志与状态文件在落盘前统一脱敏（密码一律 `***`，账号打码成 `251******`），
+  即使某校 Portal 把提交的表单回显在错误页里也一样；「复制诊断信息」读的就是这两处，粘贴出去同样干净。
+
+已知限制：本工具按**明文**提交密码（相当于 `en_md5=0`）。个别学校要求 `en_md5=1`
+（`upass = MD5(PID+密码+CALG)+CALG+PID`），这类 Portal 会一直回 `userid error2 / 密码错误`，
+日志里会有一条明确提示；目前请改用学校官方客户端。
 
 ## 下载与首次使用
 
@@ -128,7 +134,10 @@ CampusNet.exe --relogin       立即注销并重新登录
 CampusNet.exe --once          前台跑一轮检查后退出（用于验证）
 CampusNet.exe --run-seconds N 前台跑 N 秒后退出
 CampusNet.exe --install       安装到用户目录并开启开机自启
-CampusNet.exe --uninstall     卸载（加 --delete-data 连数据一起删）
+CampusNet.exe --uninstall     卸载（加 --delete-data 连数据一起删；卸载后程序会自动退出，
+                              由独立清理进程删除程序文件，删不掉则下次重启后消失）
+CampusNet.exe --uninstall --check-only
+                              只打印卸载计划（删哪些文件、文件什么时候消失），不删任何东西
 CampusNet.exe --set-credentials <账号> [--password-stdin]
 CampusNet.exe --selftest      界面自检（构建窗口、刷新一次后退出）
 CampusNet.exe --version
@@ -154,6 +163,7 @@ CampusNet.exe --version
 | `LoginConfirmDelaySec` | `3` | 登录前二次确认的等待秒数 |
 | `LoginMinIntervalSeconds` | `60` | 两次登录之间的硬性最小间隔 |
 | `LoginHourlyLimit` | `12` | 每小时登录次数上限 |
+| `RetryCount` | `1` | 一次触发内最多提交几次登录；**每次提交前都会重新检查最小间隔与每小时上限**，调大也不会绕过风控 |
 | `SessionCheckSeconds` | `300` | 在线时只读核对 Portal 会话的间隔（`0` = 关闭） |
 | `StuckReloginSeconds` | `60` | 本机连续不通但 Portal 说在线，超过这个秒数就自动注销重登（`0` = 关闭） |
 | `ConfigVersion` | `5` | 配置结构版本（自动迁移：60 秒探测 → 20 秒；旧的默认探测列表 → 新的四条默认；3 轮/1000 毫秒复检 → 2 轮/500 毫秒） |

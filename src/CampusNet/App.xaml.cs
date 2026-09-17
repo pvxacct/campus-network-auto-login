@@ -56,9 +56,27 @@ namespace CampusNet
                         RunSimple("安装", delegate(Logger log) { SelfInstaller.Install(log, HasFlag(args, "--desktop-shortcut")); });
                         return;
                     case "--uninstall":
+                        // --check-only：只打印卸载计划（删哪些文件、文件什么时候消失），不删任何东西。
+                        if (HasFlag(args, "--check-only"))
+                        {
+                            ConsoleBridge.Attach();
+                            ConsoleBridge.Line("卸载计划（未执行）：");
+                            foreach (string line in SelfInstaller.DescribeUninstallPlan(HasFlag(args, "--delete-data"), true))
+                            {
+                                ConsoleBridge.Line(line);
+                            }
+                            Shutdown(0);
+                            return;
+                        }
                         RunSimple("卸载", delegate(Logger log)
                         {
-                            SelfInstaller.Uninstall(log, HasFlag(args, "--delete-data"), true);
+                            UninstallResult result = SelfInstaller.Uninstall(log, HasFlag(args, "--delete-data"), true);
+                            if (result.WasInstalled)
+                            {
+                                ConsoleBridge.Line(result.DeleteScheduled
+                                    ? "程序文件将在本进程退出后被删除：" + AppPaths.InstalledExe
+                                    : "程序文件没能排入删除，请手动删除：" + AppPaths.InstalledExe);
+                            }
                         });
                         return;
                     case "--autostart":
@@ -240,6 +258,7 @@ namespace CampusNet
             }
             AppPaths.EnsureDataDir();
             CredentialStore.Save(AppPaths.CredentialFile, user, password);
+            Redact.SetSecrets(user, password);
             ConsoleBridge.Line("账号已保存（DPAPI 加密，仅当前 Windows 用户可解密）。");
             Shutdown(0);
         }
@@ -568,6 +587,21 @@ namespace CampusNet
                 AppPaths.DisplayName, MessageBoxButton.YesNo, MessageBoxImage.Question);
             if (answer != MessageBoxResult.Yes) { return; }
 
+            ShutdownForUser(0);
+        }
+
+        /// <summary>
+        /// 卸载后的退出：不再问一次（卸载本身已经确认过），但按「用户主动退出」处理——
+        /// 停守护、释放单实例互斥体，最关键的是让本进程真的退出，
+        /// 否则正在运行的 exe 删不掉，「已卸载」就成了假话。
+        /// </summary>
+        public void ExitAfterUninstall()
+        {
+            ShutdownForUser(0);
+        }
+
+        private void ShutdownForUser(int exitCode)
+        {
             _shuttingDown = true;
             if (_window != null) { _window.AllowClose(); }
             if (_tray != null) { _tray.Dispose(); _tray = null; }
@@ -576,7 +610,7 @@ namespace CampusNet
             Watchdog.SignalIntent();
             if (_showEvent != null) { try { _showEvent.Close(); } catch { } }
             if (_instanceMutex != null) { try { _instanceMutex.ReleaseMutex(); } catch { } }
-            Shutdown(0);
+            Shutdown(exitCode);
         }
     }
 }

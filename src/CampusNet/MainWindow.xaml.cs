@@ -444,29 +444,60 @@ namespace CampusNet
 
         private void AutoStart_Click(object sender, RoutedEventArgs e)
         {
-            SelfInstaller.SetAutoStart(AutoStartCheck.IsChecked == true, _log);
-            UpdateUi();
-            RefreshLog();
+            try
+            {
+                SelfInstaller.SetAutoStart(AutoStartCheck.IsChecked == true, _log);
+                UpdateUi();
+                RefreshLog();
+            }
+            catch (Exception ex)
+            {
+                // 用户点出来的动作出错必须让他看见：全局兜底只写 crash.log，界面会显得「点了没反应」。
+                _log.Error("设置开机自启失败：" + ex.Message);
+                MessageBox.Show("设置开机自启失败：" + ex.Message, AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         }
 
         private void Install_Click(object sender, RoutedEventArgs e)
         {
-            if (SelfInstaller.IsInstalled)
+            try
             {
-                MessageBoxResult answer = MessageBox.Show(
-                    "卸载会关闭开机自启、删除快捷方式并移除本机安装的程序文件。\n数据（账号、日志）默认保留。\n\n确定要卸载吗？",
-                    AppPaths.DisplayName, MessageBoxButton.YesNo, MessageBoxImage.Question);
-                if (answer != MessageBoxResult.Yes) { return; }
-                SelfInstaller.Uninstall(_log, false, true);
-                MessageBox.Show("已卸载。数据目录仍保留在：\n" + AppPaths.DataDir, AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
+                if (SelfInstaller.IsInstalled)
+                {
+                    MessageBoxResult answer = MessageBox.Show(
+                        "卸载会关闭开机自启、删除快捷方式，并在程序退出后删除程序文件。\n数据（账号、日志）默认保留。\n\n确定要卸载吗？",
+                        AppPaths.DisplayName, MessageBoxButton.YesNo, MessageBoxImage.Question);
+                    if (answer != MessageBoxResult.Yes) { return; }
+
+                    UninstallResult result = SelfInstaller.Uninstall(_log, false, true);
+                    if (result.WasInstalled)
+                    {
+                        MessageBox.Show(
+                            "已卸载：开机自启与快捷方式已移除，程序即将退出。\n\n"
+                            + "程序文件会在退出后立即删除；如果那时文件仍被占用（例如又开了别的副本），"
+                            + "系统会在下次重启后自动删除。\n\n数据目录仍保留在：\n" + AppPaths.DataDir,
+                            AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
+                        // 必须真的退出：正被占用的 exe 删不掉，留着只会让「已卸载」变成假话。
+                        ExitApplication();
+                        return;
+                    }
+                    MessageBox.Show(
+                        "已清理：开机自启与快捷方式已移除；本机没有已安装的程序文件（便携模式）。\n\n数据目录仍保留在：\n" + AppPaths.DataDir,
+                        AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                else
+                {
+                    SelfInstaller.Install(_log, false);
+                    MessageBox.Show("已安装到：\n" + AppPaths.InstalledExe + "\n\n并已开启开机自启。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                UpdateUi();
+                RefreshLog();
             }
-            else
+            catch (Exception ex)
             {
-                SelfInstaller.Install(_log, false);
-                MessageBox.Show("已安装到：\n" + AppPaths.InstalledExe + "\n\n并已开启开机自启。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
+                _log.Error("安装/卸载失败：" + ex.Message);
+                MessageBox.Show("操作失败：" + ex.Message, AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Error);
             }
-            UpdateUi();
-            RefreshLog();
         }
 
         private void OpenData_Click(object sender, RoutedEventArgs e)
@@ -484,24 +515,40 @@ namespace CampusNet
 
         private void Cleanup_Click(object sender, RoutedEventArgs e)
         {
-            LegacyReport report = LegacyCleanup.Detect();
-            if (!report.Any)
+            try
             {
-                MessageBox.Show("没有检测到旧版残留。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-            MessageBoxResult answer = MessageBox.Show(
-                "检测到旧版（1.x PowerShell 版）残留：\n" + report.Describe() + "\n\n"
-                + "清理会删除旧的计划任务与脚本目录（需要一次管理员确认，会弹出 UAC 窗口）。\n"
-                + "旧数据目录（含旧凭据与日志）会保留。\n\n确定要清理吗？",
-                AppPaths.DisplayName, MessageBoxButton.YesNo, MessageBoxImage.Question);
-            if (answer != MessageBoxResult.Yes) { return; }
+                LegacyReport report = LegacyCleanup.Detect();
+                if (!report.Any)
+                {
+                    MessageBox.Show("没有检测到旧版残留。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+                MessageBoxResult answer = MessageBox.Show(
+                    "检测到旧版（1.x PowerShell 版）残留：\n" + report.Describe() + "\n\n"
+                    + "清理会删除旧的计划任务与脚本目录（需要一次管理员确认，会弹出 UAC 窗口）。\n"
+                    + "旧数据目录（含旧凭据与日志）会保留。\n\n确定要清理吗？",
+                    AppPaths.DisplayName, MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (answer != MessageBoxResult.Yes) { return; }
 
-            bool ok = LegacyCleanup.RunElevated(false, _log);
-            RefreshLegacyHint();
-            RefreshLog();
-            MessageBox.Show(ok ? "旧版残留已清理。" : "清理未完成，可稍后重试或用管理员身份运行本程序再试一次。",
-                AppPaths.DisplayName, MessageBoxButton.OK, ok ? MessageBoxImage.Information : MessageBoxImage.Warning);
+                bool ok = LegacyCleanup.RunElevated(false, _log);
+                RefreshLegacyHint();
+                RefreshLog();
+                MessageBox.Show(ok ? "旧版残留已清理。" : "清理未完成，可稍后重试或用管理员身份运行本程序再试一次。",
+                    AppPaths.DisplayName, MessageBoxButton.OK, ok ? MessageBoxImage.Information : MessageBoxImage.Warning);
+            }
+            catch (Exception ex)
+            {
+                _log.Error("清理旧版残留失败：" + ex.Message);
+                MessageBox.Show("清理失败：" + ex.Message, AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>卸载后的退出：不再问一次（卸载本身已经确认过），但要按「用户主动退出」处理。</summary>
+        private static void ExitApplication()
+        {
+            App app = Application.Current as App;
+            if (app != null) { app.ExitAfterUninstall(); }
+            else { Application.Current.Shutdown(0); }
         }
 
         private void Relogin_Click(object sender, RoutedEventArgs e)

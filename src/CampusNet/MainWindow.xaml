@@ -176,24 +176,27 @@
 
                     <Expander Header="高级设置（改完自动保存）" Margin="0,12,0,0" FontSize="12.5">
                         <StackPanel Margin="0,8,0,0">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                        </Grid.RowDefinitions>
-                        <TextBlock Grid.Row="0" Grid.Column="0" Text="正常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
-                            <TextBox x:Name="OnlineProbeBox" Grid.Row="0" Grid.Column="1" Tag="OnlineProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <!-- 行数必须 >= 用到的最大 Grid.Row + 1：WPF 对越界行号不报错，
+                                     而是把它塞进最后一行，两个控件就叠印在一起（pre.7 的界面回归）。 -->
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Grid.Column="0" Text="正常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                                <TextBox x:Name="OnlineProbeBox" Grid.Row="0" Grid.Column="1" Tag="OnlineProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
                             <TextBlock Grid.Row="1" Grid.Column="0" Text="异常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
                             <TextBox x:Name="OfflineProbeBox" Grid.Row="1" Grid.Column="1" Tag="OfflineProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
                             <TextBlock Grid.Row="2" Grid.Column="0" Text="每小时登录上限（次）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
@@ -210,9 +213,9 @@
                             <TextBox x:Name="SessionCheckBox" Grid.Row="7" Grid.Column="1" Tag="SessionCheckSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
                             <TextBlock Grid.Row="8" Grid.Column="0" Text="残留会话自动重登（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
                             <TextBox x:Name="StuckReloginBox" Grid.Row="8" Grid.Column="1" Tag="StuckReloginSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
-                            <TextBlock Grid.Row="9" Grid.Column="0" Text="HTTP 探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,6,10,0" />
-                            <TextBox x:Name="HttpProbeTimeoutBox" Grid.Row="9" Grid.Column="1" Tag="HttpProbeTimeoutMs" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,6,0,0" />
-                        </Grid>
+                                <TextBlock Grid.Row="9" Grid.Column="0" Text="HTTP 探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,6,10,0" />
+                                <TextBox x:Name="HttpProbeTimeoutBox" Grid.Row="9" Grid.Column="1" Tag="HttpProbeTimeoutMs" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,6,0,0" />
+                            </Grid>
                             <TextBlock x:Name="AdvancedHint" Style="{StaticResource Caption}" Margin="0,6,0,0" TextWrapping="Wrap"
                                        Text="输入框改完（点开别处或按回车）即自动保存并立即生效。" />
                         </StackPanel>

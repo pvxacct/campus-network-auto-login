@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32;
 
@@ -42,8 +43,17 @@ namespace CampusNet.Core
             EnsureWatchdog(log);
         }
 
-        public static void Uninstall(Logger log, bool removeData, bool removeDesktopShortcut)
+        /// <summary>
+        /// 卸载：关自启、停守护、删快捷方式、（可选）删数据，最后安排删除程序文件。
+        ///
+        /// 为什么必须返回结果：正在运行的 exe 是删不掉的（Windows 不允许删除被映射的映像），
+        /// 老实现却照样弹「已卸载」，于是出现「说卸载了、文件还在、按钮又变回卸载」的自相矛盾。
+        /// 现在把「做了哪些事、文件什么时候消失」如实交给调用方，并由调用方在卸载后退出程序。
+        /// </summary>
+        public static UninstallResult Uninstall(Logger log, bool removeData, bool removeDesktopShortcut)
         {
+            var result = new UninstallResult();
+            result.WasInstalled = IsInstalled;
             SetAutoStart(false, log);
             RemoveWatchdog(log);
             TryDelete(AppPaths.StartMenuShortcut);
@@ -56,11 +66,50 @@ namespace CampusNet.Core
                 }
                 catch (Exception ex) { log.Warn("删除数据目录失败：" + ex.Message); }
             }
+            if (result.WasInstalled)
+            {
+                bool ok = ScheduleSelfDelete(AppPaths.InstalledExe, AppPaths.InstallDir, log,
+                    out result.RebootFallback, out result.CleanupScript);
+                result.DeleteScheduled = ok;
+                log.Info(ok
+                    ? "已安排删除 " + AppPaths.InstalledExe + "（本进程退出后由清理进程删除，重启后删除作兜底）。"
+                    : "安排删除 " + AppPaths.InstalledExe + " 失败，请手动删除该文件。");
+            }
+            else
+            {
+                log.Info("本机没有已安装的程序文件（可能一直在便携模式运行），只清理了自启与快捷方式。");
+            }
+            return result;
+        }
+
+        /// <summary>卸载计划（--uninstall --check-only 打印，供人在动手前确认，也供自动化断言）。</summary>
+        public static List<string> DescribeUninstallPlan(bool removeData, bool removeDesktopShortcut)
+        {
+            var lines = new List<string>();
+            lines.Add("程序路径：" + AppPaths.CurrentExe);
+            lines.Add("当前进程 PID：" + Process.GetCurrentProcess().Id);
+            lines.Add("1. 关闭开机自启（注册表 Run 项：" + RunValueName + "）");
+            lines.Add("2. 停止守护进程");
+            lines.Add("3. 删除开始菜单快捷方式：" + AppPaths.StartMenuShortcut);
+            lines.Add(removeDesktopShortcut
+                ? "4. 删除桌面快捷方式：" + AppPaths.DesktopShortcut
+                : "4. 保留桌面快捷方式");
+            lines.Add(removeData
+                ? "5. 删除数据目录：" + AppPaths.DataDir + "（账号、日志一并删除）"
+                : "5. 保留数据目录：" + AppPaths.DataDir);
             if (IsInstalled)
             {
-                ScheduleSelfDelete(AppPaths.InstalledExe);
-                log.Info("已安排删除 " + AppPaths.InstalledExe + "（程序退出后生效）。");
+                lines.Add("6. 删除已安装的程序文件：" + AppPaths.InstalledExe);
+                lines.Add("   · 本进程正在运行该文件，现在删不掉；会先写一个独立清理进程，");
+                lines.Add("     等本进程退出后立即删除（最多等 240 秒），并删除空的安装目录；");
+                lines.Add("   · 同时登记「重启后删除」作为兜底，删除失败时最迟下次重启消失。");
             }
+            else
+            {
+                lines.Add("6. 本机没有已安装的程序文件（便携模式），无需删除");
+            }
+            lines.Add("（--check-only：以上只是计划，本次不删除任何文件）");
+            return lines;
         }
 
         public static bool IsAutoStartEnabled
@@ -196,18 +245,81 @@ namespace CampusNet.Core
             try { if (File.Exists(path)) { File.Delete(path); } } catch { }
         }
 
-        private static void ScheduleSelfDelete(string exePath)
+        private const int MoveFileDelayUntilReboot = 0x4;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool MoveFileEx(string existingFileName, string newFileName, int flags);
+
+        /// <summary>
+        /// 安排删除「正在运行的自己」。
+        ///
+        /// 主路径：写一个独立 .cmd 到临时目录，由它等本进程退出后删除 exe、再删空的安装目录。
+        /// 之所以落成脚本文件而不是把路径拼进命令行：路径不出现在命令行里就没有转义 / 注入问题
+        /// （老实现是 cmd /c ping … &amp; del "路径"，路径里出现引号就会被截断）。
+        /// 兜底：MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)，普通权限写不进
+        /// PendingFileRenameOperations 时会失败，失败也无妨——主路径才是日常生效的那条。
+        /// </summary>
+        private static bool ScheduleSelfDelete(string exePath, string installDir, Logger log,
+            out bool rebootFallback, out string scriptPath)
         {
+            scriptPath = string.Empty;
+            int pid = Process.GetCurrentProcess().Id;
+
+            try { rebootFallback = MoveFileEx(exePath, null, MoveFileDelayUntilReboot); }
+            catch { rebootFallback = false; }
+            if (!rebootFallback && log != null)
+            {
+                log.Info("「重启后删除」登记未成功（普通权限下常见），改由清理进程在本进程退出后直接删除。");
+            }
+
             try
             {
-                var info = new ProcessStartInfo("cmd.exe", "/c ping -n 3 127.0.0.1 > nul & del /f /q \"" + exePath + "\"");
+                scriptPath = Path.Combine(Path.GetTempPath(), "CampusNet-cleanup-" + pid + ".cmd");
+                var text = new StringBuilder();
+                text.AppendLine("@echo off");
+                text.AppendLine("rem 由「校园网自动登录」生成：等主进程退出后删除程序文件。");
+                text.AppendLine("setlocal");
+                text.AppendLine("for /l %%i in (1,1,120) do (");
+                text.AppendLine("  tasklist /fi \"PID eq " + pid + "\" /nh | find \"" + pid + "\" >nul || goto gone");
+                text.AppendLine("  ping -n 2 127.0.0.1 >nul");
+                text.AppendLine(")");
+                text.AppendLine(":gone");
+                text.AppendLine("for /l %%i in (1,1,15) do (");
+                text.AppendLine("  del /f /q \"" + exePath + "\" >nul 2>nul");
+                text.AppendLine("  if not exist \"" + exePath + "\" goto removed");
+                text.AppendLine("  ping -n 2 127.0.0.1 >nul");
+                text.AppendLine(")");
+                text.AppendLine(":removed");
+                text.AppendLine("rd \"" + installDir + "\" >nul 2>nul");
+                text.AppendLine("del /f /q \"%~f0\" >nul 2>nul");
+                File.WriteAllText(scriptPath, text.ToString(), Encoding.ASCII);
+
+                var info = new ProcessStartInfo("cmd.exe", "/c \"" + scriptPath + "\"");
                 info.UseShellExecute = false;
                 info.CreateNoWindow = true;
                 info.WindowStyle = ProcessWindowStyle.Hidden;
                 Process.Start(info);
+                return true;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                if (log != null) { log.Warn("安排清理进程失败：" + ex.Message); }
+                return false;
+            }
         }
+    }
+
+    /// <summary>卸载到底做了什么：界面据此如实提示，不再出现「说卸载了但文件还在」。</summary>
+    public sealed class UninstallResult
+    {
+        /// <summary>本机是否存在已安装的程序文件（便携模式运行时为 false）。</summary>
+        public bool WasInstalled;
+        /// <summary>是否已经安排好「本进程退出后删除程序文件」。</summary>
+        public bool DeleteScheduled;
+        /// <summary>是否成功登记了「重启后删除」兜底。</summary>
+        public bool RebootFallback;
+        /// <summary>清理脚本路径（排障用，正常用户看不到）。</summary>
+        public string CleanupScript = string.Empty;
     }
 
     public sealed class LegacyReport

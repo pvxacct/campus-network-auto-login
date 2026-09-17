@@ -14,7 +14,7 @@ namespace CampusNet.Core
     {
         public const string AppName = "CampusNet";
         public const string DisplayName = "校园网自动登录";
-        public const string Version = "2.0.0-pre.7";
+        public const string Version = "2.0.0-pre.8";
 
         /// <summary>旧版（1.x PowerShell 版）残留位置，仅用于检测与清理。</summary>
         public const string LegacyScriptDir = @"C:\CampusAutoLogin";
@@ -342,6 +342,7 @@ namespace CampusNet.Core
 
         public void Write(string level, string message)
         {
+            message = Redact.Text(message);
             string line = AppPaths.FormatTime(DateTime.Now) + " [" + level + "] " + message;
             lock (_gate)
             {

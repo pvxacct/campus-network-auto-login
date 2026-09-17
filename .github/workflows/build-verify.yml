@@ -38,13 +38,25 @@ jobs:
           $exe = 'src\CampusNet\bin\Release\net48\CampusNet.exe'
           $version = (& $exe --version | Out-String).Trim()
           Write-Host "版本：$version"
-          if ($version -ne '2.0.0-pre.7') { throw "版本号不符合预期：$version" }
+          if ($version -ne '2.0.0-pre.8') { throw "版本号不符合预期：$version" }
           & $exe --status
 
       - name: Verify committed exe
         shell: pwsh
         run: |
           if (-not (Test-Path 'dist\CampusNet.exe')) { throw '仓库缺少 dist\CampusNet.exe' }
+          if (-not (Test-Path 'dist\CampusNet.exe.src.sha256')) {
+            throw '仓库缺少 dist\CampusNet.exe.src.sha256（源码指纹）——请运行 build\Build-CampusNet.ps1 并提交 dist 下的产物。'
+          }
+          # 硬门禁：源码指纹不一致 = 改了源码没重新生成产物，直接失败。
+          # 只比二进制会因为编译器版本差异误报（同样源码能差几十字节），所以二进制比对保持「警告」。
+          $expected = ((Get-Content 'dist\CampusNet.exe.src.sha256' -Raw) -split '\s+')[0]
+          $actual = (& build\Get-SourceFingerprint.ps1 | Out-String).Trim()
+          Write-Host "提交的源码指纹：$expected"
+          Write-Host "本次源码指纹：$actual"
+          if ($expected -ne $actual) {
+            throw 'dist\CampusNet.exe 与当前源码不一致（改了源码没重新生成产物）。请在本机运行 build\Build-CampusNet.ps1，并提交 dist 下的 exe 与两个校验文件。'
+          }
           $built = (Get-FileHash 'src\CampusNet\bin\Release\net48\CampusNet.exe' -Algorithm SHA256).Hash
           $committed = (Get-FileHash 'dist\CampusNet.exe' -Algorithm SHA256).Hash
           Write-Host "构建产物：$built"
@@ -54,7 +66,7 @@ jobs:
           Write-Host "exe 版本：$exeVersion"
           if ($tag -and -not $tag.StartsWith($exeVersion)) { throw "标签 $tag 与 exe 版本 $exeVersion 不一致" }
           if ($built -ne $committed) {
-            Write-Warning '已提交的 dist\CampusNet.exe 与本次构建的字节不一致（编译器版本差异）。发布前请用 build\Build-CampusNet.ps1 重新生成。'
+            Write-Warning '已提交的 dist\CampusNet.exe 与本次构建的字节不一致（编译器版本差异，源码指纹已通过，属正常情况）。'
           }
 
       - name: Run end-to-end tests

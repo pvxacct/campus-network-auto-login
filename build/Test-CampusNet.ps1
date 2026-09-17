@@ -523,7 +523,169 @@ Assert '迁移后写入 ConfigVersion=5' ($confirmMigrated.ConfigVersion -eq 5) 
 $confirmCustom = Invoke-ConfirmMigration -Name 's23-custom' -Attempts 4 -Gap 1500
 Assert '自定义复检参数不被改写' ($confirmCustom.ConfirmAttempts -eq 4 -and $confirmCustom.ConfirmGapMs -eq 1500) `
     "Attempts=$($confirmCustom.ConfirmAttempts) Gap=$($confirmCustom.ConfirmGapMs)"
+
+# ------------------------------------------------------------------ pre.8：审查发现的 6 类问题
+
+function New-RawConfig {
+    param(
+        [string]$PortalHost,
+        [string[]]$Targets,
+        [int]$RetryCount = 1,
+        [int]$MinInterval = 60,
+        [int]$HourlyLimit = 12,
+        [int]$OnlineProbe = 20,
+        [int]$OfflineProbe = 2,
+        [int]$LoginTimeout = 5,
+        [int]$StatusTimeout = 5
+    )
+    $cfg = [ordered]@{
+        PortalHost              = $PortalHost
+        EportalPort             = 801
+        StatusPath              = '/drcom/chkstatus'
+        LoginPath               = '/drcom/login'
+        LogoutPath              = '/drcom/logout'
+        ErrorPromptPath         = '/eportal/portal/err_code/loadErrorPrompt'
+        OnlineProbeSeconds      = $OnlineProbe
+        OfflineProbeSeconds     = $OfflineProbe
+        ProbeTimeoutMs          = 500
+        HttpProbeTimeoutMs      = 1200
+        ConfirmAttempts         = 2
+        ConfirmGapMs            = 200
+        ProbeTargets            = @($Targets)
+        LoginConfirmDelaySec    = 1
+        LoginMinIntervalSeconds = $MinInterval
+        LoginHourlyLimit        = $HourlyLimit
+        SessionCheckSeconds     = 300
+        StuckReloginSeconds     = 60
+        StatusTimeoutSec        = $StatusTimeout
+        LoginTimeoutSec         = $LoginTimeout
+        RetryCount              = $RetryCount
+        StaticFields            = [ordered]@{ '0MKKey' = '123456' }
+    }
+    return ($cfg | ConvertTo-Json -Depth 5)
+}
+
+function Invoke-RawRun {
+    param([string]$Name, [string]$Scenario, [string]$ConfigText, [int]$Seconds = 10,
+        [string]$User = 'testuser', [string]$Password = 'testpass')
+    $dir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir 'config.json') -Value $ConfigText -Encoding UTF8
+    $logPath = Join-Path $dir 'portal-requests.log'
+    $portal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
+        -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', $Scenario, '-Port', $Port, '-LogPath', $logPath
+    Start-Sleep -Milliseconds 900
+    try {
+        Set-TestCredentials -Dir $dir -User $User -Password $Password
+        $output = & $Exe '--run-seconds' $Seconds '--data-dir' $dir 2>&1 | Out-String
+    }
+    finally {
+        try { Stop-Process -Id $portal.Id -Force -ErrorAction SilentlyContinue } catch { }
+        Start-Sleep -Milliseconds 200
+    }
+    $requests = @()
+    if (Test-Path -LiteralPath $logPath) { $requests = Get-Content -LiteralPath $logPath | Where-Object { $_ -match '^(GET|POST) ' } }
+    $stateText = ''
+    $stateFile = Join-Path $dir 'state.json'
+    if (Test-Path -LiteralPath $stateFile) { $stateText = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 }
+    $state = if ($stateText) { $stateText | ConvertFrom-Json } else { [pscustomobject]@{ LastResult = ''; LastError = ''; LoginWindowCount = 0 } }
+    $logText = ''
+    $localLog = Join-Path $dir 'login.log'
+    if (Test-Path -LiteralPath $localLog) { $logText = Get-Content -LiteralPath $localLog -Raw -Encoding UTF8 }
+    return [pscustomobject]@{
+        Dir = $dir; Requests = $requests; State = $state; StateText = $stateText; Log = $logText; Output = $output
+        Status = (@($requests | Where-Object { $_ -match 'chkstatus' }).Count)
+        Login = (@($requests | Where-Object { $_ -match 'login' }).Count)
+    }
+}
 Write-Host ''
+# 场景 24：Portal 把提交的表单回显出来 → 密码与账号都不能落进日志 / state.json
+# （「复制诊断信息」读的就是这两处，它们干净 = 剪贴板干净）
+$n = Invoke-RawRun -Name 's24-redact' -Scenario 'echo-form' -Seconds 12 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65014')) `
+    -User 'sectestacct' -Password 'SecretPass123'
+Assert '日志里不出现密码原文' ($n.Log -notmatch 'SecretPass123') '密码落进了 login.log'
+Assert 'state.json 里不出现密码原文' ($n.StateText -notmatch 'SecretPass123') '密码落进了 state.json'
+Assert '日志里 upass 的值被打码' ($n.Log -match 'upass=\*\*\*') 'upass 没有被替换成 ***'
+Assert '日志里不出现完整账号' ($n.Log -notmatch 'sectestacct') '完整账号落进了 login.log'
+Assert '日志里账号显示为掩码' ($n.Log -match 'sec\*{8}') '账号没有按掩码写入'
+Assert 'state.json 里不出现完整账号' ($n.StateText -notmatch 'sectestacct') '完整账号落进了 state.json'
+
+# 场景 25：RetryCount=3 但最小间隔 60 秒 → 一次触发只提交 1 次，其余交给下一个周期
+$n = Invoke-RawRun -Name 's25-retry-interval' -Scenario 'garbage' -Seconds 12 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65015') -RetryCount 3 -MinInterval 60)
+Assert '重试不再绕过最小间隔（只提交 1 次）' ($n.Login -eq 1) "login=$($n.Login)，RetryCount=3 时 60 秒内不该再提交"
+Assert '日志写明按最小间隔停止重试' ($n.Log -match '最小间隔') '日志里没有最小间隔相关说明'
+
+# 场景 26：最小间隔设为 0（测试专用）→ 3 次重试确实提交 3 次，且小时计数按请求累加
+$n = Invoke-RawRun -Name 's26-retry-counted' -Scenario 'garbage' -Seconds 14 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65016') -RetryCount 3 -MinInterval 0)
+Assert '放开最小间隔后每轮 3 次重试都提交' ($n.Login -ge 3 -and ($n.Login % 3) -eq 0) "login=$($n.Login)，应为 3 的整数倍"
+Assert '每小时计数与真正提交的次数一致' ($n.State.LoginWindowCount -eq $n.Login) "LoginWindowCount=$($n.State.LoginWindowCount) login=$($n.Login)"
+
+# 场景 27：守护的「卡死」阈值随配置放宽，不再把正在登录的进程杀掉
+$dynDir = Join-Path $work 's27-watchdog-dynamic'
+New-Item -ItemType Directory -Force -Path $dynDir | Out-Null
+Set-Content -LiteralPath (Join-Path $dynDir 'config.json') `
+    -Value (New-RawConfig -PortalHost '127.0.0.1:65099' -Targets @('tcp:127.0.0.1:65017') `
+        -RetryCount 6 -LoginTimeout 15 -StatusTimeout 8) -Encoding UTF8
+Write-TestState -Dir $dynDir -AgeSeconds 200
+$watchDyn = Invoke-WatchdogCheck -DataDir $dynDir
+$watchSlowDir = Join-Path $work 's27-watchdog-default'
+Write-TestState -Dir $watchSlowDir -AgeSeconds 200
+$watchSlow = Invoke-WatchdogCheck -DataDir $watchSlowDir
+if ($mainRunning) {
+    Assert '大 RetryCount 下 200 秒心跳仍判 alive' ($watchDyn.Exit -eq 0) "exit=$($watchDyn.Exit)"
+    Assert '默认配置下 200 秒心跳仍判 stale' ($watchSlow.Exit -eq 1) "exit=$($watchSlow.Exit)"
+}
+Assert '守护自检会打印卡死阈值' ($watchDyn.Text -match '卡死阈值') '自检输出里没有阈值'
+Assert '阈值随配置放大（>180 秒）' ($watchDyn.Text -match '卡死阈值：2[0-9][0-9] 秒') '阈值没有随配置放大'
+
+# 场景 28：--uninstall --check-only 只打印计划，不删任何东西
+$planDir = Join-Path $work 's28-uninstall-plan'
+New-Item -ItemType Directory -Force -Path $planDir | Out-Null
+$marker = Join-Path $planDir 'state.json'
+Set-Content -LiteralPath $marker -Value '{ "LastResult": "online" }' -Encoding UTF8
+$planOut = Join-Path $planDir 'uninstall-plan.txt'
+$planProc = Start-Process -FilePath $Exe -ArgumentList '--uninstall', '--check-only', '--data-dir', $planDir `
+    -RedirectStandardOutput $planOut -Wait -PassThru
+$planText = ''
+if (Test-Path -LiteralPath $planOut) { $planText = Get-Content -LiteralPath $planOut -Raw -Encoding UTF8 }
+Assert '卸载计划退出码为 0' ($planProc.ExitCode -eq 0) "exit=$($planProc.ExitCode)"
+Assert '卸载计划含程序文件路径' ($planText -match 'CampusNet\.exe') '计划里没提到程序文件'
+Assert '卸载计划含当前 PID' ($planText -match 'PID') '计划里没有 PID'
+Assert '卸载计划说明重启兜底' ($planText -match '重启') '计划里没写重启兜底'
+Assert '--check-only 不删数据目录' (Test-Path -LiteralPath $marker) '数据文件被删了'
+
+# 场景 29：界面布局扫描——任何 Grid 用到未声明的行/列都要失败。
+# WPF 对越界行号不报错，而是把控件塞进最后一行：pre.7 的高级设置整行叠印就是这么来的。
+$xamlPath = Join-Path $repo 'src\CampusNet\MainWindow.xaml'
+[xml]$xamlDoc = Get-Content -LiteralPath $xamlPath -Raw -Encoding UTF8
+$ns = New-Object System.Xml.XmlNamespaceManager($xamlDoc.NameTable)
+$ns.AddNamespace('x', 'http://schemas.microsoft.com/winfx/2006/xaml/presentation')
+$overflow = New-Object System.Collections.Generic.List[string]
+$gridIndex = 0
+$maxRows = 0
+foreach ($grid in $xamlDoc.SelectNodes('//x:Grid', $ns)) {
+    $gridIndex++
+    $rows = $grid.SelectNodes('x:Grid.RowDefinitions/x:RowDefinition', $ns).Count
+    $cols = $grid.SelectNodes('x:Grid.ColumnDefinitions/x:ColumnDefinition', $ns).Count
+    if ($rows -gt $maxRows) { $maxRows = $rows }
+    foreach ($child in $grid.SelectNodes('*', $ns)) {
+        if ($child.LocalName -eq 'Grid.RowDefinitions' -or $child.LocalName -eq 'Grid.ColumnDefinitions') { continue }
+        $row = $child.GetAttribute('Grid.Row')
+        $col = $child.GetAttribute('Grid.Column')
+        if ($row -ne '' -and [int]$row -ge $rows) {
+            $overflow.Add("第 $gridIndex 个 Grid 的 $($child.LocalName) 用到 Grid.Row=$row，只声明了 $rows 行")
+        }
+        if ($col -ne '' -and [int]$col -ge $cols) {
+            $overflow.Add("第 $gridIndex 个 Grid 的 $($child.LocalName) 用到 Grid.Column=$col，只声明了 $cols 列")
+        }
+    }
+}
+Assert '界面 XAML 没有行列越界' ($overflow.Count -eq 0) ($overflow -join '；')
+Assert '高级设置网格至少声明 10 行' ($maxRows -ge 10) "最多只声明了 $maxRows 行"
+
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ''
 if ($failures -gt 0) {
