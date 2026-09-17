@@ -18,6 +18,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 $portalScript = Join-Path $repo 'build\FakePortal.ps1'
 $failures = 0
 $results = New-Object System.Collections.Generic.List[string]
+$script:lastRun = $null
 
 function Write-Config {
     param(
@@ -63,6 +64,84 @@ function Set-TestCredentials {
     $Password | & $Exe '--set-credentials' $User '--password-stdin' '--data-dir' $Dir | Out-Null
 }
 
+# 「断网」场景需要一个确定连不上的探测目标。以前这里写死 tcp:127.0.0.1:650xx，
+# 而 Windows 的动态端口范围是 49152-65535：运行器上别的进程完全可能临时监听到同一个
+# 端口（CI 上真的发生过一次），于是探测「通过」→ 程序判定在线 → 整个场景静默失效，
+# 表现成「日志里没有登录记录」。现在改成先列一遍本机正在监听的端口，只挑没人听的那个。
+# 用「谁在监听」而不是「连一次试试」：本机与 runner 上被拒绝的连接要等 SYN 重传（约 2 秒）
+# 才返回，逐个端口试会白白拖慢整个用例集。
+$script:listeningPorts = $null
+function Get-ListeningTcpPorts {
+    if ($null -ne $script:listeningPorts) { return $script:listeningPorts }
+    $ports = New-Object 'System.Collections.Generic.HashSet[int]'
+    try {
+        foreach ($conn in (Get-NetTCPConnection -State Listen -ErrorAction Stop)) { [void]$ports.Add([int]$conn.LocalPort) }
+    } catch {
+    }
+    if ($ports.Count -eq 0) {
+        foreach ($line in (& netstat -ano -p TCP)) {
+            if ($line -match '^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING') { [void]$ports.Add([int]$Matches[1]) }
+        }
+    }
+    $script:listeningPorts = $ports
+    return $ports
+}
+$script:offlineTargetPorts = @{}
+function Get-OfflineLoopbackPort {
+    param([int]$Preferred)
+    if ($script:offlineTargetPorts.ContainsKey($Preferred)) { return $script:offlineTargetPorts[$Preferred] }
+    $listening = Get-ListeningTcpPorts
+    # 先试场景原本用的端口，再退到 1-64：低位端口 Windows 不会当动态端口分配出去。
+    $candidates = @($Preferred) + (1..64)
+    foreach ($candidate in $candidates) {
+        if (-not $listening.Contains($candidate)) {
+            $script:offlineTargetPorts[$Preferred] = $candidate
+            return $candidate
+        }
+    }
+    throw "找不到没人监听的回环端口，无法构造「断网」场景（候选：$($candidates -join ',')）。"
+}
+function Off-Target {
+    param([int]$Preferred)
+    return "tcp:127.0.0.1:$(Get-OfflineLoopbackPort -Preferred $Preferred)"
+}
+
+# 等假 Portal 真正开始监听再启动被测程序。固定 sleep 在冷启动的 runner 上不够：
+# Portal 还没起来时程序每轮都只会报 unreachable，时间窗跑完都不会去登录（假失败）。
+function Wait-PortalReady {
+    param([string]$LogPath, [int]$TimeoutMs = 30000)
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $LogPath) {
+            $first = @(Get-Content -LiteralPath $LogPath -TotalCount 1 -ErrorAction SilentlyContinue)[0]
+            if ($first -and $first.StartsWith('START ')) { return }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "假 Portal 在 $TimeoutMs 毫秒内没有就绪：$LogPath"
+}
+
+# 断言失败时把「现场」一并写进 FAIL 行：CI 会把 FAIL 行做成注解，
+# 这样下次不必只凭失败名字猜原因。
+function Get-RunDiagnostic {
+    $run = $script:lastRun
+    if (-not $run) { return '' }
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($run.Name) { $parts.Add('场景=' + $run.Name) }
+    if ($null -ne $run.ExitCode) { $parts.Add('exit=' + $run.ExitCode) }
+    if ($null -ne $run.Status) { $parts.Add('chkstatus=' + $run.Status + ' login=' + $run.Login) }
+    if ($run.State) { $parts.Add('LastResult=' + $run.State.LastResult) }
+    $requests = @($run.Requests)
+    if ($requests.Count -gt 0) { $parts.Add('请求：' + (($requests | Select-Object -Last 4) -join ' / ')) }
+    if ($run.Log) {
+        $tail = ((@($run.Log -split "`r?`n") | Where-Object { $_ } | Select-Object -Last 3) -join ' | ')
+        $parts.Add('日志尾：' + $tail)
+    }
+    $text = $parts -join '；'
+    if ($text.Length -gt 700) { $text = $text.Substring(0, 700) + '…' }
+    return $text
+}
+
 function Invoke-Scenario {
     param(
         [string]$Name,
@@ -83,11 +162,13 @@ function Invoke-Scenario {
 
     $portal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
         -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', $Scenario, '-Port', $Port, '-LogPath', $logPath
-    Start-Sleep -Milliseconds 900
+    Wait-PortalReady -LogPath $logPath
 
+    $exitCode = $null
     try {
         Set-TestCredentials -Dir $dataDir
         $output = & $Exe '--run-seconds' $Seconds '--data-dir' $dataDir 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
     }
     finally {
         try { Stop-Process -Id $portal.Id -Force -ErrorAction SilentlyContinue } catch { }
@@ -110,10 +191,12 @@ function Invoke-Scenario {
     $localLog = Join-Path $dataDir 'login.log'
     if (Test-Path -LiteralPath $localLog) { $logContent = Get-Content -LiteralPath $localLog -Raw -Encoding UTF8 }
 
-    return [pscustomobject]@{
+    $run = [pscustomobject]@{
         Name = $Name; Status = $status; Login = $login; Logout = $logout
-        Requests = $requests; State = $state; Output = $output; Log = $logContent
+        Requests = $requests; State = $state; Output = $output; Log = $logContent; ExitCode = $exitCode
     }
+    $script:lastRun = $run
+    return $run
 }
 
 function Assert {
@@ -122,6 +205,8 @@ function Assert {
         $results.Add("PASS  $Name")
     } else {
         $script:failures++
+        $diag = Get-RunDiagnostic
+        if ($diag) { $Detail = $Detail + '｜现场：' + $diag }
         $results.Add("FAIL  $Name  -> $Detail")
     }
 }
@@ -138,18 +223,18 @@ Assert '启动时订阅了系统网络变化事件' ($n.Log -match '已订阅网
 
 # 场景 2：断网 → 自动登录成功
 $n = Invoke-Scenario -Name 's2-offline-login' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
-    -Targets @('tcp:127.0.0.1:65001') -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
+    -Targets @(Off-Target 65001) -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
 Assert '断网后自动登录且只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
 Assert '登录成功后状态为 login-ok/online' ($n.State.LastResult -eq 'login-ok' -or $n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
 
 # 场景 3：第一次显示离线、复检已在线 → 不登录
 $n = Invoke-Scenario -Name 's3-confirm' -Scenario 'confirm-online' -PortalHost "127.0.0.1:$Port" `
-    -Targets @('tcp:127.0.0.1:65002') -Seconds 12 -OnlineProbe 2 -OfflineProbe 2
+    -Targets @(Off-Target 65002) -Seconds 12 -OnlineProbe 2 -OfflineProbe 2
 Assert '复检在线时不登录' ($n.Login -eq 0) "login=$($n.Login)"
 
 # 场景 4：Portal 限流 → 本次不再重试，原因写进状态（不再有冷却）
 $n = Invoke-Scenario -Name 's4-ratelimit' -Scenario 'rate-limited' -PortalHost "127.0.0.1:$Port" `
-    -Targets @('tcp:127.0.0.1:65003') -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
+    -Targets @(Off-Target 65003) -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
 Assert '限流后只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
 Assert '限流后结果记为 login-throttled' ($n.State.LastResult -eq 'login-throttled') "LastResult=$($n.State.LastResult)"
 Assert '限流原因写入状态' ($n.State.LastError -match '限流') "LastError=$($n.State.LastError)"
@@ -158,7 +243,7 @@ Assert 'state.json 不再有冷却字段' (-not ($n.State.PSObject.Properties.Na
 
 # 场景 5：Portal 提示「账号已在别处在线 / 密码错误」→ 完全忽略，不记失败、不写「最近错误」
 $n = Invoke-Scenario -Name 's5-conflict' -Scenario 'conflict' -PortalHost "127.0.0.1:$Port" `
-    -Targets @('tcp:127.0.0.1:65004') -Seconds 30 -OnlineProbe 2 -OfflineProbe 2
+    -Targets @(Off-Target 65004) -Seconds 30 -OnlineProbe 2 -OfflineProbe 2
 Assert 'error2 后只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
 Assert 'error2 不再记为登录失败' ($n.State.LastResult -eq 'login-retry') "LastResult=$($n.State.LastResult)"
 Assert 'error2 不写「最近错误」' ([string]::IsNullOrEmpty($n.State.LastError)) "LastError=$($n.State.LastError)"
@@ -169,7 +254,7 @@ Assert 'state.json 不再出现 login-conflict' ($n.State.LastResult -ne 'login-
 
 # 场景 6：登录接口回了完全无法识别的响应 → 这才是真正的失败，照实记录
 $n = Invoke-Scenario -Name 's6-mininterval' -Scenario 'garbage' -PortalHost "127.0.0.1:$Port" `
-    -Targets @('tcp:127.0.0.1:65005') -Seconds 16 -OnlineProbe 2 -OfflineProbe 1
+    -Targets @(Off-Target 65005) -Seconds 16 -OnlineProbe 2 -OfflineProbe 1
 Assert '失败后 60 秒内不重复登录' ($n.Login -eq 1) "login=$($n.Login)（16 秒内应只有 1 次）"
 Assert '无法识别的登录响应记为 login-failed' ($n.State.LastResult -eq 'login-failed') "LastResult=$($n.State.LastResult)"
 Assert '真正的失败原因写入状态' ($n.State.LastError -match '未知响应') "LastError=$($n.State.LastError)"
@@ -184,6 +269,7 @@ function Invoke-ConfigMigration {
     param([string]$Name, [int]$OnlineProbe)
     $dir = Join-Path $work $Name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $offlineTarget = Off-Target 65001
     $legacy = [ordered]@{
         PortalHost             = '127.0.0.1:65010'
         OnlineProbeSeconds     = $OnlineProbe
@@ -191,7 +277,7 @@ function Invoke-ConfigMigration {
         ConfirmAttempts        = 1
         ConfirmGapMs           = 200
         LoginCooldownMinutes   = 30
-        ProbeTargets           = @('tcp:127.0.0.1:65001')
+        ProbeTargets           = @($offlineTarget)
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
@@ -234,7 +320,7 @@ $migrated = Invoke-ConfigMigration -Name 's8-migrate' -OnlineProbe 60
 Assert '旧默认 60 秒迁移为 20 秒' ($migrated.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($migrated.OnlineProbeSeconds)"
 Assert '迁移后写入 ConfigVersion=6' ($migrated.ConfigVersion -eq 6) "ConfigVersion=$($migrated.ConfigVersion)"
 Assert '迁移后剔除 LoginCooldownMinutes' (-not ($migrated.PSObject.Properties.Name -contains 'LoginCooldownMinutes')) '仍存在该键'
-Assert '迁移后保留自定义 ProbeTargets' (($migrated.ProbeTargets -join ',') -eq 'tcp:127.0.0.1:65001') "ProbeTargets=$($migrated.ProbeTargets -join ',')"
+Assert '迁移后保留自定义 ProbeTargets' (($migrated.ProbeTargets -join ',') -eq (Off-Target 65001)) "ProbeTargets=$($migrated.ProbeTargets -join ',')"
 
 $custom = Invoke-ConfigMigration -Name 's8-custom' -OnlineProbe 45
 Assert '自定义 45 秒不会被改写' ($custom.OnlineProbeSeconds -eq 45) "OnlineProbeSeconds=$($custom.OnlineProbeSeconds)"
@@ -307,7 +393,7 @@ Assert '真 204 后状态为 online' ($n.State.LastResult -eq 'online') "LastRes
 
 # 场景 15：登录接口回「已在别处在线」，但复检确认网络其实已恢复 → 直接算成功
 $n = Invoke-Scenario -Name 's15-error2-recovered' -Scenario 'conflict-then-online' -PortalHost "127.0.0.1:$Port" `
-    -Targets @('tcp:127.0.0.1:65007') -Seconds 20 -OnlineProbe 2 -OfflineProbe 2
+    -Targets @(Off-Target 65007) -Seconds 20 -OnlineProbe 2 -OfflineProbe 2
 Assert 'error2 后复检在线即算登录成功' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
 Assert 'error2 恢复场景只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
 
@@ -375,7 +461,7 @@ if (-not $preexisting) {
 # 场景 18：登录接口回成功、但状态接口随即不可达 → 必须算「待确认」，不能算登录成功
 #（这是 pre.6 的严重误报：after.Online || !after.Reachable 会把「Portal 挂了 + 没联上网」记成 login-ok）
 $n = Invoke-Scenario -Name 's18-unconfirmed' -Scenario 'drop-after-login' -PortalHost "127.0.0.1:$Port" `
-    -Targets @('tcp:127.0.0.1:65011') -Seconds 34 -OnlineProbe 2 -OfflineProbe 2
+    -Targets @(Off-Target 65011) -Seconds 34 -OnlineProbe 2 -OfflineProbe 2
 Assert '状态接口不可达时不算登录成功' ($n.State.LastResult -eq 'login-unconfirmed') "LastResult=$($n.State.LastResult)"
 Assert '待确认时不写「登录成功」时间' ([string]::IsNullOrEmpty($n.State.LastLoginSuccess)) "LastLoginSuccess=$($n.State.LastLoginSuccess)"
 Assert '待确认时只提交一次登录' ($n.Login -eq 1) "login=$($n.Login)"
@@ -397,10 +483,12 @@ function Invoke-RawScenario {
     $logPath = Join-Path $dir 'portal-requests.log'
     $portal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
         -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', $Scenario, '-Port', $Port, '-LogPath', $logPath
-    Start-Sleep -Milliseconds 900
+    Wait-PortalReady -LogPath $logPath
+    $exitCode = $null
     try {
         if (-not $SkipCredentials) { Set-TestCredentials -Dir $dir }
         $output = & $Exe '--run-seconds' $Seconds '--data-dir' $dir 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
     }
     finally {
         try { Stop-Process -Id $portal.Id -Force -ErrorAction SilentlyContinue } catch { }
@@ -417,11 +505,14 @@ function Invoke-RawScenario {
     $logContent = ''
     $localLog = Join-Path $dir 'login.log'
     if (Test-Path -LiteralPath $localLog) { $logContent = Get-Content -LiteralPath $localLog -Raw -Encoding UTF8 }
-    return [pscustomobject]@{
-        Dir = $dir; Requests = $requests; State = $state; Log = $logContent; Output = $output
+    $run = [pscustomobject]@{
+        Name = $Name; Dir = $dir; Requests = $requests; State = $state; Log = $logContent; Output = $output
         Status = (@($requests | Where-Object { $_ -match 'chkstatus' }).Count)
         Login = (@($requests | Where-Object { $_ -match 'login' }).Count)
+        ExitCode = $exitCode
     }
+    $script:lastRun = $run
+    return $run
 }
 
 # 场景 20：config.json 损坏 → 停止自动登录、提示用户、一个 Portal 请求都不发
@@ -482,7 +573,7 @@ Set-Content -LiteralPath (Join-Path $fourDir 'config.json') -Value (New-Blackhol
 $bhLog = Join-Path $work 's22-portal.log'
 $bhPortal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
     -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', 'blackhole', '-Port', $Port, '-LogPath', $bhLog
-Start-Sleep -Milliseconds 900
+Wait-PortalReady -LogPath $bhLog
 try {
     $swOne = [System.Diagnostics.Stopwatch]::StartNew()
     $outOne = & $Exe '--diagnose' '--data-dir' $oneDir 2>&1 | Out-String
@@ -509,6 +600,7 @@ function Invoke-ConfirmMigration {
     param([string]$Name, [int]$Attempts, [int]$Gap)
     $dir = Join-Path $work $Name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $offlineTarget = Off-Target 65013
     $legacy = [ordered]@{
         ConfigVersion        = 4
         PortalHost           = "127.0.0.1:$Port"
@@ -517,7 +609,7 @@ function Invoke-ConfirmMigration {
         ProbeTimeoutMs       = 500
         ConfirmAttempts      = $Attempts
         ConfirmGapMs         = $Gap
-        ProbeTargets         = @("tcp:127.0.0.1:65013")
+        ProbeTargets         = @($offlineTarget)
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
@@ -584,10 +676,12 @@ function Invoke-RawRun {
     $logPath = Join-Path $dir 'portal-requests.log'
     $portal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
         -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', $Scenario, '-Port', $Port, '-LogPath', $logPath
-    Start-Sleep -Milliseconds 900
+    Wait-PortalReady -LogPath $logPath
+    $exitCode = $null
     try {
         Set-TestCredentials -Dir $dir -User $User -Password $Password
         $output = & $Exe '--run-seconds' $Seconds '--data-dir' $dir 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
     }
     finally {
         try { Stop-Process -Id $portal.Id -Force -ErrorAction SilentlyContinue } catch { }
@@ -602,17 +696,20 @@ function Invoke-RawRun {
     $logText = ''
     $localLog = Join-Path $dir 'login.log'
     if (Test-Path -LiteralPath $localLog) { $logText = Get-Content -LiteralPath $localLog -Raw -Encoding UTF8 }
-    return [pscustomobject]@{
-        Dir = $dir; Requests = $requests; State = $state; StateText = $stateText; Log = $logText; Output = $output
+    $run = [pscustomobject]@{
+        Name = $Name; Dir = $dir; Requests = $requests; State = $state; StateText = $stateText; Log = $logText; Output = $output
         Status = (@($requests | Where-Object { $_ -match 'chkstatus' }).Count)
         Login = (@($requests | Where-Object { $_ -match 'login' }).Count)
+        ExitCode = $exitCode
     }
+    $script:lastRun = $run
+    return $run
 }
 Write-Host ''
 # 场景 24：Portal 把提交的表单回显出来 → 密码与账号都不能落进日志 / state.json
 # （「复制诊断信息」读的就是这两处，它们干净 = 剪贴板干净）
 $n = Invoke-RawRun -Name 's24-redact' -Scenario 'echo-form' -Seconds 16 `
-    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65014')) `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @(Off-Target 65014)) `
     -User 'sectestacct' -Password 'SecretPass123'
 Assert '日志里不出现密码原文' ($n.Log -notmatch 'SecretPass123') '密码落进了 login.log'
 Assert 'state.json 里不出现密码原文' ($n.StateText -notmatch 'SecretPass123') '密码落进了 state.json'
@@ -623,13 +720,13 @@ Assert 'state.json 里不出现完整账号' ($n.StateText -notmatch 'sectestacc
 
 # 场景 25：RetryCount=3 但最小间隔 60 秒 → 一次触发只提交 1 次，其余交给下一个周期
 $n = Invoke-RawRun -Name 's25-retry-interval' -Scenario 'garbage' -Seconds 16 `
-    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65015') -RetryCount 3 -MinInterval 60)
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @(Off-Target 65015) -RetryCount 3 -MinInterval 60)
 Assert '重试不再绕过最小间隔（只提交 1 次）' ($n.Login -eq 1) "login=$($n.Login)，RetryCount=3 时 60 秒内不该再提交"
 Assert '日志写明按最小间隔停止重试' ($n.Log -match '最小间隔') '日志里没有最小间隔相关说明'
 
 # 场景 26：最小间隔设为 0（测试专用）→ 3 次重试确实提交 3 次，且小时计数按请求累加
 $n = Invoke-RawRun -Name 's26-retry-counted' -Scenario 'garbage' -Seconds 16 `
-    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65016') -RetryCount 3 -MinInterval 0)
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @(Off-Target 65016) -RetryCount 3 -MinInterval 0)
 Assert '放开最小间隔后每轮 3 次重试都提交' ($n.Login -ge 3 -and ($n.Login % 3) -eq 0) "login=$($n.Login)，应为 3 的整数倍"
 Assert '每小时计数与真正提交的次数一致' ($n.State.LoginWindowCount -eq $n.Login) "LoginWindowCount=$($n.State.LoginWindowCount) login=$($n.Login)"
 
@@ -637,7 +734,7 @@ Assert '每小时计数与真正提交的次数一致' ($n.State.LoginWindowCoun
 $dynDir = Join-Path $work 's27-watchdog-dynamic'
 New-Item -ItemType Directory -Force -Path $dynDir | Out-Null
 Set-Content -LiteralPath (Join-Path $dynDir 'config.json') `
-    -Value (New-RawConfig -PortalHost '127.0.0.1:65099' -Targets @('tcp:127.0.0.1:65017') `
+    -Value (New-RawConfig -PortalHost '127.0.0.1:65099' -Targets @(Off-Target 65017) `
         -RetryCount 6 -LoginTimeout 15 -StatusTimeout 8) -Encoding UTF8
 Write-TestState -Dir $dynDir -AgeSeconds 200
 $watchDyn = Invoke-WatchdogCheck -DataDir $dynDir
@@ -699,6 +796,7 @@ function Invoke-SessionMigration {
     param([string]$Name, [int]$SessionCheck)
     $dir = Join-Path $work $Name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $offlineTarget = Off-Target 65015
     $legacy = [ordered]@{
         ConfigVersion        = 5
         PortalHost           = "127.0.0.1:$Port"
@@ -707,7 +805,7 @@ function Invoke-SessionMigration {
         ProbeTimeoutMs       = 500
         SessionCheckSeconds  = $SessionCheck
         UpstreamProbeSeconds = 300
-        ProbeTargets         = @('tcp:127.0.0.1:65015')
+        ProbeTargets         = @($offlineTarget)
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
@@ -742,7 +840,7 @@ Write-Config -Path (Join-Path $reloginDir 'config.json') -PortalHost "127.0.0.1:
 $reloginRequestLog = Join-Path $reloginDir 'portal-requests.log'
 $reloginPortal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
     -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', 'online', '-Port', $Port, '-LogPath', $reloginRequestLog
-Start-Sleep -Milliseconds 900
+Wait-PortalReady -LogPath $reloginRequestLog
 try {
     Set-TestCredentials -Dir $reloginDir
     $swRelogin = [System.Diagnostics.Stopwatch]::StartNew()
