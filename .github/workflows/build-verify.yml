@@ -73,5 +73,19 @@ jobs:
         shell: pwsh
         run: |
           $exe = (Resolve-Path 'src\CampusNet\bin\Release\net48\CampusNet.exe').Path
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Test-CampusNet.ps1 -Exe $exe
-          if ($LASTEXITCODE -ne 0) { throw '端到端测试未通过' }
+          $log = Join-Path $env:RUNNER_TEMP 'e2e.log'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\Test-CampusNet.ps1 -Exe $exe 2>&1 |
+            Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            # 把失败断言变成 GitHub 注解：Actions 的原始日志只有仓库管理员能下载，
+            # 注解却能用公开 API 读到，出问题时不必再靠猜。
+            $fails = @(Select-String -Path $log -Pattern '^FAIL' | Select-Object -First 12)
+            if ($fails.Count -eq 0) {
+              Write-Host '::error title=端到端测试失败::没有 FAIL 行，可能中途异常退出，见日志尾部'
+            }
+            foreach ($f in $fails) { Write-Host ('::error title=端到端断言失败::{0}' -f $f.Line.Trim()) }
+            $tail = ((Get-Content -LiteralPath $log -Tail 15) -join ' | ')
+            Write-Host ('::error title=日志尾部::{0}' -f $tail)
+            throw "端到端测试未通过（退出码 $code）"
+          }

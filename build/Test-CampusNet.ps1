@@ -601,7 +601,7 @@ function Invoke-RawRun {
 Write-Host ''
 # 场景 24：Portal 把提交的表单回显出来 → 密码与账号都不能落进日志 / state.json
 # （「复制诊断信息」读的就是这两处，它们干净 = 剪贴板干净）
-$n = Invoke-RawRun -Name 's24-redact' -Scenario 'echo-form' -Seconds 12 `
+$n = Invoke-RawRun -Name 's24-redact' -Scenario 'echo-form' -Seconds 16 `
     -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65014')) `
     -User 'sectestacct' -Password 'SecretPass123'
 Assert '日志里不出现密码原文' ($n.Log -notmatch 'SecretPass123') '密码落进了 login.log'
@@ -612,13 +612,13 @@ Assert '日志里账号显示为掩码' ($n.Log -match 'sec\*{8}') '账号没有
 Assert 'state.json 里不出现完整账号' ($n.StateText -notmatch 'sectestacct') '完整账号落进了 state.json'
 
 # 场景 25：RetryCount=3 但最小间隔 60 秒 → 一次触发只提交 1 次，其余交给下一个周期
-$n = Invoke-RawRun -Name 's25-retry-interval' -Scenario 'garbage' -Seconds 12 `
+$n = Invoke-RawRun -Name 's25-retry-interval' -Scenario 'garbage' -Seconds 16 `
     -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65015') -RetryCount 3 -MinInterval 60)
 Assert '重试不再绕过最小间隔（只提交 1 次）' ($n.Login -eq 1) "login=$($n.Login)，RetryCount=3 时 60 秒内不该再提交"
 Assert '日志写明按最小间隔停止重试' ($n.Log -match '最小间隔') '日志里没有最小间隔相关说明'
 
 # 场景 26：最小间隔设为 0（测试专用）→ 3 次重试确实提交 3 次，且小时计数按请求累加
-$n = Invoke-RawRun -Name 's26-retry-counted' -Scenario 'garbage' -Seconds 14 `
+$n = Invoke-RawRun -Name 's26-retry-counted' -Scenario 'garbage' -Seconds 16 `
     -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @('tcp:127.0.0.1:65016') -RetryCount 3 -MinInterval 0)
 Assert '放开最小间隔后每轮 3 次重试都提交' ($n.Login -ge 3 -and ($n.Login % 3) -eq 0) "login=$($n.Login)，应为 3 的整数倍"
 Assert '每小时计数与真正提交的次数一致' ($n.State.LoginWindowCount -eq $n.Login) "LoginWindowCount=$($n.State.LoginWindowCount) login=$($n.Login)"
@@ -647,15 +647,42 @@ New-Item -ItemType Directory -Force -Path $planDir | Out-Null
 $marker = Join-Path $planDir 'state.json'
 Set-Content -LiteralPath $marker -Value '{ "LastResult": "online" }' -Encoding UTF8
 $planOut = Join-Path $planDir 'uninstall-plan.txt'
-$planProc = Start-Process -FilePath $Exe -ArgumentList '--uninstall', '--check-only', '--data-dir', $planDir `
-    -RedirectStandardOutput $planOut -Wait -PassThru
-$planText = ''
-if (Test-Path -LiteralPath $planOut) { $planText = Get-Content -LiteralPath $planOut -Raw -Encoding UTF8 }
-Assert '卸载计划退出码为 0' ($planProc.ExitCode -eq 0) "exit=$($planProc.ExitCode)"
-Assert '卸载计划含程序文件路径' ($planText -match 'CampusNet\.exe') '计划里没提到程序文件'
-Assert '卸载计划含当前 PID' ($planText -match 'PID') '计划里没有 PID'
-Assert '卸载计划说明重启兜底' ($planText -match '重启') '计划里没写重启兜底'
-Assert '--check-only 不删数据目录' (Test-Path -LiteralPath $marker) '数据文件被删了'
+# 计划文本随「本机有没有已安装的程序文件」而不同：CI 是干净机器（走便携分支），
+# 开发机通常已经装过（走删除分支）。两条分支都要真跑一遍——
+# 缺的那条用我们自己建的占位文件补上，检查完立刻删掉（绝不碰真实安装的文件）。
+$installedExe = Join-Path $env:LOCALAPPDATA 'Programs\CampusNet\CampusNet.exe'
+$installedDir = Split-Path -Parent $installedExe
+$placeholderMade = $false
+if (-not (Test-Path -LiteralPath $installedExe)) {
+    $portableProc = Start-Process -FilePath $Exe -ArgumentList '--uninstall', '--check-only', '--data-dir', $planDir `
+        -RedirectStandardOutput $planOut -Wait -PassThru
+    $portableText = ''
+    if (Test-Path -LiteralPath $planOut) { $portableText = Get-Content -LiteralPath $planOut -Raw -Encoding UTF8 }
+    Assert '便携模式计划退出码为 0' ($portableProc.ExitCode -eq 0) "exit=$($portableProc.ExitCode)"
+    Assert '便携模式计划写明无需删除' ($portableText -match '无需删除') '便携模式下没说清楚'
+    New-Item -ItemType Directory -Force -Path $installedDir | Out-Null
+    Set-Content -LiteralPath $installedExe -Value 'placeholder for uninstall-plan test' -Encoding ASCII
+    $placeholderMade = $true
+}
+try {
+    $planProc = Start-Process -FilePath $Exe -ArgumentList '--uninstall', '--check-only', '--data-dir', $planDir `
+        -RedirectStandardOutput $planOut -Wait -PassThru
+    $planText = ''
+    if (Test-Path -LiteralPath $planOut) { $planText = Get-Content -LiteralPath $planOut -Raw -Encoding UTF8 }
+    Assert '卸载计划退出码为 0' ($planProc.ExitCode -eq 0) "exit=$($planProc.ExitCode)"
+    Assert '卸载计划含程序文件路径' ($planText -match 'CampusNet\.exe') '计划里没提到程序文件'
+    Assert '卸载计划含当前 PID' ($planText -match 'PID') '计划里没有 PID'
+    Assert '卸载计划说明重启兜底' ($planText -match '重启') '计划里没写重启兜底'
+    Assert '--check-only 不删数据目录' (Test-Path -LiteralPath $marker) '数据文件被删了'
+}
+finally {
+    if ($placeholderMade -and (Test-Path -LiteralPath $installedExe)) {
+        Remove-Item -LiteralPath $installedExe -Force
+        if ((Test-Path -LiteralPath $installedDir) -and -not (Get-ChildItem -LiteralPath $installedDir -Force)) {
+            Remove-Item -LiteralPath $installedDir -Force
+        }
+    }
+}
 
 # 场景 29：界面布局扫描——任何 Grid 用到未声明的行/列都要失败。
 # WPF 对越界行号不报错，而是把控件塞进最后一行：pre.7 的高级设置整行叠印就是这么来的。
