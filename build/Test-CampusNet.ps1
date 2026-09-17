@@ -833,7 +833,10 @@ Assert '登录后 25~40 秒内确认恢复（老写法要等满 60 秒窗口）'
 $n = Invoke-RawRun -Name 's34-instant-content' -Scenario 'instant-content' -Seconds 12 `
     -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" `
         -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -OfflineProbe 2 -MinInterval 60)
-Assert '登录后立刻复检命中（日志出现 +0 秒）' ($n.Log -match '\+0 秒') '日志里没有「+0 秒」的复检记录'
+Assert '登录后立刻复检命中（首轮立刻命中）' ($n.Log -match '本地内容校验通过（首轮立刻命中）') '日志里没有「首轮立刻命中」的记录'
+$instantDelta = Get-LogSecondsBetween -Log $n.Log -FromPattern '次尝试登录' -ToPattern '网络已恢复'
+Assert '登录到确认恢复 ≤ 2 秒（老写法最早也要等 3 秒）' ($instantDelta -ge 0 -and $instantDelta -le 2) `
+    "登录到恢复相隔 $instantDelta 秒"
 Assert '瞬时生效直接判为登录成功' ($n.State.LastResult -eq 'login-ok' -or $n.State.LastResult -eq 'online') `
     "LastResult=$($n.State.LastResult)"
 

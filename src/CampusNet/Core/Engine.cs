@@ -1043,10 +1043,12 @@ namespace CampusNet.Core
         {
             how = string.Empty;
             // 第 0 轮：立刻看一眼。登录瞬间生效时不必先白等 3 秒（老写法固定先睡 3 秒再查）。
+            // 注意别把这一轮写成「+0 秒」：ContentCheck 内部会并行跑两轮、每轮都有独立超时，
+            // 真机上这一轮实测可能要 4 秒。所以写成「首轮立刻命中」，只表达「这是立刻的那一轮」。
             int initialLatency;
             if (NetworkProbe.ContentCheck(config, out initialLatency))
             {
-                how = "本地内容校验通过（+0 秒）";
+                how = "本地内容校验通过（首轮立刻命中）";
                 return true;
             }
             int elapsed = 0;
