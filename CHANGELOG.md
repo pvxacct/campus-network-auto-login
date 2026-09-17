@@ -47,7 +47,8 @@
 - **发布链路硬门禁**：构建脚本新增源码指纹 `dist/CampusNet.exe.src.sha256`
   （由 csproj + `src/**/*.cs` + `src/**/*.xaml` + 构建脚本算出，**排除 `bin/` 与 `obj/` 里的
   编译生成文件**——那里的 `App.g.cs`、`*.AssemblyInfo.cs` 带本机绝对路径，谁算谁不一样）。
-  `build-verify` 与 `create-release`
+  指纹还对路径与换行做了归一（正斜杠 + CRLF→LF），Windows 与 Linux 算出同一个值；
+  `create-release` 的门禁单独跑在 Windows runner 上复核。`build-verify` 与 `create-release`
   在指纹不一致时**直接失败**，堵住「改了源码忘重建就发版」；二进制逐字节比对仍为警告，
   因为不同编译器版本会差几十字节（同样源码实测差 100 字节）。
 

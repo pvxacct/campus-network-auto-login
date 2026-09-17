@@ -26,7 +26,29 @@ permissions:
   contents: write
 
 jobs:
+  # 发布前的源码指纹门禁：防止「改了源码忘了重建」的产物被发出去。
+  # 单独跑在 Windows 上——发布任务在 ubuntu 上，脚本虽然已经把路径与换行都归一化过，
+  # 但同平台复核一次更稳妥（pre.8 上线时正是这一步在 Linux 上算不出来）。
+  verify-source:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify source fingerprint
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/CampusNet.exe.src.sha256')) {
+            throw '缺少 dist/CampusNet.exe.src.sha256（源码指纹）——请运行 build/Build-CampusNet.ps1 并提交产物。'
+          }
+          $expected = ((Get-Content 'dist/CampusNet.exe.src.sha256' -Raw) -split '\s+')[0]
+          $actual = (& build/Get-SourceFingerprint.ps1 | Out-String).Trim()
+          Write-Host "提交的源码指纹：$expected"
+          Write-Host "本次源码指纹：$actual"
+          if ($expected -ne $actual) { throw '源码指纹不一致，拒绝发布：请先重新生成并提交 dist 产物。' }
+
   release:
+    needs: verify-source
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -50,19 +72,6 @@ jobs:
           fi
           ls -l dist/CampusNet.exe
           sha256sum dist/CampusNet.exe
-
-      # 发布前再卡一次源码指纹：防止「改了源码忘了重建」的产物被发出去。
-      - name: Verify source fingerprint
-        shell: pwsh
-        run: |
-          if (-not (Test-Path 'dist/CampusNet.exe.src.sha256')) {
-            throw '缺少 dist/CampusNet.exe.src.sha256（源码指纹）——请运行 build/Build-CampusNet.ps1 并提交产物。'
-          }
-          $expected = ((Get-Content 'dist/CampusNet.exe.src.sha256' -Raw) -split '\s+')[0]
-          $actual = (& build/Get-SourceFingerprint.ps1 | Out-String).Trim()
-          Write-Host "提交的源码指纹：$expected"
-          Write-Host "本次源码指纹：$actual"
-          if ($expected -ne $actual) { throw '源码指纹不一致，拒绝发布：请先重新生成并提交 dist 产物。' }
 
       - name: Publish release
         env:
