@@ -11,7 +11,7 @@ namespace CampusNet.Core
     public sealed class AppConfig
     {
         /// <summary>配置文件结构版本：小于当前值的老配置会在加载时自动迁移一次。</summary>
-        public const int CurrentConfigVersion = 5;
+        public const int CurrentConfigVersion = 6;
 
         public const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -84,8 +84,12 @@ namespace CampusNet.Core
         public int LoginMinIntervalSeconds = 60;
         public int LoginHourlyLimit = 12;
 
-        /// <summary>在线时每隔多少秒只读核对一次 Portal 会话（0 = 关闭）。</summary>
-        public int SessionCheckSeconds = 300;
+        /// <summary>
+        /// 在线时每隔多少秒只读核对一次 Portal 会话（0 = 关闭）。
+        /// 这是「账号被踢下线」最主要的发现途径：间隔越短，被踢后恢复得越快。
+        /// 默认 120 秒 —— 实测 300 秒时「发现断网」的中位延迟高达 166 秒（最坏 410 秒）。
+        /// </summary>
+        public int SessionCheckSeconds = 120;
 
         /// <summary>
         /// 本机探测连续不通、但 Portal 说账号还在线时的容忍秒数；
@@ -256,6 +260,8 @@ namespace CampusNet.Core
             //             换成「小米 204 + 百度 + 微软 + TCP 兜底」四条，误判与状态闪跳都明显更少。
             //   v4 -> v5：复检默认值 3 轮 / 1000 毫秒 收紧为 2 轮 / 500 毫秒。
             //             配合「每个目标并行探测」，完全断网时从判定到提交登录由几十秒压到十几秒。
+            //   v5 -> v6：会话核对间隔默认 300 秒缩短为 120 秒（被踢下线后发现的更快），
+            //             疑似掉线核对的最小间隔由 60 秒降到 20 秒（内部常量，不占配置键）。
             if (config.ConfigVersion < CurrentConfigVersion)
             {
                 if (SameTargets(config.ProbeTargets, LegacyProbeTargets)
@@ -264,6 +270,8 @@ namespace CampusNet.Core
                     config.ProbeTargets = new List<string>(new AppConfig().ProbeTargets);
                 }
                 if (config.OnlineProbeSeconds == 60) { config.OnlineProbeSeconds = 20; }
+                // 只改「等于旧默认值 300」的那一份；用户自己填过的值（例如 240 / 600）原样保留。
+                if (config.SessionCheckSeconds == 300) { config.SessionCheckSeconds = 120; }
                 if (config.ConfirmAttempts == 3 && config.ConfirmGapMs == 1000)
                 {
                     config.ConfirmAttempts = new AppConfig().ConfirmAttempts;
@@ -404,6 +412,8 @@ namespace CampusNet.Core
         public string LastLoginSuccess = string.Empty;
         public string LastSessionCheck = string.Empty;
         public string LastSessionResult = string.Empty;
+        /// <summary>上一次会话核对的来源：periodic（定时巡检）/ suspect（疑似掉线核对）。</summary>
+        public string LastSessionCheckKind = string.Empty;
         public string LoginWindowStart = string.Empty;
         public int LoginWindowCount;
         public long RunCount;
@@ -435,6 +445,7 @@ namespace CampusNet.Core
             state.LastLoginSuccess = Json.GetString(map, "LastLoginSuccess", string.Empty);
             state.LastSessionCheck = Json.GetString(map, "LastSessionCheck", string.Empty);
             state.LastSessionResult = Json.GetString(map, "LastSessionResult", string.Empty);
+            state.LastSessionCheckKind = Json.GetString(map, "LastSessionCheckKind", string.Empty);
             state.LoginWindowStart = Json.GetString(map, "LoginWindowStart", string.Empty);
             state.LoginWindowCount = Json.GetInt(map, "LoginWindowCount", 0);
             state.RunCount = Json.GetInt(map, "RunCount", 0);
@@ -467,6 +478,7 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.String("LastLoginSuccess", LastLoginSuccess) + ",");
             builder.AppendLine("  " + Json.String("LastSessionCheck", LastSessionCheck) + ",");
             builder.AppendLine("  " + Json.String("LastSessionResult", LastSessionResult) + ",");
+            builder.AppendLine("  " + Json.String("LastSessionCheckKind", LastSessionCheckKind) + ",");
             builder.AppendLine("  " + Json.String("LoginWindowStart", LoginWindowStart) + ",");
             builder.AppendLine("  " + Json.Number("LoginWindowCount", LoginWindowCount) + ",");
             builder.AppendLine("  " + Json.Number("RunCount", RunCount) + ",");
@@ -499,6 +511,7 @@ namespace CampusNet.Core
             LastLoginSuccess = other.LastLoginSuccess;
             LastSessionCheck = other.LastSessionCheck;
             LastSessionResult = other.LastSessionResult;
+            LastSessionCheckKind = other.LastSessionCheckKind;
             LoginWindowStart = other.LoginWindowStart;
             LoginWindowCount = other.LoginWindowCount;
             RunCount = other.RunCount;

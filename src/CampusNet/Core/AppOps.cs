@@ -464,7 +464,8 @@ namespace CampusNet.Core
             builder.AppendLine("会话核对  ：" + (string.IsNullOrEmpty(snapshot.LastSessionCheck)
                 ? "尚未核对"
                 : Display(AppPaths.ParseTime(snapshot.LastSessionCheck)) + Since(AppPaths.ParseTime(snapshot.LastSessionCheck))
-                    + "（" + DescribeSession(snapshot.LastSessionResult) + "）"));
+                    + "（" + DescribeSession(snapshot.LastSessionResult)
+                    + (string.IsNullOrEmpty(snapshot.LastSessionCheckKind) ? string.Empty : " · " + DescribeSessionKind(snapshot.LastSessionCheckKind)) + "）"));
             builder.AppendLine("连续失败  ：" + snapshot.ConsecutiveFailures + " 次；本小时登录 " + snapshot.LoginWindowCount + " 次");
             builder.AppendLine("暂停      ：" + (snapshot.Paused ? "是" + (snapshot.PauseUntil.HasValue ? "，直到 " + Display(snapshot.PauseUntil) : string.Empty) : "否"));
             builder.AppendLine("最近错误  ：" + (string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError));
@@ -533,6 +534,17 @@ namespace CampusNet.Core
                 case "offline": return "Portal 显示账号已离线";
                 case "unreachable": return "Portal 不可达";
                 default: return string.IsNullOrEmpty(key) ? "—" : key;
+            }
+        }
+
+        /// <summary>会话核对的来源：定时巡检 / 疑似掉线核对（后者说明本机探测已经不对劲）。</summary>
+        private static string DescribeSessionKind(string kind)
+        {
+            switch (kind)
+            {
+                case "periodic": return "定时巡检";
+                case "suspect": return "疑似掉线核对";
+                default: return string.Empty;
             }
         }
 

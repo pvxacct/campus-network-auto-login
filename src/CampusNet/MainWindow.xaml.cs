@@ -713,7 +713,20 @@ namespace CampusNet
         {
             DateTime? time = AppPaths.ParseTime(snapshot.LastSessionCheck);
             if (!time.HasValue) { return "尚未核对"; }
-            return Relative(time) + " · " + SessionResultText(snapshot.LastSessionResult);
+            string kind = SessionKindText(snapshot.LastSessionCheckKind);
+            return Relative(time) + " · " + SessionResultText(snapshot.LastSessionResult)
+                + (string.IsNullOrEmpty(kind) ? string.Empty : " · " + kind);
+        }
+
+        /// <summary>会话核对的来源：定时巡检 / 疑似掉线核对。</summary>
+        private static string SessionKindText(string kind)
+        {
+            switch (kind)
+            {
+                case "periodic": return "定时巡检";
+                case "suspect": return "疑似掉线核对";
+                default: return string.Empty;
+            }
         }
 
         private static string SessionResultText(string key)

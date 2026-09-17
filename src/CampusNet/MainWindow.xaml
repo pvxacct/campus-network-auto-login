@@ -37,8 +37,11 @@
             </DockPanel>
         </Border>
 
-        <!-- 主体 -->
-        <Grid Grid.Row="2">
+        <!-- 主体：内容比窗口高时出现滚动条。默认窗口高度下，展开「高级设置」后最后一行
+             （HTTP 探测超时）会被挤出可视区，用户看不到也改不了，所以这里必须能滚动。 -->
+        <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                      Padding="0,0,6,0" Focusable="False">
+        <Grid>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="1.15*" />
                 <ColumnDefinition Width="12" />
@@ -223,6 +226,7 @@
                 </StackPanel>
             </Border>
         </Grid>
+        </ScrollViewer>
 
         <!-- 日志 -->
         <Border Grid.Row="3" Style="{StaticResource Card}" Margin="0,12,0,0">

@@ -26,10 +26,11 @@ function Write-Config {
         [int]$OnlineProbe,
         [int]$OfflineProbe,
         [int]$HourlyLimit,
-        [int]$SessionCheck = 300,
+        [int]$SessionCheck = 120,
         [string[]]$Targets
     )
     $config = [ordered]@{
+        ConfigVersion          = 6
         PortalHost             = $PortalHost
         EportalPort            = 801
         StatusPath             = '/drcom/chkstatus'
@@ -72,7 +73,7 @@ function Invoke-Scenario {
         [int]$OnlineProbe = 3,
         [int]$OfflineProbe = 2,
         [int]$HourlyLimit = 12,
-        [int]$SessionCheck = 300
+        [int]$SessionCheck = 120
     )
     $dataDir = Join-Path $work $Name
     New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
@@ -133,6 +134,7 @@ Write-Host ''
 $n = Invoke-Scenario -Name 's1-online' -Scenario 'online' -PortalHost "127.0.0.1:$Port" `
     -Targets @("tcp:127.0.0.1:$Port") -Seconds 10 -OnlineProbe 2
 Assert '正常联网时不请求 Portal' ($n.Status -eq 0 -and $n.Login -eq 0) "chkstatus=$($n.Status) login=$($n.Login)"
+Assert '启动时订阅了系统网络变化事件' ($n.Log -match '已订阅网络变化事件') '登录日志里没有订阅记录'
 
 # 场景 2：断网 → 自动登录成功
 $n = Invoke-Scenario -Name 's2-offline-login' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
@@ -226,11 +228,11 @@ Assert '迁移后探测目标共 4 项' ($migratedTargets.ProbeTargets.Count -eq
 $legacyV3 = @('http:www.msftconnecttest.com/connecttest.txt|Microsoft Connect Test', 'tcp:223.5.5.5:443', 'tcp:114.114.114.114:53')
 $migratedV3 = Invoke-TargetsMigration -Name 's8-legacy-v3-targets' -Targets $legacyV3
 Assert 'pre.5 默认探测列表被换成新的四条' ($migratedV3.ProbeTargets.Count -eq 4 -and $migratedV3.ProbeTargets[0] -eq 'http:connect.rom.miui.com/generate_204|204') "ProbeTargets=$($migratedV3.ProbeTargets -join ',')"
-Assert 'pre.5 配置迁移后写入 ConfigVersion=5' ($migratedV3.ConfigVersion -eq 5) "ConfigVersion=$($migratedV3.ConfigVersion)"
+Assert 'pre.5 配置迁移后写入 ConfigVersion=6' ($migratedV3.ConfigVersion -eq 6) "ConfigVersion=$($migratedV3.ConfigVersion)"
 
 $migrated = Invoke-ConfigMigration -Name 's8-migrate' -OnlineProbe 60
 Assert '旧默认 60 秒迁移为 20 秒' ($migrated.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($migrated.OnlineProbeSeconds)"
-Assert '迁移后写入 ConfigVersion=5' ($migrated.ConfigVersion -eq 5) "ConfigVersion=$($migrated.ConfigVersion)"
+Assert '迁移后写入 ConfigVersion=6' ($migrated.ConfigVersion -eq 6) "ConfigVersion=$($migrated.ConfigVersion)"
 Assert '迁移后剔除 LoginCooldownMinutes' (-not ($migrated.PSObject.Properties.Name -contains 'LoginCooldownMinutes')) '仍存在该键'
 Assert '迁移后保留自定义 ProbeTargets' (($migrated.ProbeTargets -join ',') -eq 'tcp:127.0.0.1:65001') "ProbeTargets=$($migrated.ProbeTargets -join ',')"
 
@@ -248,9 +250,9 @@ Assert '新配置默认兜底巡检 300 秒' ($fresh.UpstreamProbeSeconds -eq 30
 Assert '新配置默认带「204 内容校验」目标' ($fresh.ProbeTargets[0] -eq 'http:connect.rom.miui.com/generate_204|204') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
 Assert '新配置默认共 4 条探测目标' ($fresh.ProbeTargets.Count -eq 4) "Count=$($fresh.ProbeTargets.Count)"
 Assert '新配置默认保留微软内容校验目标' (($fresh.ProbeTargets -join ' ') -match 'msftconnecttest') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
-Assert '新配置默认会话校验 300 秒' ($fresh.SessionCheckSeconds -eq 300) "SessionCheckSeconds=$($fresh.SessionCheckSeconds)"
+Assert '新配置默认会话校验 120 秒' ($fresh.SessionCheckSeconds -eq 120) "SessionCheckSeconds=$($fresh.SessionCheckSeconds)"
 Assert '新配置默认残留重登 60 秒' ($fresh.StuckReloginSeconds -eq 60) "StuckReloginSeconds=$($fresh.StuckReloginSeconds)"
-Assert '新配置写入 ConfigVersion=5' ($fresh.ConfigVersion -eq 5) "ConfigVersion=$($fresh.ConfigVersion)"
+Assert '新配置写入 ConfigVersion=6' ($fresh.ConfigVersion -eq 6) "ConfigVersion=$($fresh.ConfigVersion)"
 Assert '新配置默认 HTTP 探测超时 3000 毫秒' ($fresh.HttpProbeTimeoutMs -eq 3000) "HttpProbeTimeoutMs=$($fresh.HttpProbeTimeoutMs)"
 Assert '新配置默认复检 2 轮 / 500 毫秒' ($fresh.ConfirmAttempts -eq 2 -and $fresh.ConfirmGapMs -eq 500) "Attempts=$($fresh.ConfirmAttempts) Gap=$($fresh.ConfirmGapMs)"
 Assert '新配置默认 Portal 协议为 http' ($fresh.PortalScheme -eq 'http') "PortalScheme=$($fresh.PortalScheme)"
@@ -269,6 +271,8 @@ $n = Invoke-Scenario -Name 's11-session-check' -Scenario 'offline-ok' -PortalHos
     -Targets @("tcp:127.0.0.1:$Port") -Seconds 16 -OnlineProbe 2 -OfflineProbe 2 -SessionCheck 3
 Assert '会话校验到点后自动登录' ($n.Login -eq 1) "login=$($n.Login)"
 Assert '会话校验结果被记录' ($n.State.LastSessionResult -eq 'online' -or $n.State.LastSessionResult -eq 'offline') "LastSessionResult=$($n.State.LastSessionResult)"
+Assert '定时核对的日志写明来源' ($n.Log -match '会话核对：') '日志里没有「会话核对：」'
+Assert '定时核对在状态里记为 periodic' ($n.State.LastSessionCheckKind -eq 'periodic') "LastSessionCheckKind=$($n.State.LastSessionCheckKind)"
 
 # 场景 12：--clear-log 清空日志（只剩一行「日志已清空」）
 $clearDir = Join-Path $work 's12-clearlog'
@@ -443,6 +447,7 @@ function New-BlackholeConfig {
     $targets = @()
     for ($i = 0; $i -lt $TargetCount; $i++) { $targets += "http:127.0.0.1:$Port/blackhole$i" }
     $cfg = [ordered]@{
+        ConfigVersion       = 6
         PortalHost          = "127.0.0.1:$Port"
         EportalPort         = 801
         StatusPath          = '/drcom/chkstatus'
@@ -459,7 +464,7 @@ function New-BlackholeConfig {
         LoginConfirmDelaySec = 1
         LoginMinIntervalSeconds = 60
         LoginHourlyLimit    = 12
-        SessionCheckSeconds = 300
+        SessionCheckSeconds = 120
         StuckReloginSeconds = 60
         StatusTimeoutSec    = 5
         LoginTimeoutSec     = 5
@@ -519,7 +524,7 @@ function Invoke-ConfirmMigration {
 $confirmMigrated = Invoke-ConfirmMigration -Name 's23-migrate' -Attempts 3 -Gap 1000
 Assert 'pre.6 的复检节奏迁移为 2 轮 / 500 毫秒' ($confirmMigrated.ConfirmAttempts -eq 2 -and $confirmMigrated.ConfirmGapMs -eq 500) `
     "Attempts=$($confirmMigrated.ConfirmAttempts) Gap=$($confirmMigrated.ConfirmGapMs)"
-Assert '迁移后写入 ConfigVersion=5' ($confirmMigrated.ConfigVersion -eq 5) "ConfigVersion=$($confirmMigrated.ConfigVersion)"
+Assert '迁移后写入 ConfigVersion=6' ($confirmMigrated.ConfigVersion -eq 6) "ConfigVersion=$($confirmMigrated.ConfigVersion)"
 $confirmCustom = Invoke-ConfirmMigration -Name 's23-custom' -Attempts 4 -Gap 1500
 Assert '自定义复检参数不被改写' ($confirmCustom.ConfirmAttempts -eq 4 -and $confirmCustom.ConfirmGapMs -eq 1500) `
     "Attempts=$($confirmCustom.ConfirmAttempts) Gap=$($confirmCustom.ConfirmGapMs)"
@@ -539,6 +544,7 @@ function New-RawConfig {
         [int]$StatusTimeout = 5
     )
     $cfg = [ordered]@{
+        ConfigVersion           = 6
         PortalHost              = $PortalHost
         EportalPort             = 801
         StatusPath              = '/drcom/chkstatus'
@@ -555,7 +561,7 @@ function New-RawConfig {
         LoginConfirmDelaySec    = 1
         LoginMinIntervalSeconds = $MinInterval
         LoginHourlyLimit        = $HourlyLimit
-        SessionCheckSeconds     = 300
+        SessionCheckSeconds     = 120
         StuckReloginSeconds     = 60
         StatusTimeoutSec        = $StatusTimeout
         LoginTimeoutSec         = $LoginTimeout
@@ -684,6 +690,73 @@ finally {
     }
 }
 
+# 场景 30：v5 -> v6 迁移——会话核对间隔的旧默认值 300 秒缩短为 120 秒
+function Invoke-SessionMigration {
+    param([string]$Name, [int]$SessionCheck)
+    $dir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $legacy = [ordered]@{
+        ConfigVersion        = 5
+        PortalHost           = "127.0.0.1:$Port"
+        OnlineProbeSeconds   = 20
+        OfflineProbeSeconds  = 2
+        ProbeTimeoutMs       = 500
+        SessionCheckSeconds  = $SessionCheck
+        UpstreamProbeSeconds = 300
+        ProbeTargets         = @('tcp:127.0.0.1:65015')
+    }
+    ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
+    Set-TestCredentials -Dir $dir
+    & $Exe '--run-seconds' 3 '--data-dir' $dir | Out-String | Out-Null
+    return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+$sessMigrated = Invoke-SessionMigration -Name 's30-session-migrate' -SessionCheck 300
+Assert '旧默认会话核对 300 秒迁移为 120 秒' ($sessMigrated.SessionCheckSeconds -eq 120) "SessionCheckSeconds=$($sessMigrated.SessionCheckSeconds)"
+Assert '会话核对迁移后写入 ConfigVersion=6' ($sessMigrated.ConfigVersion -eq 6) "ConfigVersion=$($sessMigrated.ConfigVersion)"
+Assert '迁移不会动同为 300 的兜底巡检间隔' ($sessMigrated.UpstreamProbeSeconds -eq 300) "UpstreamProbeSeconds=$($sessMigrated.UpstreamProbeSeconds)"
+$sessCustom = Invoke-SessionMigration -Name 's30-session-custom' -SessionCheck 240
+Assert '自定义会话核对 240 秒不被改写' ($sessCustom.SessionCheckSeconds -eq 240) "SessionCheckSeconds=$($sessCustom.SessionCheckSeconds)"
+
+# 场景 31：疑似掉线核对提速——两次核对间隔必须远小于旧的 60 秒
+# 内容校验目标被假 Portal 用「连得上但没有关键字」的响应骗过（等价于网关代答），
+# 于是走「疑似掉线」路径：连续两轮核对一次 Portal，之后每隔 SuspectVerifyMinSeconds 再核对一次。
+$n = Invoke-Scenario -Name 's31-suspect-fast' -Scenario 'online-then-offline' -PortalHost "127.0.0.1:$Port" `
+    -Targets @("tcp:127.0.0.1:$Port", "http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") `
+    -Seconds 34 -OnlineProbe 2 -OfflineProbe 2
+Assert '疑似掉线时 34 秒内完成两次核对（旧常量 60 秒做不到）' ($n.Status -ge 2) "chkstatus=$($n.Status)"
+Assert '疑似路径的日志写明来源' ($n.Log -match '疑似掉线核对：') '日志里没有「疑似掉线核对：」'
+Assert '疑似核对在状态里记为 suspect' ($n.State.LastSessionCheckKind -eq 'suspect') "LastSessionCheckKind=$($n.State.LastSessionCheckKind)"
+Assert '核对发现离线后自动登录' ($n.Login -ge 1) "login=$($n.Login)"
+
+# 场景 32：--relogin 必须等「注销 + 重新登录」真正跑完
+# 旧写法固定跑 25 秒，注销成功、等待 3 秒后就直接退出了，登录请求根本没提交。
+$reloginDir = Join-Path $work 's32-relogin'
+New-Item -ItemType Directory -Force -Path $reloginDir | Out-Null
+Write-Config -Path (Join-Path $reloginDir 'config.json') -PortalHost "127.0.0.1:$Port" -OnlineProbe 2 `
+    -OfflineProbe 2 -HourlyLimit 12 -SessionCheck 120 -Targets @("tcp:127.0.0.1:$Port")
+$reloginRequestLog = Join-Path $reloginDir 'portal-requests.log'
+$reloginPortal = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru `
+    -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $portalScript, '-Scenario', 'online', '-Port', $Port, '-LogPath', $reloginRequestLog
+Start-Sleep -Milliseconds 900
+try {
+    Set-TestCredentials -Dir $reloginDir
+    $swRelogin = [System.Diagnostics.Stopwatch]::StartNew()
+    $reloginOut = & $Exe '--relogin' '--data-dir' $reloginDir 2>&1 | Out-String
+    $swRelogin.Stop()
+}
+finally {
+    try { Stop-Process -Id $reloginPortal.Id -Force -ErrorAction SilentlyContinue } catch { }
+    Start-Sleep -Milliseconds 200
+}
+$reloginRequests = @()
+if (Test-Path -LiteralPath $reloginRequestLog) { $reloginRequests = Get-Content -LiteralPath $reloginRequestLog | Where-Object { $_ -match '^(GET|POST) ' } }
+$reloginLogin = (@($reloginRequests | Where-Object { $_ -match 'login' }).Count)
+$reloginLogout = (@($reloginRequests | Where-Object { $_ -match 'logout' }).Count)
+Assert '--relogin 注销之后确实提交了登录' ($reloginLogout -ge 1 -and $reloginLogin -ge 1) "logout=$reloginLogout login=$reloginLogin"
+Assert '--relogin 跑完就退出（不空等固定秒数）' ($swRelogin.Elapsed.TotalSeconds -lt 20) "耗时 $([math]::Round($swRelogin.Elapsed.TotalSeconds, 1)) 秒"
+Assert '--relogin 输出带最终状态' ($reloginOut -match '状态：') '输出里没有状态行'
+
 # 场景 29：界面布局扫描——任何 Grid 用到未声明的行/列都要失败。
 # WPF 对越界行号不报错，而是把控件塞进最后一行：pre.7 的高级设置整行叠印就是这么来的。
 $xamlPath = Join-Path $repo 'src\CampusNet\MainWindow.xaml'
@@ -712,6 +785,19 @@ foreach ($grid in $xamlDoc.SelectNodes('//x:Grid', $ns)) {
 }
 Assert '界面 XAML 没有行列越界' ($overflow.Count -eq 0) ($overflow -join '；')
 Assert '高级设置网格至少声明 10 行' ($maxRows -ge 10) "最多只声明了 $maxRows 行"
+
+# 主体内容必须放在 ScrollViewer 里：默认窗口高度下，展开「高级设置」后最后一行（HTTP 探测超时）
+# 会被挤出可视区，用户既看不到也点不到。
+$mainScroller = $null
+foreach ($scroller in $xamlDoc.SelectNodes('//x:ScrollViewer', $ns)) {
+    if ($scroller.GetAttribute('Grid.Row') -eq '2') { $mainScroller = $scroller; break }
+}
+$wrappedRows = 0
+if ($null -ne $mainScroller) {
+    $wrappedRows = $mainScroller.SelectNodes('.//x:Grid[x:Grid.RowDefinitions]', $ns).Count
+}
+Assert '主体内容被 ScrollViewer 包裹（最后一行不再被裁掉）' ($wrappedRows -ge 1) `
+    "ScrollViewer 里没有找到带行定义的 Grid（找到 $wrappedRows 个）"
 
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ''

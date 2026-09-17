@@ -110,7 +110,7 @@ namespace CampusNet
                         RunHeadless(ArgInt(args, 1, 15), false);
                         return;
                     case "--relogin":
-                        RunHeadless(ArgInt(args, 1, 25), true);
+                        RunHeadlessRelogin(ArgInt(args, 1, 120));
                         return;
                     case "--selftest":
                         StartUi(false, true);
@@ -335,7 +335,8 @@ namespace CampusNet
             ConsoleBridge.Line("暂停：" + (state.Paused ? "是" : "否"));
             ConsoleBridge.Line("会话核对：" + (string.IsNullOrEmpty(state.LastSessionCheck)
                 ? "尚未核对"
-                : state.LastSessionCheck + "（" + SessionText(state.LastSessionResult) + "）")
+                : state.LastSessionCheck + "（" + SessionText(state.LastSessionResult)
+                  + (string.IsNullOrEmpty(state.LastSessionCheckKind) ? string.Empty : " · " + SessionKindText(state.LastSessionCheckKind)) + "）")
                 + "；间隔 " + (config.SessionCheckSeconds > 0 ? config.SessionCheckSeconds + " 秒" : "关闭"));
             ConsoleBridge.Line("开机自启：" + (SelfInstaller.IsAutoStartEnabled ? "已开启" : "已关闭"));
             ConsoleBridge.Line("守护      ：" + (SelfInstaller.IsWatchdogInstalled
@@ -397,6 +398,48 @@ namespace CampusNet
             Shutdown(0);
         }
 
+        /// <summary>
+        /// --relogin：注销后重新登录，并且**等这一轮流程真正跑完**再退出。
+        /// 老写法固定跑 25 秒，注销成功、等待 3 秒后就退出了，登录请求根本没提交 —— 账号会停在已注销状态。
+        /// 现在用评估编号判断：等到「调用 Relogin 之后开始的那一轮」结束（Busy=false）为止，最多等 maxSeconds 秒。
+        /// </summary>
+        private void RunHeadlessRelogin(int maxSeconds)
+        {
+            ConsoleBridge.Attach();
+            AppPaths.EnsureDataDir();
+            Logger log = CreateLogger();
+            int budget = Math.Max(10, maxSeconds);
+            log.Info("命令行模式启动（立即重连，等待流程跑完，最长 " + budget + " 秒）。");
+            var engine = new LoginEngine(log);
+            engine.Start();
+            long startId = engine.Snapshot().EvaluationId;
+            engine.Relogin();
+
+            var deadline = DateTime.Now.AddSeconds(budget);
+            bool completed = false;
+            while (DateTime.Now < deadline)
+            {
+                EngineSnapshot current = engine.Snapshot();
+                if (current.EvaluationId > startId && !current.Busy) { completed = true; break; }
+                Thread.Sleep(200);
+            }
+
+            EngineSnapshot snapshot = engine.Snapshot();
+            engine.Dispose();
+            if (!completed)
+            {
+                ConsoleBridge.Line("警告：等待 " + budget + " 秒仍未跑完（可能正在按最小间隔等待下一轮），当前状态如下。");
+            }
+            ConsoleBridge.Line("状态：" + snapshot.StatusText);
+            ConsoleBridge.Line("结果：" + snapshot.LastResult);
+            ConsoleBridge.Line("在线：" + (snapshot.Online ? "是" : "否"));
+            ConsoleBridge.Line("探测：" + snapshot.ProbeSummary);
+            ConsoleBridge.Line("延迟：" + (snapshot.LatencyMs < 0 ? "未知" : snapshot.LatencyMs + " ms") + "；丢包：" + snapshot.LossPercent + "%");
+            ConsoleBridge.Line("本小时登录：" + snapshot.LoginWindowCount + "；连续失败：" + snapshot.ConsecutiveFailures);
+            ConsoleBridge.Line("累计检查：" + snapshot.RunCount);
+            Shutdown(0);
+        }
+
         private static string Describe(string key)
         {
             switch (key)
@@ -435,6 +478,17 @@ namespace CampusNet
                 case "offline": return "Portal 显示已离线";
                 case "unreachable": return "Portal 不可达";
                 default: return string.IsNullOrEmpty(key) ? "—" : key;
+            }
+        }
+
+        /// <summary>会话核对的来源：定时巡检 / 疑似掉线核对。</summary>
+        private static string SessionKindText(string kind)
+        {
+            switch (kind)
+            {
+                case "periodic": return "定时巡检";
+                case "suspect": return "疑似掉线核对";
+                default: return string.Empty;
             }
         }
 

@@ -89,6 +89,8 @@ while ($true) {
             switch ($Scenario) {
                 'online' { $online = $true }
                 'confirm-online' { if ($counts.chkstatus -ge 2) { $online = $true } }
+                # 第 1 次核对说在线、之后都说离线：用来验证「疑似掉线核对」的提速（旧行为要等 60 秒才核对第 2 次）
+                'online-then-offline' { if ($counts.chkstatus -le 1) { $online = $true } }
                 'offline-ok' { if ($counts.login -ge 1) { $online = $true } }
                 # 登录接口回了「已在别处在线」，但会话其实已经建立：第 3 次查询起显示在线
                 'conflict-then-online' { if ($counts.chkstatus -ge 3) { $online = $true } }

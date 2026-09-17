@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Net.NetworkInformation;
 using System.Threading;
 
 namespace CampusNet.Core
@@ -24,6 +25,7 @@ namespace CampusNet.Core
         public DateTime? LastLoginSuccess;
         public string LastSessionCheck = string.Empty;
         public string LastSessionResult = string.Empty;
+        public string LastSessionCheckKind = string.Empty;
         public bool Paused;
         public DateTime? PauseUntil;
         public int IgnoredPrompts;
@@ -33,6 +35,10 @@ namespace CampusNet.Core
         public string UserName = string.Empty;
         public int LatencyMs = -1;
         public int LossPercent = 100;
+        /// <summary>已完成的评估轮次编号（每次评估自增一次）。</summary>
+        public long EvaluationId;
+        /// <summary>是否正有一轮评估在跑（网络请求 / 登录流程进行中）。</summary>
+        public bool Busy;
         public NetworkInfo Network = new NetworkInfo();
         public readonly List<int> LatencyHistory = new List<int>();
         public readonly List<string> StatusHistory = new List<string>();
@@ -68,10 +74,15 @@ namespace CampusNet.Core
         private const int HistoryLength = 60;
         private const int ReloginWaitSec = 3;
         private const int PersistMinIntervalSeconds = 60;
+        /// <summary>系统网络变化事件的防抖窗口：网卡插拔时事件会连成一串，只按最后一次处理。</summary>
+        private const int NetworkEventDebounceMs = 1000;
         /// <summary>连续多少轮拿不到内容校验才认定「疑似掉线」并发起 Portal 核对（配合 20 秒节奏约 40 秒）。</summary>
         private const int SuspectStreakForVerify = 2;
-        /// <summary>疑似掉线期间向 Portal 求证的最小间隔，避免每一轮都去打扰 Portal。</summary>
-        private const int SuspectVerifyMinSeconds = 60;
+        /// <summary>
+        /// 疑似掉线期间向 Portal 求证的最小间隔：只影响「只读 chkstatus」的发起频率，
+        /// 与登录风控无关。20 秒是折中 —— 被踢下线后约 20~40 秒就能发现，又不至于每轮都去打扰 Portal。
+        /// </summary>
+        private const int SuspectVerifyMinSeconds = 20;
         /// <summary>忽略 Portal 业务提示后的复检节奏：3 / 5 / 12 秒，累计约 20 秒。</summary>
         private const int RecoveryFirstDelaySec = 3;
         private const int RecoverySecondDelaySec = 5;
@@ -89,6 +100,12 @@ namespace CampusNet.Core
         private Thread _worker;
         private volatile bool _stop;
         private bool _pendingRelogin;
+        /// <summary>系统网络变化事件的防抖定时器与最近一次事件原因。</summary>
+        private Timer _networkEventTimer;
+        private bool _networkEventsHooked;
+        private volatile string _pendingNetworkEvent;
+        /// <summary>评估轮次编号：Evaluate 每跑一轮自增一次，供 --relogin 等外部调用方等待「这一轮跑完」。</summary>
+        private long _evaluationId;
         /// <summary>本次启动（或最近一次配置重载）的时间，用作会话核对的初始锚点。</summary>
         private DateTime _startedAt = DateTime.Now;
         /// <summary>连续多少轮内容校验没过（单次抖动会被补测挡掉，不计入）。</summary>
@@ -198,6 +215,7 @@ namespace CampusNet.Core
         public void Start()
         {
             if (_worker != null) { return; }
+            SubscribeNetworkChange();
             _worker = new Thread(Worker);
             _worker.IsBackground = true;
             _worker.Name = "CampusNet-Engine";
@@ -207,12 +225,82 @@ namespace CampusNet.Core
         public void Dispose()
         {
             _stop = true;
+            UnsubscribeNetworkChange();
             try { _wake.Set(); } catch { }
             Thread worker = _worker;
             if (worker != null)
             {
                 try { worker.Join(3000); } catch { }
             }
+        }
+
+        /// <summary>
+        /// 订阅系统网络变化事件（网线插拔 / WiFi 切换 / IP 变化）：事件到达后 1 秒内唤醒工作线程复检一次，
+        /// 不用再干等下一个探测周期。事件不绕过任何风控闸门，只是让「发现断网」更快。
+        /// </summary>
+        private void SubscribeNetworkChange()
+        {
+            try
+            {
+                if (_networkEventsHooked) { return; }
+                _networkEventTimer = new Timer(OnNetworkEventDebounce, null, Timeout.Infinite, Timeout.Infinite);
+                NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
+                NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+                _networkEventsHooked = true;
+                _log.Info("已订阅网络变化事件（网线 / WiFi / IP 变化时 1 秒内立即复检）。");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn("订阅网络变化事件失败（不影响自动登录，只是发现得更慢）：" + ex.Message);
+            }
+        }
+
+        private void UnsubscribeNetworkChange()
+        {
+            if (!_networkEventsHooked) { return; }
+            _networkEventsHooked = false;
+            try { NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged; } catch { }
+            try { NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged; } catch { }
+            Timer timer = _networkEventTimer;
+            _networkEventTimer = null;
+            if (timer != null) { try { timer.Dispose(); } catch { } }
+        }
+
+        private void OnNetworkAvailabilityChanged(object sender, NetworkAvailabilityEventArgs e)
+        {
+            QueueNetworkEvent(e.IsAvailable ? "网络可用性变化：已连接" : "网络可用性变化：已断开");
+        }
+
+        private void OnNetworkAddressChanged(object sender, EventArgs e)
+        {
+            QueueNetworkEvent("IP 地址变化");
+        }
+
+        private void QueueNetworkEvent(string reason)
+        {
+            if (_stop || !_networkEventsHooked) { return; }
+            _pendingNetworkEvent = reason;
+            Timer timer = _networkEventTimer;
+            if (timer == null) { return; }
+            try { timer.Change(NetworkEventDebounceMs, Timeout.Infinite); } catch { }
+        }
+
+        private void OnNetworkEventDebounce(object state)
+        {
+            if (_stop) { return; }
+            string reason = _pendingNetworkEvent;
+            _pendingNetworkEvent = null;
+            try
+            {
+                // 网卡信息（IP / 网关 / DNS）一定变了，缓存必须立刻作废，否则界面与诊断还会显示旧地址。
+                NetworkProbe.InvalidateNetworkInfo();
+                _log.Info("网络变化事件（" + (string.IsNullOrEmpty(reason) ? "未知" : reason) + "）：已刷新网卡信息并立即复检。");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn("处理网络变化事件失败：" + ex.Message);
+            }
+            try { _wake.Set(); } catch { }
         }
 
         /// <summary>立即重连：注销当前会话后重新登录。</summary>
@@ -285,6 +373,9 @@ namespace CampusNet.Core
                 copy.LastLoginSuccess = from.LastLoginSuccess;
                 copy.LastSessionCheck = from.LastSessionCheck;
                 copy.LastSessionResult = from.LastSessionResult;
+                copy.LastSessionCheckKind = from.LastSessionCheckKind;
+                copy.EvaluationId = from.EvaluationId;
+                copy.Busy = from.Busy;
                 copy.Paused = from.Paused;
                 copy.PauseUntil = from.PauseUntil;
                 copy.IgnoredPrompts = from.IgnoredPrompts;
@@ -350,7 +441,22 @@ namespace CampusNet.Core
             }
         }
 
+        /// <summary>
+        /// 一轮评估的包装：登记本轮编号与「正在跑」标志，让外部调用方（例如 --relogin）
+        /// 能等到自己触发的那一轮真正跑完，而不是按固定秒数猜。
+        /// </summary>
         private int Evaluate()
+        {
+            lock (_gate)
+            {
+                _snapshot.EvaluationId = ++_evaluationId;
+                _snapshot.Busy = true;
+            }
+            try { return EvaluateCore(); }
+            finally { lock (_gate) { _snapshot.Busy = false; } }
+        }
+
+        private int EvaluateCore()
         {
             DateTime now = DateTime.Now;
             bool relogin;
@@ -484,7 +590,7 @@ namespace CampusNet.Core
                     }
 
                     StatusResult check = portal.GetStatus();
-                    RecordSessionCheck(check);
+                    RecordSessionCheck(check, suspect ? "suspect" : "periodic");
 
                     if (!check.Reachable)
                     {
@@ -916,19 +1022,26 @@ namespace CampusNet.Core
             SetStatus("online", "在线（延迟 " + (probe.LatencyMs < 0 ? "未知" : probe.LatencyMs + " ms") + "）");
         }
 
-        /// <summary>记录一次「在线会话核对」的结果（只读 chkstatus，绝不触发登录）。</summary>
-        private void RecordSessionCheck(StatusResult check)
+        /// <summary>
+        /// 记录一次「在线会话核对」的结果（只读 chkstatus，绝不触发登录）。
+        /// kind = periodic（定时巡检）/ suspect（本机探测不对劲时的疑似掉线核对）。
+        /// </summary>
+        private void RecordSessionCheck(StatusResult check, string kind)
         {
             string result = !check.Reachable ? "unreachable" : (check.Online ? "online" : "offline");
             lock (_gate)
             {
                 _state.LastSessionCheck = AppPaths.FormatTime(DateTime.Now);
                 _state.LastSessionResult = result;
+                _state.LastSessionCheckKind = kind;
                 _snapshot.LastSessionCheck = _state.LastSessionCheck;
                 _snapshot.LastSessionResult = result;
+                _snapshot.LastSessionCheckKind = kind;
             }
-            if (check.Online) { _log.Info("会话核对：Portal 显示账号在线。"); }
-            else if (check.Reachable) { _log.Warn("会话核对：Portal 显示账号不在线。"); }
+            // 日志里区分两种来源：「定时巡检」说明一切正常，「疑似掉线核对」说明本机探测已经不对劲了。
+            string prefix = kind == "suspect" ? "疑似掉线核对：" : "会话核对：";
+            if (check.Online) { _log.Info(prefix + "Portal 显示账号在线。"); }
+            else if (check.Reachable) { _log.Warn(prefix + "Portal 显示账号不在线。"); }
         }
 
         private void UpdateNetwork(ProbeOutcome probe)
@@ -1014,6 +1127,7 @@ namespace CampusNet.Core
                 _snapshot.LastLoginSuccess = _state.LastLoginSuccessTime;
                 _snapshot.LastSessionCheck = _state.LastSessionCheck;
                 _snapshot.LastSessionResult = _state.LastSessionResult;
+                _snapshot.LastSessionCheckKind = _state.LastSessionCheckKind;
                 _snapshot.Paused = _state.Paused;
                 _snapshot.PauseUntil = _state.PauseUntilTime;
                 _snapshot.IgnoredPrompts = _state.IgnoredPrompts;
@@ -1042,6 +1156,7 @@ namespace CampusNet.Core
                 _snapshot.LastLoginSuccess = _state.LastLoginSuccessTime;
                 _snapshot.LastSessionCheck = _state.LastSessionCheck;
                 _snapshot.LastSessionResult = _state.LastSessionResult;
+                _snapshot.LastSessionCheckKind = _state.LastSessionCheckKind;
                 _snapshot.LastProbe = _state.LastProbeTime;
                 _snapshot.LastTrigger = AppPaths.ParseTime(_state.LastTrigger);
                 _snapshot.ConsecutiveFailures = _state.ConsecutiveFailures;
