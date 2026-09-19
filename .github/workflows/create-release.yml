@@ -1,5 +1,6 @@
-# 为 v* 标签创建 GitHub Release，只附上一个文件：单文件 exe（CampusNet.exe）。
-# 源码在仓库 main 分支，使用说明见 docs/使用说明.md。
+# 为 v* 标签创建 GitHub Release，只附上一个文件：单文件 exe。
+# 附件名带版本号：CampusNet-v<版本>.exe（标签 v2.0.0 → 附件 CampusNet-v2.0.0.exe）。
+# 仓库里的产物路径仍是 dist/CampusNet.exe；源码在仓库 main 分支，使用说明见 docs/使用说明.md。
 # 触发方式：
 #   1) 推送 v* 标签（例如 git push origin v2.0.0-pre.1）时自动运行，发布该标签；
 #   2) 在 Actions 页面点 “Run workflow” 手动运行（可指定标签、可勾选 Pre-release）。
@@ -84,7 +85,12 @@ jobs:
           if [ -z "$tag" ]; then tag="$(git describe --tags --abbrev=0)"; fi
           ver="${tag#v}"
           exe="dist/CampusNet.exe"
+          # 附件名带版本号：下载到本地一眼能看出是哪个版本，也和标签名对得上。
+          # 仓库里的产物路径不变（dist/CampusNet.exe），只是上传时换个名字。
+          asset="CampusNet-$tag.exe"
+          cp -- "$exe" "dist/$asset"
           echo "tag=$tag"
+          echo "asset=$asset"
 
           create_flags=(--latest)
           edit_flags=(--prerelease=false --latest)
@@ -110,14 +116,17 @@ jobs:
             gh release create "$tag" --title "$title" --verify-tag "${create_flags[@]}" "${notes[@]}"
           fi
 
-          gh release upload "$tag" "$exe" --clobber
+          gh release upload "$tag" "dist/$asset" --clobber
 
-          # 只保留 CampusNet.exe：清掉这个 Release 里其它附件（例如历史版本留下的源码包 / 解压包）
+          # 只保留带版本号的那个 exe：清掉这个 Release 里其它附件（例如历史版本留下的
+          # 源码包 / 解压包，以及改名前那份没带版本号的 CampusNet.exe）
+          gh release view "$tag" --json assets -q '.assets[].name' > /tmp/assets.txt
           while IFS= read -r name; do
-            [ -z "$name" ] && continue
+            if [ -z "$name" ]; then continue; fi
+            if [ "$name" = "$asset" ]; then continue; fi
             echo "删除多余附件：$name"
             gh release delete-asset "$tag" "$name" --yes
-          done < <(gh release view "$tag" --json assets -q '.assets[].name | select(. != "CampusNet.exe")')
+          done < /tmp/assets.txt
 
           echo "=== 最终附件列表 ==="
           gh release view "$tag" --json tagName,name,isPrerelease,url,assets
