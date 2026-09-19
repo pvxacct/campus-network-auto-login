@@ -1,0 +1,93 @@
+# 一次性工作流（跑完就删）：把 2.0 线历史 Release 的附件从 CampusNet.exe 改名为
+# CampusNet-<标签>.exe，刷新 v2.0.0 的说明，并清掉附件命名验证用的临时发布。
+# 说明：用仓库自带的 GITHUB_TOKEN，不需要任何密钥；改名前会先把附件原样下载下来，
+# 再以新名字传回去，字节不变，因此 SHA256 不变。
+name: One-off rename release assets
+
+on:
+  push:
+    paths:
+      - '.github/workflows/oneoff-rename-assets.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rename historical assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/r
+          for tag in $(gh release list --limit 100 --json tagName --jq '.[].tagName' | sort -V); do
+            case "$tag" in
+              v2.0.0*) ;;
+              *) echo "跳过 $tag（不在 2.0 线）"; continue ;;
+            esac
+            asset="CampusNet-$tag.exe"
+            names="$(gh release view "$tag" --json assets --jq '.assets[].name')"
+            if echo "$names" | grep -qx -- "$asset"; then
+              echo "$tag 已经是 $asset，跳过"
+              continue
+            fi
+            if ! echo "$names" | grep -qx -- 'CampusNet.exe'; then
+              echo "$tag 没有 CampusNet.exe，跳过"
+              continue
+            fi
+            rm -f /tmp/r/CampusNet.exe "/tmp/r/$asset"
+            gh release download "$tag" --pattern 'CampusNet.exe' --dir /tmp/r
+            mv /tmp/r/CampusNet.exe "/tmp/r/$asset"
+            gh release upload "$tag" "/tmp/r/$asset" --clobber
+            gh release delete-asset "$tag" 'CampusNet.exe' --yes
+            echo "已改名：$tag -> $asset"
+          done
+
+      - name: Refresh v2.0.0 release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          awk -v v="2.0.0" '$0 ~ "^## \\[" v "\\]" {f=1; next} f && /^## \[/ {f=0} f {print}' CHANGELOG.md > /tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "CHANGELOG.md 里没找到 2.0.0 段落" >&2
+            exit 1
+          fi
+          gh release edit v2.0.0 --title "校园网自动登录 v2.0.0" --prerelease=false --latest --notes-file /tmp/notes.md
+          echo "v2.0.0 说明已刷新"
+
+      - name: Drop the naming test release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view v2.0.0-naming-test >/dev/null 2>&1; then
+            gh release delete v2.0.0-naming-test --yes --cleanup-tag
+            echo "已删除临时发布 v2.0.0-naming-test（含标签）"
+          else
+            echo "没有临时发布需要清理"
+          fi
+
+      - name: Final asset list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for tag in $(gh release list --limit 100 --json tagName --jq '.[].tagName' | sort -V); do
+            case "$tag" in
+              v2.0.0*|v1.9.0) ;;
+              *) continue ;;
+            esac
+            echo "--- $tag"
+            gh release view "$tag" --json assets --jq '.assets[] | "    \(.name)  \(.size) 字节"'
+          done
+          echo "=== 发布列表 ==="
+          gh release list --limit 20
