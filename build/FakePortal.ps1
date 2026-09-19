@@ -65,6 +65,8 @@ $counts = @{ chkstatus = 0; login = 0; logout = 0; error = 0 }
 $blackholeClients = New-Object System.Collections.Generic.List[object]
 # 内容校验何时开始返回关键字：late-content 用来复现「登录已经生效、程序却还在等」的场景
 $loginAt = $null
+# 内容校验目标被请求过多少次：content-from-4th 用它把「登录前本地校验」卡在第 4 次请求上
+$contentHits = 0
 
 while ($true) {
     $client = $listener.AcceptTcpClient()
@@ -96,6 +98,11 @@ while ($true) {
                 'offline-ok' { if ($counts.login -ge 1) { $online = $true } }
                 # 登录接口回了「已在别处在线」，但会话其实已经建立：第 3 次查询起显示在线
                 'conflict-then-online' { if ($counts.chkstatus -ge 3) { $online = $true } }
+                # 登录后第 13 秒起才显示在线：验证「提交 → 确认」的加密复检阶梯。
+                # 旧阶梯只有 +20 秒那一档够得着，新阶梯应该在 +14 秒就确认成功。
+                'online-after-login-13' {
+                    $online = ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 13)
+                }
                 'content-ok' { $online = $true }
                 default { $online = $false }
             }
@@ -104,7 +111,8 @@ while ($true) {
         }
         elseif ($path -like '*login*') {
             $counts.login++
-            if ($null -eq $loginAt -and ($Scenario -eq 'late-content' -or $Scenario -eq 'instant-content')) {
+            if ($null -eq $loginAt -and ($Scenario -eq 'late-content' -or
+                    $Scenario -eq 'instant-content' -or $Scenario -eq 'online-after-login-13')) {
                 $loginAt = Get-Date
             }
             switch ($Scenario) {
@@ -162,9 +170,10 @@ while ($true) {
             Send-Response -Stream $stream -ContentType 'application/json; charset=utf-8' `
                 -Body ("dr1({`"result`":1,`"error_code`":`"$code`",`"error_prompt_zh`":`"$prompt`"})")
         }
-        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204' -or $Scenario -eq 'late-content' -or $Scenario -eq 'instant-content') -and $path -like '*connecttest.txt*') {
+        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204' -or $Scenario -eq 'late-content' -or $Scenario -eq 'instant-content' -or $Scenario -eq 'content-from-4th') -and $path -like '*connecttest.txt*') {
             # 内容校验测试用：content-ok 发关键字；content-204 发真正的 204 空响应；
             # instant-content 在登录后立刻发关键字；late-content 要等登录后 30 秒才发。
+            $contentHits++
             $serve = $true
             if ($Scenario -eq 'instant-content' -or $Scenario -eq 'late-content') {
                 $serve = $false
@@ -172,6 +181,12 @@ while ($true) {
                     $waitSec = if ($Scenario -eq 'late-content') { 30 } else { 0 }
                     $serve = ((Get-Date) - $loginAt).TotalSeconds -ge $waitSec
                 }
+            }
+            if ($Scenario -eq 'content-from-4th') {
+                # 前 3 次内容请求都回「连得上但没有关键字」（等价于会话没通），第 4 次起才真的返回。
+                # 前 3 次正好是「首轮探测 + 断网复检 2 轮」，第 4 次落在「登录前本地内容校验」那一步，
+                # 用来验证程序会靠它翻案、连一次 chkstatus / login 都不再发。
+                $serve = $contentHits -ge 4
             }
             if ($Scenario -eq 'content-204') {
                 Send-Response -Stream $stream -Status 204 -Body ''

@@ -89,7 +89,11 @@
                             CornerRadius="8" Height="64" Margin="0,10,0,0" SnapsToDevicePixels="True">
                         <Canvas x:Name="LatencyCanvas" ClipToBounds="True" />
                     </Border>
-                    <TextBlock x:Name="ProbeText" Style="{StaticResource Caption}" Margin="0,6,0,0" Text="等待首次探测…" />
+                    <!-- 探测明细可能很长（4 条目标的逐项结果）。这里必须允许换行，
+                         否则 TextBlock 会按"不换行的理想宽度"排版（实测 758px），
+                         直接把文字画到卡片外面并被硬截断。 -->
+                    <TextBlock x:Name="ProbeText" Style="{StaticResource Caption}" Margin="0,6,0,0"
+                               TextWrapping="Wrap" TextTrimming="CharacterEllipsis" Text="等待首次探测…" />
                 </StackPanel>
             </Border>
 
@@ -200,22 +204,22 @@
                                 </Grid.RowDefinitions>
                                 <TextBlock Grid.Row="0" Grid.Column="0" Text="正常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
                                 <TextBox x:Name="OnlineProbeBox" Grid.Row="0" Grid.Column="1" Tag="OnlineProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
-                            <TextBlock Grid.Row="1" Grid.Column="0" Text="异常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
-                            <TextBox x:Name="OfflineProbeBox" Grid.Row="1" Grid.Column="1" Tag="OfflineProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
-                            <TextBlock Grid.Row="2" Grid.Column="0" Text="每小时登录上限（次）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
-                            <TextBox x:Name="HourlyLimitBox" Grid.Row="2" Grid.Column="1" Tag="LoginHourlyLimit" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
-                            <TextBlock Grid.Row="3" Grid.Column="0" Text="Portal 地址" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
-                            <TextBox x:Name="PortalHostBox" Grid.Row="3" Grid.Column="1" LostFocus="PortalHost_LostFocus" KeyDown="PortalHost_KeyDown" Margin="0,0,0,6" />
-                            <TextBlock Grid.Row="4" Grid.Column="0" Text="登录最小间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,6,10,6" />
-                            <TextBox x:Name="MinIntervalBox" Grid.Row="4" Grid.Column="1" Tag="LoginMinIntervalSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,6,0,6" />
-                            <TextBlock Grid.Row="5" Grid.Column="0" Text="兜底巡检间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
-                            <TextBox x:Name="UpstreamProbeBox" Grid.Row="5" Grid.Column="1" Tag="UpstreamProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
-                            <TextBlock Grid.Row="6" Grid.Column="0" Text="探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
-                            <TextBox x:Name="ProbeTimeoutBox" Grid.Row="6" Grid.Column="1" Tag="ProbeTimeoutMs" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
-                            <TextBlock Grid.Row="7" Grid.Column="0" Text="会话校验间隔（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
-                            <TextBox x:Name="SessionCheckBox" Grid.Row="7" Grid.Column="1" Tag="SessionCheckSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
-                            <TextBlock Grid.Row="8" Grid.Column="0" Text="残留会话自动重登（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
-                            <TextBox x:Name="StuckReloginBox" Grid.Row="8" Grid.Column="1" Tag="StuckReloginSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
+                                <TextBlock Grid.Row="1" Grid.Column="0" Text="异常时探测间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                                <TextBox x:Name="OfflineProbeBox" Grid.Row="1" Grid.Column="1" Tag="OfflineProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
+                                <TextBlock Grid.Row="2" Grid.Column="0" Text="每小时登录上限（次）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                                <TextBox x:Name="HourlyLimitBox" Grid.Row="2" Grid.Column="1" Tag="LoginHourlyLimit" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
+                                <TextBlock Grid.Row="3" Grid.Column="0" Text="Portal 地址" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                                <TextBox x:Name="PortalHostBox" Grid.Row="3" Grid.Column="1" LostFocus="PortalHost_LostFocus" KeyDown="PortalHost_KeyDown" Margin="0,0,0,6" />
+                                <TextBlock Grid.Row="4" Grid.Column="0" Text="登录最小间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,6,10,6" />
+                                <TextBox x:Name="MinIntervalBox" Grid.Row="4" Grid.Column="1" Tag="LoginMinIntervalSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,6,0,6" />
+                                <TextBlock Grid.Row="5" Grid.Column="0" Text="兜底巡检间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                                <TextBox x:Name="UpstreamProbeBox" Grid.Row="5" Grid.Column="1" Tag="UpstreamProbeSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
+                                <TextBlock Grid.Row="6" Grid.Column="0" Text="探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                                <TextBox x:Name="ProbeTimeoutBox" Grid.Row="6" Grid.Column="1" Tag="ProbeTimeoutMs" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
+                                <TextBlock Grid.Row="7" Grid.Column="0" Text="会话校验间隔（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
+                                <TextBox x:Name="SessionCheckBox" Grid.Row="7" Grid.Column="1" Tag="SessionCheckSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,6" />
+                                <TextBlock Grid.Row="8" Grid.Column="0" Text="残留会话自动重登（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
+                                <TextBox x:Name="StuckReloginBox" Grid.Row="8" Grid.Column="1" Tag="StuckReloginSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
                                 <TextBlock Grid.Row="9" Grid.Column="0" Text="HTTP 探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,6,10,0" />
                                 <TextBox x:Name="HttpProbeTimeoutBox" Grid.Row="9" Grid.Column="1" Tag="HttpProbeTimeoutMs" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,6,0,0" />
                             </Grid>
@@ -236,7 +240,7 @@
                     <Button Content="清空日志" Click="ClearLog_Click" DockPanel.Dock="Right" Margin="8,0,0,0" Padding="10,3,10,3" VerticalAlignment="Center" />
                     <CheckBox x:Name="WarningOnlyCheck" Content="只看警告和错误" HorizontalAlignment="Right" Click="WarningOnly_Click" />
                 </DockPanel>
-                <RichTextBox x:Name="LogView" IsReadOnly="True" BorderThickness="0" Background="#FBFCFD" Height="150"
+                <RichTextBox x:Name="LogView" IsReadOnly="True" BorderThickness="0" Background="#FBFCFD" Height="180"
                              FontFamily="Consolas, Cascadia Mono, Microsoft YaHei UI" FontSize="11.5"
                              VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" />
             </DockPanel>
@@ -249,7 +253,7 @@
             <Button x:Name="ResumeButton" Content="恢复自动登录" Click="Resume_Click" />
             <Button Content="刷新" Click="Refresh_Click" />
             <Button Content="复制诊断信息" Click="CopyDiagnose_Click" />
-            <Button x:Name="CloseButton" Content="关闭窗口（后台继续运行）" Click="Close_Click" DockPanel.Dock="Right" Margin="8,0,0,0" />
+                    <Button x:Name="CloseButton" Content="关闭窗口（后台继续运行）" Click="Close_Click" DockPanel.Dock="Right" Margin="8,0,0,6" />
         </DockPanel>
     </Grid>
 </Window>

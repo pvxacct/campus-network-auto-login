@@ -48,14 +48,17 @@
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="CornerRadius" Value="10" />
-            <Setter Property="Padding" Value="14,12,14,12" />
+            <!-- 卡片内边距统一 16,14（左右 16 / 上下 14）：四张卡片用同一个样式，右列不再显得比左列空 -->
+            <Setter Property="Padding" Value="16,14" />
         </Style>
 
         <Style TargetType="Button">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI" />
             <Setter Property="FontSize" Value="12.5" />
             <Setter Property="Padding" Value="12,6,12,6" />
-            <Setter Property="Margin" Value="0,0,8,0" />
+            <Setter Property="MinHeight" Value="30" />
+            <!-- 按钮间距统一：左右 8（横排按钮之间）、下 6（WrapPanel 换行时不会贴在一起） -->
+            <Setter Property="Margin" Value="0,0,8,6" />
             <Setter Property="Background" Value="#FFFFFF" />
             <Setter Property="BorderBrush" Value="#D3D9E0" />
             <Setter Property="BorderThickness" Value="1" />

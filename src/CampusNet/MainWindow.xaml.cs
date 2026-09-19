@@ -203,7 +203,13 @@ namespace CampusNet
             _logSignature = signature;
 
             LogView.Document.Blocks.Clear();
-            var paragraph = new Paragraph { Margin = new Thickness(0), LineHeight = 16 };
+            // 行高 18（原 16）：日志默认字号 11.5 时行距太挤，长日志看起来是一坨。
+            var paragraph = new Paragraph
+            {
+                Margin = new Thickness(0),
+                LineHeight = 18,
+                LineStackingStrategy = LineStackingStrategy.BlockLineHeight
+            };
             foreach (string line in lines)
             {
                 SolidColorBrush brush;

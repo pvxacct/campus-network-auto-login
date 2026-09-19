@@ -11,7 +11,7 @@ namespace CampusNet.Core
     public sealed class AppConfig
     {
         /// <summary>配置文件结构版本：小于当前值的老配置会在加载时自动迁移一次。</summary>
-        public const int CurrentConfigVersion = 6;
+        public const int CurrentConfigVersion = 7;
 
         public const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -80,7 +80,12 @@ namespace CampusNet.Core
             "tcp:114.114.114.114:53"
         };
 
-        public int LoginConfirmDelaySec = 3;
+        /// <summary>
+        /// 判定离线后、真正提交登录前的二次确认延迟（秒）。
+        /// 真机 50 次自然掉线实测：这条确认一次都没拦下过登录，3 秒纯粹是白等；
+        /// 1 秒足够挡住「上一轮状态陈旧」这类误判，又把「发现 → 提交」压到约 1 秒。
+        /// </summary>
+        public int LoginConfirmDelaySec = 1;
         public int LoginMinIntervalSeconds = 60;
         public int LoginHourlyLimit = 12;
 
@@ -262,6 +267,7 @@ namespace CampusNet.Core
             //             配合「每个目标并行探测」，完全断网时从判定到提交登录由几十秒压到十几秒。
             //   v5 -> v6：会话核对间隔默认 300 秒缩短为 120 秒（被踢下线后发现的更快），
             //             疑似掉线核对的最小间隔由 60 秒降到 20 秒（内部常量，不占配置键）。
+            //   v6 -> v7：登录前二次确认默认 3 秒缩短为 1 秒，只改「等于旧默认值 3」的那一份。
             if (config.ConfigVersion < CurrentConfigVersion)
             {
                 if (SameTargets(config.ProbeTargets, LegacyProbeTargets)
@@ -272,6 +278,8 @@ namespace CampusNet.Core
                 if (config.OnlineProbeSeconds == 60) { config.OnlineProbeSeconds = 20; }
                 // 只改「等于旧默认值 300」的那一份；用户自己填过的值（例如 240 / 600）原样保留。
                 if (config.SessionCheckSeconds == 300) { config.SessionCheckSeconds = 120; }
+                // 同上：只改等于旧默认值 3 的那一份；用户自己填的 5 / 10 之类原样保留。
+                if (config.LoginConfirmDelaySec == 3) { config.LoginConfirmDelaySec = new AppConfig().LoginConfirmDelaySec; }
                 if (config.ConfirmAttempts == 3 && config.ConfirmGapMs == 1000)
                 {
                     config.ConfirmAttempts = new AppConfig().ConfirmAttempts;

@@ -83,10 +83,14 @@ namespace CampusNet.Core
         /// 与登录风控无关。20 秒是折中 —— 被踢下线后约 20~40 秒就能发现，又不至于每轮都去打扰 Portal。
         /// </summary>
         private const int SuspectVerifyMinSeconds = 20;
-        /// <summary>忽略 Portal 业务提示后的复检节奏：先立刻看一眼，再按 3 / 5 / 12 秒复检（累计约 20 秒）。</summary>
-        private const int RecoveryFirstDelaySec = 3;
-        private const int RecoverySecondDelaySec = 5;
-        private const int RecoveryThirdDelaySec = 12;
+        /// <summary>
+        /// 提交登录后的复检节奏：先立刻看一眼（0 延迟的本地内容校验），再按
+        /// 2 / 3 / 4 / 5 / 6 / 3 秒加密复检（累计 2/5/9/14/20/23 秒，总窗口约 23 秒）。
+        /// 真机 50 次掉线实测：29 次都是在旧阶梯的最后一档（+20 秒）才由 Portal 确认，
+        /// 加密档位把「提交 → 确认」的中位耗时从 21~22 秒压到约 15 秒。
+        /// 每档只多一次只读 chkstatus，不碰任何登录风控闸门。
+        /// </summary>
+        private static readonly int[] RecoveryWaitsSec = new[] { 2, 3, 4, 5, 6, 3 };
 
         private readonly object _gate = new object();
         private readonly Logger _log;
@@ -797,6 +801,28 @@ namespace CampusNet.Core
             // 闸门 3：登录前二次确认
             if (config.LoginConfirmDelaySec > 0 && !relogin)
             {
+                // 先做一次纯本地内容校验（0 个 Portal 请求）：本地已经能取回内容，说明根本不用登录。
+                // 只在「本地探测判定不通」时用这条翻案——Portal 会话核对说离线时不能这么做，
+                // 「本机内容能取回」不代表账号没被踢，那正是需要登录的场景。
+                if (!probe.Online)
+                {
+                    int localLatency;
+                    if (NetworkProbe.ContentCheck(config, out localLatency))
+                    {
+                        // 内容校验已经通过，再跑一轮完整探测，好让界面/日志拿到真实的延迟、丢包与逐目标明细。
+                        ProbeOutcome recovered = NetworkProbe.Probe(config, config.ConfirmAttempts, config.ConfirmGapMs);
+                        if (recovered.Online)
+                        {
+                            UpdateNetwork(recovered);
+                            _log.Info("登录前本地内容校验已能上网（"
+                                + (localLatency < 0 ? "延迟未知" : localLatency + " ms")
+                                + "），网络已恢复，本轮不发任何 Portal 请求。");
+                            OnOnline(recovered, "登录前本地校验已能上网，无需登录");
+                            Persist(recovered.LatencyMs, recovered.LossPercent);
+                            return config.OnlineProbeSeconds;
+                        }
+                    }
+                }
                 Thread.Sleep(config.LoginConfirmDelaySec * 1000);
                 StatusResult confirm = portal.GetStatus();
                 if (!confirm.Reachable)
@@ -1052,8 +1078,7 @@ namespace CampusNet.Core
                 return true;
             }
             int elapsed = 0;
-            int[] waits = new[] { RecoveryFirstDelaySec, RecoverySecondDelaySec, RecoveryThirdDelaySec };
-            foreach (int wait in waits)
+            foreach (int wait in RecoveryWaitsSec)
             {
                 Thread.Sleep(Math.Max(1, wait) * 1000);
                 elapsed += wait;
@@ -1069,6 +1094,10 @@ namespace CampusNet.Core
                     how = "本地内容校验通过（+" + elapsed + " 秒）";
                     return true;
                 }
+                // Portal 状态接口整个不可达（Portal 挂了 / 网络根本没通）时，后面几档问也问不出结果，
+                // 每档只会白白耗满一次超时（真机实测一刀 4~5 秒），把整轮评估拖长几十秒。
+                // 这时候直接收工，交给上层按「待确认」处理，下一个周期继续复检。
+                if (!status.Reachable) { break; }
             }
             return false;
         }
