@@ -1,7 +1,7 @@
 <Window x:Class="CampusNet.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="校园网自动登录" Height="840" Width="1060" MinHeight="700" MinWidth="960"
+        Title="校园网自动登录" Height="840" Width="1060" MinHeight="780" MinWidth="960"
         WindowStartupLocation="CenterScreen"
         Background="{StaticResource PageBrush}"
         TextOptions.TextFormattingMode="Ideal"

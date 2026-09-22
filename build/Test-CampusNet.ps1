@@ -982,6 +982,13 @@ Assert '日志区最小高度 ≥ 110（窗口缩到最小时还能看几行）'
 Assert '日志区仍允许自身纵向滚动' ($null -ne $logView -and $logView.GetAttribute('VerticalScrollBarVisibility') -eq 'Auto') `
     "VerticalScrollBarVisibility=$($logView.GetAttribute('VerticalScrollBarVisibility'))"
 
+# 窗口不能小于「内容自然高度」：2.1.0 实测（UI Automation，100% DPI）把窗口拉到 960x700 时
+# 日志区被顶出窗口下沿（bottom 1011 > 窗口 bottom 976），760 仍溢出、780 才刚好放下。
+# 所以 MinHeight 必须 ≥ 780 —— 宁大勿小，免得又出现「控件被裁在窗口外」的老问题。
+$winMinHeightText = $xamlDoc.DocumentElement.GetAttribute('MinHeight')
+$winMinHeight = if ($winMinHeightText) { [int]$winMinHeightText } else { 0 }
+Assert '主窗口 MinHeight ≥ 780（不低于内容自然高度，避免日志区被顶出窗口）' ($winMinHeight -ge 780) "MinHeight=$winMinHeightText"
+
 # 除日志之外不允许滚动：主体内容整体是 Auto 行，窗口缩到 MinHeight 也不裁切。
 # （2.0.0 曾为「高级设置最后一行被裁掉」把主体塞进 ScrollViewer；2.1.0 把高级设置
 #   移进独立窗口后，主窗口不再需要任何外层滚动。）
