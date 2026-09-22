@@ -9,11 +9,11 @@
     <AssemblyName>CampusNet</AssemblyName>
     <RootNamespace>CampusNet</RootNamespace>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
-    <Version>2.0.0</Version>
+    <Version>2.1.0</Version>
     <AssemblyVersion>2.0.0.0</AssemblyVersion>
     <FileVersion>2.0.0.0</FileVersion>
     <Product>校园网自动登录</Product>
-    <AssemblyTitle>校园网自动登录 2.0</AssemblyTitle>
+    <AssemblyTitle>校园网自动登录 2.1</AssemblyTitle>
     <Description>校园网（Dr.COM ePortal）自动登录与网络监控面板</Description>
     <Company>CampusNet</Company>
     <Copyright>MIT License</Copyright>

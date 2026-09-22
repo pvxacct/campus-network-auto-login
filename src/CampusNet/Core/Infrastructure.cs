@@ -14,7 +14,7 @@ namespace CampusNet.Core
     {
         public const string AppName = "CampusNet";
         public const string DisplayName = "校园网自动登录";
-        public const string Version = "2.0.0";
+        public const string Version = "2.1.0";
 
         /// <summary>旧版（1.x PowerShell 版）残留位置，仅用于检测与清理。</summary>
         public const string LegacyScriptDir = @"C:\CampusAutoLogin";
@@ -299,10 +299,24 @@ namespace CampusNet.Core
         public const int MaxBytes = 5 * 1024 * 1024;
         private const int MemoryLines = 400;
 
+        /// <summary>内存环形缓冲里的一行：带上单调递增的序号，界面据此做「只追加新行」的增量渲染。</summary>
+        private sealed class Entry
+        {
+            public long Seq;
+            public string Line;
+        }
+
         private readonly object _gate = new object();
         private readonly string _path;
         private readonly string _oldPath;
-        private readonly LinkedList<string> _recent = new LinkedList<string>();
+        private readonly LinkedList<Entry> _recent = new LinkedList<Entry>();
+        private long _sequence;
+
+        /// <summary>本进程已经写过的日志行总数（含启动时从文件载入的那批）。</summary>
+        public long Sequence
+        {
+            get { lock (_gate) { return _sequence; } }
+        }
 
         public Logger(string path, string oldPath)
         {
@@ -331,7 +345,10 @@ namespace CampusNet.Core
                     }
                 }
                 int start = Math.Max(0, lines.Count - MemoryLines);
-                for (int i = start; i < lines.Count; i++) { _recent.AddLast(lines[i]); }
+                for (int i = start; i < lines.Count; i++)
+                {
+                    _recent.AddLast(new Entry { Seq = _sequence++, Line = lines[i] });
+                }
             }
             catch { }
         }
@@ -346,7 +363,7 @@ namespace CampusNet.Core
             string line = AppPaths.FormatTime(DateTime.Now) + " [" + level + "] " + message;
             lock (_gate)
             {
-                _recent.AddLast(line);
+                _recent.AddLast(new Entry { Seq = _sequence++, Line = line });
                 while (_recent.Count > MemoryLines) { _recent.RemoveFirst(); }
                 try
                 {
@@ -376,10 +393,9 @@ namespace CampusNet.Core
                 var node = _recent.Last;
                 while (node != null && result.Count < count)
                 {
-                    if (!warningsOnly || node.Value.IndexOf("[WARN]", StringComparison.Ordinal) >= 0 ||
-                        node.Value.IndexOf("[ERROR]", StringComparison.Ordinal) >= 0)
+                    if (!warningsOnly || IsWarning(node.Value.Line))
                     {
-                        result.Insert(0, node.Value);
+                        result.Insert(0, node.Value.Line);
                     }
                     node = node.Previous;
                 }
@@ -388,8 +404,44 @@ namespace CampusNet.Core
         }
 
         /// <summary>
+        /// 取出序号大于 <paramref name="afterSequence"/> 的日志行（界面增量渲染用）。
+        /// dropped = true 表示中间有行已经被内存环形缓冲挤掉（或一次拿到太多行），
+        /// 调用方应该整块重绘而不是追加。
+        /// </summary>
+        public List<string> Since(long afterSequence, int maxLines, bool warningsOnly,
+            out long lastSequence, out bool dropped)
+        {
+            var result = new List<string>();
+            lastSequence = afterSequence;
+            dropped = false;
+            lock (_gate)
+            {
+                if (_recent.Count > 0 && _recent.First.Value.Seq > afterSequence + 1) { dropped = true; }
+                foreach (Entry entry in _recent)
+                {
+                    if (entry.Seq <= afterSequence) { continue; }
+                    lastSequence = entry.Seq;
+                    if (!warningsOnly || IsWarning(entry.Line)) { result.Add(entry.Line); }
+                }
+                if (maxLines > 0 && result.Count > maxLines)
+                {
+                    result.RemoveRange(0, result.Count - maxLines);
+                    dropped = true;
+                }
+            }
+            return result;
+        }
+
+        private static bool IsWarning(string line)
+        {
+            return line.IndexOf("[WARN]", StringComparison.Ordinal) >= 0
+                || line.IndexOf("[ERROR]", StringComparison.Ordinal) >= 0;
+        }
+
+        /// <summary>
         /// 清空日志：删除 login.log 与 login.log.old，并清掉内存缓存，最后留一行「日志已清空」。
-        /// 界面上的「清空日志」按钮与 --clear-log 参数都走这里。
+        /// 2.1.0 起只有命令行参数 --clear-log（删除历史日志文件）会走这里；
+        /// 界面上的「清除显示」按钮只清空窗口里的显示，绝不碰这两个文件。
         /// </summary>
         public void Clear()
         {

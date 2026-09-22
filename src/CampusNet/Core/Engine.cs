@@ -33,6 +33,14 @@ namespace CampusNet.Core
         public string LastForcedRelogin = string.Empty;
         public bool HasCredential;
         public string UserName = string.Empty;
+        /// <summary>今日登录计数（本地日期）：确认成功次数 / 真正提交的请求次数。</summary>
+        public string DayKey = string.Empty;
+        public int DayLoginSuccess;
+        public int DayLoginAttempts;
+        /// <summary>「提交登录 → 确认恢复」耗时：最近一次（秒，-1 = 本次运行还没有样本）与本次运行中位。</summary>
+        public int LastRecoverySeconds = -1;
+        public int RecoveryMedianSeconds = -1;
+        public int RecoverySampleCount;
         public int LatencyMs = -1;
         public int LossPercent = 100;
         /// <summary>已完成的评估轮次编号（每次评估自增一次）。</summary>
@@ -76,21 +84,26 @@ namespace CampusNet.Core
         private const int PersistMinIntervalSeconds = 60;
         /// <summary>系统网络变化事件的防抖窗口：网卡插拔时事件会连成一串，只按最后一次处理。</summary>
         private const int NetworkEventDebounceMs = 1000;
-        /// <summary>连续多少轮拿不到内容校验才认定「疑似掉线」并发起 Portal 核对（配合 20 秒节奏约 40 秒）。</summary>
-        private const int SuspectStreakForVerify = 2;
+        /// <summary>
+        /// 连续多少轮拿不到内容校验才认定「疑似掉线」并发起 Portal 核对。
+        /// 2.1.0 起为 1：上一版要连丢两轮（约 40 秒）才核对，掉线发现太慢；
+        /// 单次抖动仍由「当轮补测一次」挡掉，实测 140 次疑似核对零误报。
+        /// </summary>
+        private const int SuspectStreakForVerify = 1;
         /// <summary>
         /// 疑似掉线期间向 Portal 求证的最小间隔：只影响「只读 chkstatus」的发起频率，
-        /// 与登录风控无关。20 秒是折中 —— 被踢下线后约 20~40 秒就能发现，又不至于每轮都去打扰 Portal。
+        /// 与登录风控无关。2.1.0 起为 10 秒（上一版 20 秒）：被踢下线后约 10~20 秒就能发现。
         /// </summary>
-        private const int SuspectVerifyMinSeconds = 20;
+        private const int SuspectVerifyMinSeconds = 10;
         /// <summary>
-        /// 提交登录后的复检节奏：先立刻看一眼（0 延迟的本地内容校验），再按
-        /// 2 / 3 / 4 / 5 / 6 / 3 秒加密复检（累计 2/5/9/14/20/23 秒，总窗口约 23 秒）。
-        /// 真机 50 次掉线实测：29 次都是在旧阶梯的最后一档（+20 秒）才由 Portal 确认，
-        /// 加密档位把「提交 → 确认」的中位耗时从 21~22 秒压到约 15 秒。
+        /// 提交登录后的复检节奏：先立刻看一眼（0 延迟的本地内容校验），再按**每档 2 秒**复检
+        /// 12 档（累计 2/4/6/8/…/24 秒，总窗口约 24 秒）。
+        /// 真机实测「提交 → 确认」中位 22 秒、p25 16 秒、p75 26 秒：上一版的 3~6 秒粒度太粗，
+        /// 真实信号出现后平均还要多等 2~4 秒才被看见，所以改成 2 秒一档。
         /// 每档只多一次只读 chkstatus，不碰任何登录风控闸门。
         /// </summary>
-        private static readonly int[] RecoveryWaitsSec = new[] { 2, 3, 4, 5, 6, 3 };
+        private static readonly int[] RecoveryWaitsSec =
+            new[] { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 };
 
         private readonly object _gate = new object();
         private readonly Logger _log;
@@ -128,6 +141,13 @@ namespace CampusNet.Core
         /// </summary>
         private DateTime _loginWaitUntil = DateTime.MinValue;
 
+        /// <summary>
+        /// 「提交登录 → 确认恢复」的耗时样本（秒），只保留本次运行最近 N 次。
+        /// 纯内存数据：不写 state.json、不新增文件（与只读约束一致），退出即清空。
+        /// </summary>
+        private readonly List<int> _recoverySamples = new List<int>();
+        private const int RecoverySampleLimit = 20;
+
         private DateTime _lastPersistUtc = DateTime.MinValue;
         private string _persistedStatusKey;
         private bool _persistedOnline;
@@ -137,6 +157,8 @@ namespace CampusNet.Core
         private string _persistedSessionCheck;
         private int _persistedIgnoredPrompts;
         private string _persistedForcedRelogin;
+        private int _persistedDayAttempts = -1;
+        private int _persistedDaySuccess = -1;
 
         public LoginEngine(Logger log)
         {
@@ -176,7 +198,9 @@ namespace CampusNet.Core
                     credential != null ? credential.Password : string.Empty);
                 // 状态对象永远不换新的：后台线程正握着自己的引用往状态里写，
                 // 换掉对象会让这一轮结果写进被丢弃的对象（状态丢失，甚至用旧内容覆盖状态文件）。
-                _state.CopyFrom(loaded);
+                // 用 MergeFrom 而不是 CopyFrom：累计计数（运行次数 / 已忽略提示 / 今日登录）
+                // 只增不减，避免磁盘上更旧的快照把统计值拉回去（本机出现过 33 → 18 的倒退）。
+                _state.MergeFrom(loaded);
                 _snapshot.HasCredential = credential != null && credential.IsUsable;
                 _snapshot.UserName = credential != null ? credential.UserName : string.Empty;
                 ResetPersistGate();
@@ -202,6 +226,9 @@ namespace CampusNet.Core
         {
             lock (_gate)
             {
+                // 今日计数：跨零点先翻篇，再记本次「真正提交出去的请求」
+                _state.RollDay(now);
+                _state.DayLoginAttempts++;
                 DateTime? windowStart = _state.LoginWindowStartTime;
                 if (!windowStart.HasValue || (now - windowStart.Value).TotalHours >= 1)
                 {
@@ -212,6 +239,42 @@ namespace CampusNet.Core
                 _state.LastLoginAttempt = AppPaths.FormatTime(now);
                 return _state.LoginWindowCount;
             }
+        }
+
+        /// <summary>记一次「确认成功」的登录（含手动「立即重连」），并累计今日成功次数。</summary>
+        private void CountLoginSuccess(DateTime now)
+        {
+            lock (_gate)
+            {
+                _state.RollDay(now);
+                _state.DayLoginSuccess++;
+            }
+        }
+
+        /// <summary>
+        /// 记录一次「提交登录 → 确认恢复」的耗时。只更新内存快照，不落盘。
+        /// </summary>
+        private int RecordRecovery(DateTime submittedAt)
+        {
+            int seconds = (int)Math.Round((DateTime.Now - submittedAt).TotalSeconds);
+            if (seconds < 0) { seconds = 0; }
+            lock (_gate)
+            {
+                _recoverySamples.Add(seconds);
+                while (_recoverySamples.Count > RecoverySampleLimit) { _recoverySamples.RemoveAt(0); }
+                _snapshot.LastRecoverySeconds = seconds;
+                _snapshot.RecoverySampleCount = _recoverySamples.Count;
+                _snapshot.RecoveryMedianSeconds = Median(_recoverySamples);
+            }
+            return seconds;
+        }
+
+        private static int Median(List<int> values)
+        {
+            if (values == null || values.Count == 0) { return -1; }
+            var sorted = new List<int>(values);
+            sorted.Sort();
+            return sorted[sorted.Count / 2];
         }
 
         /// <summary>本小时窗口内已经提交了多少次登录（窗口过期返回 0）。</summary>
@@ -226,10 +289,11 @@ namespace CampusNet.Core
         }
 
         /// <summary>
-        /// 等待期与「恢复监视」的轮询间隔：跟随 OfflineProbeSeconds（默认约 5 秒），最低 3 秒。
+        /// 「不正常」时的复测节奏（秒）：跟随 OfflineProbeSeconds（2.1.0 起默认 3 秒），最低 3 秒。
+        /// 它同时用于「疑似掉线复测」「最小间隔等待期的恢复监视」以及登录失败后的下一轮。
         /// 这个节奏只影响纯本地探测，不产生任何 Portal 请求。
         /// </summary>
-        private static int WatchIntervalSeconds(AppConfig config)
+        private static int ReprobeSeconds(AppConfig config)
         {
             return Math.Max(3, config.OfflineProbeSeconds);
         }
@@ -412,6 +476,12 @@ namespace CampusNet.Core
                 copy.LastForcedRelogin = from.LastForcedRelogin;
                 copy.HasCredential = from.HasCredential;
                 copy.UserName = from.UserName;
+                copy.DayKey = from.DayKey;
+                copy.DayLoginSuccess = from.DayLoginSuccess;
+                copy.DayLoginAttempts = from.DayLoginAttempts;
+                copy.LastRecoverySeconds = from.LastRecoverySeconds;
+                copy.RecoveryMedianSeconds = from.RecoveryMedianSeconds;
+                copy.RecoverySampleCount = from.RecoverySampleCount;
                 copy.LatencyMs = from.LatencyMs;
                 copy.LossPercent = from.LossPercent;
                 copy.Network = from.Network;
@@ -565,7 +635,7 @@ namespace CampusNet.Core
 
             // ---------- 最小间隔等待期：只做本地探测，不发任何 Portal 请求 ----------
             // 真机实测（2026-09-17 23:10:21 → 23:10:54）：闸门 1 让工作线程睡满剩余间隔，
-            // 这 33 秒里网络其实已经恢复，却没人去确认。现在改成按约 5 秒的节奏复测：
+            // 这 33 秒里网络其实已经恢复，却没人去确认。现在改成按约 3 秒的节奏复测：
             // 探测恢复正常就往下走（交给既有的「内容校验通过 → 网络已恢复」路径），
             // 仍然不通就继续短间隔复测。这一段不发 chkstatus、不发 login，登录风控闸门一概不变。
             if (!relogin && now < _loginWaitUntil)
@@ -578,7 +648,7 @@ namespace CampusNet.Core
                     SetStatus("login-wait", "刚登录过，约 " + remain + " 秒后再试（正在本地监视网络恢复）");
                     _log.WarnOnce("login-watch", "处于最小间隔等待期：本轮只做本地探测，不发 Portal 请求；网络一恢复就立即确认。");
                     Persist(probe.LatencyMs, probe.LossPercent);
-                    return WatchIntervalSeconds(config);
+                    return ReprobeSeconds(config);
                 }
                 if (!_state.Online)
                 {
@@ -610,7 +680,8 @@ namespace CampusNet.Core
 
                 if (suspect)
                 {
-                    // 连续两轮（约 40 秒）都拿不到内容校验才算「疑似掉线」：单次抖动不再改状态。
+                    // 2.1.0 起连续 1 轮拿不到内容校验就算「疑似掉线」：单次抖动已经被上面那次
+                    // 「立刻补测」挡掉，再等第二轮（约 40 秒）只会让掉线被发现得更晚。
                     _suspectStreak++;
                     if (!_suspectSince.HasValue) { _suspectSince = now; }
                 }
@@ -678,10 +749,9 @@ namespace CampusNet.Core
                 {
                     // 还没到核对时间：如实说明「只有 TCP 握手通过」，别让界面显示成一切正常
                     SetStatus("tcp-only", "内容校验连续 " + _suspectStreak + " 次没过（疑似网关代答），稍后向 Portal 核对");
-                    // 疑似掉线时按「异常」的节奏复测（默认 5 秒），别等满 20 秒才确认第二次，
-                    // 否则被踢下线后要拖 40 秒以上才会去核对 Portal。
+                    // 疑似掉线时按「异常」的节奏复测（2.1.0 起默认 3 秒），别等满一个正常探测周期才确认第二次。
                     Persist(probe.LatencyMs, probe.LossPercent);
-                    return Math.Max(5, config.OfflineProbeSeconds);
+                    return ReprobeSeconds(config);
                 }
                 else
                 {
@@ -772,7 +842,7 @@ namespace CampusNet.Core
                         _loginWaitUntil = reference.Value.AddSeconds(config.LoginMinIntervalSeconds);
                         SetStatus("login-wait", "刚登录过，约 " + wait + " 秒后再试（正在本地监视网络恢复）");
                         Persist(probe.LatencyMs, probe.LossPercent);
-                        return WatchIntervalSeconds(config);
+                        return ReprobeSeconds(config);
                     }
                 }
             }
@@ -849,6 +919,8 @@ namespace CampusNet.Core
             string limitReason = string.Empty;
             string ignoredPrompt = string.Empty;
             DateTime lastSubmit = now;
+            // 「提交 → 确认恢复」耗时的起点：真正调用登录接口的那一刻（重试时按最后一次算）。
+            DateTime submittedAt = now;
             for (int attempt = 1; attempt <= config.RetryCount; attempt++)
             {
                 // 每一次提交都要重新过闸门。RetryCount 只决定「一次触发最多提交几次」，
@@ -883,6 +955,7 @@ namespace CampusNet.Core
 
                 _log.Info("第 " + attempt + "/" + config.RetryCount + " 次尝试登录（账号 "
                     + Redact.MaskUser(credential.UserName) + "）。");
+                submittedAt = DateTime.Now;
                 PortalLoginResult result = portal.Login(credential.UserName, credential.Password);
                 lastSubmit = DateTime.Now;
                 // 提交过登录请求就开始计时：最小间隔以内不再发第二次登录请求，
@@ -966,8 +1039,10 @@ namespace CampusNet.Core
                     _state.ConsecutiveFailures = 0;
                     _state.LastLoginSuccess = AppPaths.FormatTime(DateTime.Now);
                 }
+                CountLoginSuccess(DateTime.Now);
+                int recoverySeconds = RecordRecovery(submittedAt);
                 ResetSuspect();
-                _log.Info("自动登录成功，网络已恢复。");
+                _log.Info("自动登录成功，网络已恢复（提交 → 确认耗时 " + recoverySeconds + " 秒）。");
                 SetStatus("online", "在线（刚刚自动登录）");
                 Persist(-1, 0);
                 return config.OnlineProbeSeconds;
@@ -983,9 +1058,9 @@ namespace CampusNet.Core
                     _state.LastError = "登录请求已提交，但状态接口不可达，无法确认是否已联网";
                 }
                 SetStatus("login-unconfirmed", "登录已提交，等待确认（Portal 状态接口暂时不可达）");
-                _log.Warn("本次不记为登录成功（未确认），按 " + Math.Max(5, config.OfflineProbeSeconds) + " 秒的节奏继续复检。");
+                _log.Warn("本次不记为登录成功（未确认），按 " + ReprobeSeconds(config) + " 秒的节奏继续复检。");
                 Persist(probe.LatencyMs, probe.LossPercent);
-                return Math.Max(5, config.OfflineProbeSeconds);
+                return ReprobeSeconds(config);
             }
 
             if (!string.IsNullOrEmpty(limitReason))
@@ -1032,7 +1107,7 @@ namespace CampusNet.Core
                 SetStatus("login-failed", "自动登录失败：" + Shorten(lastMessage));
             }
             Persist(probe.LatencyMs, probe.LossPercent);
-            return Math.Max(5, config.OfflineProbeSeconds);
+            return ReprobeSeconds(config);
         }
 
         /// <summary>内容校验恢复正常：清空「疑似掉线」状态机。</summary>
@@ -1062,8 +1137,8 @@ namespace CampusNet.Core
 
         /// <summary>
         /// 登录返回「账号已在别处在线 / 密码错误」这类提示后，会话往往还要几秒才真正生效。
-        /// 先立刻做一次本地内容校验（0 延迟、不发 Portal 请求），再按 3 / 5 / 12 秒做几轮
-        /// 轻量复检（只读 chkstatus + 本地内容校验），通了就立刻算成功。
+        /// 先立刻做一次本地内容校验（0 延迟、不发 Portal 请求），再按每档 2 秒共 12 档
+        /// （累计 24 秒）做轻量复检（只读 chkstatus + 本地内容校验），通了就立刻算成功。
         /// </summary>
         private bool WaitForRecovery(AppConfig config, PortalClient portal, out string how)
         {
@@ -1196,7 +1271,9 @@ namespace CampusNet.Core
                     || _persistedLoginCount != _state.LoginWindowCount
                     || _persistedIgnoredPrompts != _state.IgnoredPrompts
                     || !string.Equals(_persistedForcedRelogin, _state.LastForcedRelogin, StringComparison.Ordinal)
-                    || !string.Equals(_persistedSessionCheck, _state.LastSessionCheck, StringComparison.Ordinal);
+                    || !string.Equals(_persistedSessionCheck, _state.LastSessionCheck, StringComparison.Ordinal)
+                    || _persistedDayAttempts != _state.DayLoginAttempts
+                    || _persistedDaySuccess != _state.DayLoginSuccess;
                 if (force || changed || (DateTime.UtcNow - _lastPersistUtc).TotalSeconds >= PersistMinIntervalSeconds)
                 {
                     try { _state.Save(AppPaths.StateFile); } catch { }
@@ -1209,6 +1286,8 @@ namespace CampusNet.Core
                     _persistedIgnoredPrompts = _state.IgnoredPrompts;
                     _persistedForcedRelogin = _state.LastForcedRelogin;
                     _persistedSessionCheck = _state.LastSessionCheck;
+                    _persistedDayAttempts = _state.DayLoginAttempts;
+                    _persistedDaySuccess = _state.DayLoginSuccess;
                 }
                 _snapshot.LastResult = _state.LastResult;
                 _snapshot.Online = _state.Online;
@@ -1229,6 +1308,9 @@ namespace CampusNet.Core
                 _snapshot.IgnoredPrompts = _state.IgnoredPrompts;
                 _snapshot.LastIgnoredPrompt = _state.LastIgnoredPrompt;
                 _snapshot.LastForcedRelogin = _state.LastForcedRelogin;
+                _snapshot.DayKey = _state.DayKey;
+                _snapshot.DayLoginSuccess = _state.TodaySuccess(DateTime.Now);
+                _snapshot.DayLoginAttempts = _state.TodayAttempts(DateTime.Now);
                 _snapshot.HasCredential = _credential != null && _credential.IsUsable;
                 _snapshot.UserName = _credential != null ? _credential.UserName : string.Empty;
                 if (latencyMs >= 0) { _snapshot.LatencyMs = latencyMs; }
@@ -1249,6 +1331,9 @@ namespace CampusNet.Core
                 _snapshot.IgnoredPrompts = _state.IgnoredPrompts;
                 _snapshot.LastIgnoredPrompt = _state.LastIgnoredPrompt;
                 _snapshot.LastForcedRelogin = _state.LastForcedRelogin;
+                _snapshot.DayKey = _state.DayKey;
+                _snapshot.DayLoginSuccess = _state.TodaySuccess(DateTime.Now);
+                _snapshot.DayLoginAttempts = _state.TodayAttempts(DateTime.Now);
                 _snapshot.LastLoginSuccess = _state.LastLoginSuccessTime;
                 _snapshot.LastSessionCheck = _state.LastSessionCheck;
                 _snapshot.LastSessionResult = _state.LastSessionResult;

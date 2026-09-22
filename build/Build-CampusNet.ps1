@@ -1,5 +1,5 @@
 ﻿<#
-  一键编译 2.0 单文件 exe。
+  一键编译 2.x 单文件 exe。
   产物：dist\CampusNet.exe（仓库内提交的可执行文件）+ dist\CampusNet.exe.sha256
         + dist\CampusNet.exe.src.sha256（源码指纹，供 CI 判断产物是否与源码对应）
 
@@ -42,7 +42,7 @@ Write-Host ('源码指纹：{0}' -f $fingerprint)
 Write-Host ''
 Write-Host '== 版本自检 ==' -ForegroundColor Cyan
 $version = (& $exe --version | Out-String).Trim()
-if ($version -ne '2.0.0') { throw "版本号不符合预期：$version" }
+if ($version -ne '2.1.0') { throw "版本号不符合预期：$version" }
 Write-Host "版本：$version"
 
 if (-not $SkipTests) {

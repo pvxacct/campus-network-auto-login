@@ -31,7 +31,7 @@ function Write-Config {
         [string[]]$Targets
     )
     $config = [ordered]@{
-        ConfigVersion          = 7
+        ConfigVersion          = 8
         PortalHost             = $PortalHost
         EportalPort            = 801
         StatusPath             = '/drcom/chkstatus'
@@ -193,6 +193,7 @@ function Invoke-Scenario {
 
     $run = [pscustomobject]@{
         Name = $Name; Status = $status; Login = $login; Logout = $logout
+        Dir = $dataDir; LogPath = $logPath
         Requests = $requests; State = $state; Output = $output; Log = $logContent; ExitCode = $exitCode
     }
     $script:lastRun = $run
@@ -209,6 +210,32 @@ function Assert {
         if ($diag) { $Detail = $Detail + '｜现场：' + $diag }
         $results.Add("FAIL  $Name  -> $Detail")
     }
+}
+
+# 日志里两条记录相差多少秒（找不到任意一条返回 -1）
+function Get-LogSecondsBetween {
+    param([string]$Log, [string]$FromPattern, [string]$ToPattern)
+    $a = [regex]::Match($Log, '(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[^\r\n]*' + $FromPattern)
+    $b = [regex]::Match($Log, '(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[^\r\n]*' + $ToPattern)
+    if (-not $a.Success -or -not $b.Success) { return -1 }
+    $t1 = [datetime]::ParseExact($a.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $null)
+    $t2 = [datetime]::ParseExact($b.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $null)
+    return [math]::Round(($t2 - $t1).TotalSeconds, 0)
+}
+
+# 从假 Portal 的请求日志里取某一类请求的毫秒时间戳（每行形如 "GET /drcom/chkstatus @1727000000123"），
+# 用来断言「两次核对之间隔了多久」这类节奏问题。
+function Get-RequestTimes {
+    param([string]$LogPath, [string]$Kind)
+    $times = New-Object System.Collections.Generic.List[long]
+    if (-not (Test-Path -LiteralPath $LogPath)) { return $times.ToArray() }
+    foreach ($line in (Get-Content -LiteralPath $LogPath)) {
+        if ($line -notmatch '^(GET|POST) ') { continue }
+        if ($line -notmatch [regex]::Escape($Kind)) { continue }
+        $m = [regex]::Match($line, '@(\d+)\s*$')
+        if ($m.Success) { $times.Add([long]$m.Groups[1].Value) }
+    }
+    return $times.ToArray()
 }
 
 Write-Host "使用 exe：$Exe"
@@ -314,11 +341,11 @@ Assert '迁移后探测目标共 4 项' ($migratedTargets.ProbeTargets.Count -eq
 $legacyV3 = @('http:www.msftconnecttest.com/connecttest.txt|Microsoft Connect Test', 'tcp:223.5.5.5:443', 'tcp:114.114.114.114:53')
 $migratedV3 = Invoke-TargetsMigration -Name 's8-legacy-v3-targets' -Targets $legacyV3
 Assert 'pre.5 默认探测列表被换成新的四条' ($migratedV3.ProbeTargets.Count -eq 4 -and $migratedV3.ProbeTargets[0] -eq 'http:connect.rom.miui.com/generate_204|204') "ProbeTargets=$($migratedV3.ProbeTargets -join ',')"
-Assert 'pre.5 配置迁移后写入 ConfigVersion=7' ($migratedV3.ConfigVersion -eq 7) "ConfigVersion=$($migratedV3.ConfigVersion)"
+Assert 'pre.5 配置迁移后写入 ConfigVersion=8' ($migratedV3.ConfigVersion -eq 8) "ConfigVersion=$($migratedV3.ConfigVersion)"
 
 $migrated = Invoke-ConfigMigration -Name 's8-migrate' -OnlineProbe 60
-Assert '旧默认 60 秒迁移为 20 秒' ($migrated.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($migrated.OnlineProbeSeconds)"
-Assert '迁移后写入 ConfigVersion=7' ($migrated.ConfigVersion -eq 7) "ConfigVersion=$($migrated.ConfigVersion)"
+Assert '旧默认 60 秒迁移为 10 秒' ($migrated.OnlineProbeSeconds -eq 10) "OnlineProbeSeconds=$($migrated.OnlineProbeSeconds)"
+Assert '迁移后写入 ConfigVersion=8' ($migrated.ConfigVersion -eq 8) "ConfigVersion=$($migrated.ConfigVersion)"
 Assert '迁移后剔除 LoginCooldownMinutes' (-not ($migrated.PSObject.Properties.Name -contains 'LoginCooldownMinutes')) '仍存在该键'
 Assert '迁移后保留自定义 ProbeTargets' (($migrated.ProbeTargets -join ',') -eq (Off-Target 65001)) "ProbeTargets=$($migrated.ProbeTargets -join ',')"
 
@@ -331,14 +358,15 @@ New-Item -ItemType Directory -Force -Path $freshDir | Out-Null
 Set-TestCredentials -Dir $freshDir
 & $Exe '--run-seconds' 4 '--data-dir' $freshDir | Out-String | Out-Null
 $fresh = Get-Content -LiteralPath (Join-Path $freshDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-Assert '新配置默认在线探测 20 秒' ($fresh.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($fresh.OnlineProbeSeconds)"
+Assert '新配置默认在线探测 10 秒' ($fresh.OnlineProbeSeconds -eq 10) "OnlineProbeSeconds=$($fresh.OnlineProbeSeconds)"
 Assert '新配置默认兜底巡检 300 秒' ($fresh.UpstreamProbeSeconds -eq 300) "UpstreamProbeSeconds=$($fresh.UpstreamProbeSeconds)"
 Assert '新配置默认带「204 内容校验」目标' ($fresh.ProbeTargets[0] -eq 'http:connect.rom.miui.com/generate_204|204') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
 Assert '新配置默认共 4 条探测目标' ($fresh.ProbeTargets.Count -eq 4) "Count=$($fresh.ProbeTargets.Count)"
 Assert '新配置默认保留微软内容校验目标' (($fresh.ProbeTargets -join ' ') -match 'msftconnecttest') "ProbeTargets=$($fresh.ProbeTargets -join ',')"
-Assert '新配置默认会话校验 120 秒' ($fresh.SessionCheckSeconds -eq 120) "SessionCheckSeconds=$($fresh.SessionCheckSeconds)"
+Assert '新配置默认会话核对 60 秒' ($fresh.SessionCheckSeconds -eq 60) "SessionCheckSeconds=$($fresh.SessionCheckSeconds)"
+Assert '新配置默认异常探测 3 秒' ($fresh.OfflineProbeSeconds -eq 3) "OfflineProbeSeconds=$($fresh.OfflineProbeSeconds)"
 Assert '新配置默认残留重登 60 秒' ($fresh.StuckReloginSeconds -eq 60) "StuckReloginSeconds=$($fresh.StuckReloginSeconds)"
-Assert '新配置写入 ConfigVersion=7' ($fresh.ConfigVersion -eq 7) "ConfigVersion=$($fresh.ConfigVersion)"
+Assert '新配置写入 ConfigVersion=8' ($fresh.ConfigVersion -eq 8) "ConfigVersion=$($fresh.ConfigVersion)"
 Assert '新配置默认登录前确认 1 秒' ($fresh.LoginConfirmDelaySec -eq 1) "LoginConfirmDelaySec=$($fresh.LoginConfirmDelaySec)"
 Assert '新配置默认 HTTP 探测超时 3000 毫秒' ($fresh.HttpProbeTimeoutMs -eq 3000) "HttpProbeTimeoutMs=$($fresh.HttpProbeTimeoutMs)"
 Assert '新配置默认复检 2 轮 / 500 毫秒' ($fresh.ConfirmAttempts -eq 2 -and $fresh.ConfirmGapMs -eq 500) "Attempts=$($fresh.ConfirmAttempts) Gap=$($fresh.ConfirmGapMs)"
@@ -621,7 +649,7 @@ function Invoke-ConfirmMigration {
 $confirmMigrated = Invoke-ConfirmMigration -Name 's23-migrate' -Attempts 3 -Gap 1000
 Assert 'pre.6 的复检节奏迁移为 2 轮 / 500 毫秒' ($confirmMigrated.ConfirmAttempts -eq 2 -and $confirmMigrated.ConfirmGapMs -eq 500) `
     "Attempts=$($confirmMigrated.ConfirmAttempts) Gap=$($confirmMigrated.ConfirmGapMs)"
-Assert '迁移后写入 ConfigVersion=7' ($confirmMigrated.ConfigVersion -eq 7) "ConfigVersion=$($confirmMigrated.ConfigVersion)"
+Assert '迁移后写入 ConfigVersion=8' ($confirmMigrated.ConfigVersion -eq 8) "ConfigVersion=$($confirmMigrated.ConfigVersion)"
 $confirmCustom = Invoke-ConfirmMigration -Name 's23-custom' -Attempts 4 -Gap 1500
 Assert '自定义复检参数不被改写' ($confirmCustom.ConfirmAttempts -eq 4 -and $confirmCustom.ConfirmGapMs -eq 1500) `
     "Attempts=$($confirmCustom.ConfirmAttempts) Gap=$($confirmCustom.ConfirmGapMs)"
@@ -641,7 +669,7 @@ function New-RawConfig {
         [int]$StatusTimeout = 5
     )
     $cfg = [ordered]@{
-        ConfigVersion           = 7
+        ConfigVersion           = 8
         PortalHost              = $PortalHost
         EportalPort             = 801
         StatusPath              = '/drcom/chkstatus'
@@ -698,7 +726,7 @@ function Invoke-RawRun {
     $localLog = Join-Path $dir 'login.log'
     if (Test-Path -LiteralPath $localLog) { $logText = Get-Content -LiteralPath $localLog -Raw -Encoding UTF8 }
     $run = [pscustomobject]@{
-        Name = $Name; Dir = $dir; Requests = $requests; State = $state; StateText = $stateText; Log = $logText; Output = $output
+        Name = $Name; Dir = $dir; LogPath = $logPath; Requests = $requests; State = $state; StateText = $stateText; Log = $logText; Output = $output
         Status = (@($requests | Where-Object { $_ -match 'chkstatus' }).Count)
         Login = (@($requests | Where-Object { $_ -match 'login' }).Count)
         ExitCode = $exitCode
@@ -830,8 +858,8 @@ function Invoke-SessionMigration {
 }
 
 $sessMigrated = Invoke-SessionMigration -Name 's30-session-migrate' -SessionCheck 300
-Assert '旧默认会话核对 300 秒迁移为 120 秒' ($sessMigrated.SessionCheckSeconds -eq 120) "SessionCheckSeconds=$($sessMigrated.SessionCheckSeconds)"
-Assert '会话核对迁移后写入 ConfigVersion=7' ($sessMigrated.ConfigVersion -eq 7) "ConfigVersion=$($sessMigrated.ConfigVersion)"
+Assert '旧默认会话核对 300 秒迁移为 60 秒' ($sessMigrated.SessionCheckSeconds -eq 60) "SessionCheckSeconds=$($sessMigrated.SessionCheckSeconds)"
+Assert '会话核对迁移后写入 ConfigVersion=8' ($sessMigrated.ConfigVersion -eq 8) "ConfigVersion=$($sessMigrated.ConfigVersion)"
 Assert '迁移不会动同为 300 的兜底巡检间隔' ($sessMigrated.UpstreamProbeSeconds -eq 300) "UpstreamProbeSeconds=$($sessMigrated.UpstreamProbeSeconds)"
 $sessCustom = Invoke-SessionMigration -Name 's30-session-custom' -SessionCheck 240
 Assert '自定义会话核对 240 秒不被改写' ($sessCustom.SessionCheckSeconds -eq 240) "SessionCheckSeconds=$($sessCustom.SessionCheckSeconds)"
@@ -846,6 +874,13 @@ Assert '疑似掉线时 34 秒内完成两次核对（旧常量 60 秒做不到�
 Assert '疑似路径的日志写明来源' ($n.Log -match '疑似掉线核对：') '日志里没有「疑似掉线核对：」'
 Assert '疑似核对在状态里记为 suspect' ($n.State.LastSessionCheckKind -eq 'suspect') "LastSessionCheckKind=$($n.State.LastSessionCheckKind)"
 Assert '核对发现离线后自动登录' ($n.Login -ge 1) "login=$($n.Login)"
+
+# 2.1.0：疑似核对的最小间隔从 20 秒压到 10 秒。用假 Portal 的请求时间戳量两次核对的间隔，
+# 旧值（20 秒）无论怎么调度都不可能小于 14 秒。
+$chkTimes = @(Get-RequestTimes -LogPath $n.LogPath -Kind 'chkstatus')
+$chkGap = if ($chkTimes.Count -ge 2) { [math]::Round(($chkTimes[1] - $chkTimes[0]) / 1000.0, 1) } else { -1 }
+Assert '两次疑似核对间隔 ≤ 14 秒（旧值 20 秒）' ($chkGap -ge 0 -and $chkGap -le 14) `
+    "间隔=$chkGap 秒（chkstatus=$($chkTimes.Count) 次）"
 
 # 场景 32：--relogin 必须等「注销 + 重新登录」真正跑完
 # 旧写法固定跑 25 秒，注销成功、等待 3 秒后就直接退出了，登录请求根本没提交。
@@ -877,32 +912,51 @@ Assert '--relogin 输出带最终状态' ($reloginOut -match '状态：') '输�
 
 # 场景 29：界面布局扫描——任何 Grid 用到未声明的行/列都要失败。
 # WPF 对越界行号不报错，而是把控件塞进最后一行：pre.7 的高级设置整行叠印就是这么来的。
+# 2.1.0 起主窗口与「高级设置」独立窗口都要过这一关。
+# 坑：XmlNamespaceManager 与 XmlNode 本身都是「可枚举」的（前者枚举前缀、后者枚举子节点），
+# 所以只要穿过函数参数或管道就会被 PowerShell 拆成数组（实测报错
+# "Cannot convert System.Object[] to type XmlNamespaceManager"）。全部在脚本作用域里直接持有。
 $xamlPath = Join-Path $repo 'src\CampusNet\MainWindow.xaml'
-[xml]$xamlDoc = Get-Content -LiteralPath $xamlPath -Raw -Encoding UTF8
+$advancedXamlPath = Join-Path $repo 'src\CampusNet\AdvancedWindow.xaml'
+$mainXamlText = Get-Content -LiteralPath $xamlPath -Raw -Encoding UTF8
+$advancedXamlText = Get-Content -LiteralPath $advancedXamlPath -Raw -Encoding UTF8
+[xml]$xamlDoc = $mainXamlText
+[xml]$advancedDoc = $advancedXamlText
 $ns = New-Object System.Xml.XmlNamespaceManager($xamlDoc.NameTable)
 $ns.AddNamespace('x', 'http://schemas.microsoft.com/winfx/2006/xaml/presentation')
+$ns.AddNamespace('xa', 'http://schemas.microsoft.com/winfx/2006/xaml')
+$advancedNs = New-Object System.Xml.XmlNamespaceManager($advancedDoc.NameTable)
+$advancedNs.AddNamespace('x', 'http://schemas.microsoft.com/winfx/2006/xaml/presentation')
+$advancedNs.AddNamespace('xa', 'http://schemas.microsoft.com/winfx/2006/xaml')
+
 $overflow = New-Object System.Collections.Generic.List[string]
-$gridIndex = 0
-$maxRows = 0
-foreach ($grid in $xamlDoc.SelectNodes('//x:Grid', $ns)) {
-    $gridIndex++
-    $rows = $grid.SelectNodes('x:Grid.RowDefinitions/x:RowDefinition', $ns).Count
-    $cols = $grid.SelectNodes('x:Grid.ColumnDefinitions/x:ColumnDefinition', $ns).Count
-    if ($rows -gt $maxRows) { $maxRows = $rows }
-    foreach ($child in $grid.SelectNodes('*', $ns)) {
-        if ($child.LocalName -eq 'Grid.RowDefinitions' -or $child.LocalName -eq 'Grid.ColumnDefinitions') { continue }
-        $row = $child.GetAttribute('Grid.Row')
-        $col = $child.GetAttribute('Grid.Column')
-        if ($row -ne '' -and [int]$row -ge $rows) {
-            $overflow.Add("第 $gridIndex 个 Grid 的 $($child.LocalName) 用到 Grid.Row=$row，只声明了 $rows 行")
-        }
-        if ($col -ne '' -and [int]$col -ge $cols) {
-            $overflow.Add("第 $gridIndex 个 Grid 的 $($child.LocalName) 用到 Grid.Column=$col，只声明了 $cols 列")
+$scanTargets = @(
+    @{ Doc = $xamlDoc; XmlNs = $ns; Label = '主窗口' },
+    @{ Doc = $advancedDoc; XmlNs = $advancedNs; Label = '高级设置窗口' }
+)
+foreach ($scan in $scanTargets) {
+    $doc = $scan.Doc
+    $xmlNs = $scan.XmlNs
+    $label = $scan.Label
+    $index = 0
+    foreach ($grid in $doc.SelectNodes('//x:Grid', $xmlNs)) {
+        $index++
+        $rows = $grid.SelectNodes('x:Grid.RowDefinitions/x:RowDefinition', $xmlNs).Count
+        $cols = $grid.SelectNodes('x:Grid.ColumnDefinitions/x:ColumnDefinition', $xmlNs).Count
+        foreach ($child in $grid.SelectNodes('*', $xmlNs)) {
+            if ($child.LocalName -eq 'Grid.RowDefinitions' -or $child.LocalName -eq 'Grid.ColumnDefinitions') { continue }
+            $row = $child.GetAttribute('Grid.Row')
+            $col = $child.GetAttribute('Grid.Column')
+            if ($row -ne '' -and [int]$row -ge $rows) {
+                $overflow.Add("$label 第 $index 个 Grid 的 $($child.LocalName) 用到 Grid.Row=$row，只声明了 $rows 行")
+            }
+            if ($col -ne '' -and [int]$col -ge $cols) {
+                $overflow.Add("$label 第 $index 个 Grid 的 $($child.LocalName) 用到 Grid.Column=$col，只声明了 $cols 列")
+            }
         }
     }
 }
 Assert '界面 XAML 没有行列越界' ($overflow.Count -eq 0) ($overflow -join '；')
-Assert '高级设置网格至少声明 10 行' ($maxRows -ge 10) "最多只声明了 $maxRows 行"
 
 # 视觉规范：卡片内边距统一、日志区不再挤成一坨（2.0.0 的界面整理）
 $appXamlPath = Join-Path $repo 'src\CampusNet\App.xaml'
@@ -919,17 +973,61 @@ Assert '卡片内边距统一为 16,14' ($cardPadding -eq '16,14') "Card Padding
 
 # x:Name 属于 XAML 命名空间，跟元素本身的 presentation 命名空间不是同一个：这里必须单独建一个映射，
 # 否则 XPath 匹配不到任何节点（会静默返回 $null，断言看起来像「界面没设高度」）。
-$nsXaml = New-Object System.Xml.XmlNamespaceManager($xamlDoc.NameTable)
-$nsXaml.AddNamespace('x', 'http://schemas.microsoft.com/winfx/2006/xaml/presentation')
-$nsXaml.AddNamespace('xa', 'http://schemas.microsoft.com/winfx/2006/xaml')
+$nsXaml = $ns
 $logView = $xamlDoc.SelectSingleNode('//x:RichTextBox[@xa:Name="LogView"]', $nsXaml)
-$logHeight = if ($null -ne $logView -and $logView.GetAttribute('Height')) { [int]$logView.GetAttribute('Height') } else { 0 }
-Assert '日志区高度 ≥ 180' ($logHeight -ge 180) "LogView Height=$logHeight"
+$logFixedHeight = if ($null -ne $logView) { $logView.GetAttribute('Height') } else { 'missing' }
+$logMinHeight = if ($null -ne $logView -and $logView.GetAttribute('MinHeight')) { [int]$logView.GetAttribute('MinHeight') } else { 0 }
+Assert '日志区没有固定高度（跟着窗口伸缩）' ([string]::IsNullOrEmpty($logFixedHeight)) "LogView Height=$logFixedHeight"
+Assert '日志区最小高度 ≥ 110（窗口缩到最小时还能看几行）' ($logMinHeight -ge 110) "LogView MinHeight=$logMinHeight"
+Assert '日志区仍允许自身纵向滚动' ($null -ne $logView -and $logView.GetAttribute('VerticalScrollBarVisibility') -eq 'Auto') `
+    "VerticalScrollBarVisibility=$($logView.GetAttribute('VerticalScrollBarVisibility'))"
+
+# 除日志之外不允许滚动：主体内容整体是 Auto 行，窗口缩到 MinHeight 也不裁切。
+# （2.0.0 曾为「高级设置最后一行被裁掉」把主体塞进 ScrollViewer；2.1.0 把高级设置
+#   移进独立窗口后，主窗口不再需要任何外层滚动。）
+$bodyScroller = $null
+foreach ($scroller in $xamlDoc.SelectNodes('//x:ScrollViewer', $ns)) {
+    if ($scroller.GetAttribute('Grid.Row') -eq '2') { $bodyScroller = $scroller }
+}
+Assert '主体内容不再包在 ScrollViewer 里（除日志外不滚动）' ($null -eq $bodyScroller) '主窗口主体外层仍有 ScrollViewer'
+
+# 日志卡片头部（右侧按钮组）：必须有「跟随最新」勾选框和「清除显示」按钮
+$followTail = $xamlDoc.SelectSingleNode('//x:CheckBox[@xa:Name="FollowTailCheck"]', $nsXaml)
+Assert '日志头部有默认勾选的「跟随最新」' ($null -ne $followTail -and $followTail.GetAttribute('IsChecked') -eq 'True') `
+    '找不到默认勾选的 FollowTailCheck'
+Assert '日志头部有「清除显示」按钮' ($mainXamlText -match 'Content="清除显示"' -and $mainXamlText -match 'Click="ClearLog_Click"') `
+    '找不到「清除显示」按钮'
+Assert '「清除显示」按钮提示写明不会删文件' ($mainXamlText -match '不会删除本机的 login\.log') '按钮提示里没写明不删文件'
 
 $mainCs = Get-Content -LiteralPath (Join-Path $repo 'src\CampusNet\MainWindow.xaml.cs') -Raw -Encoding UTF8
 $lineHeightMatch = [regex]::Match($mainCs, 'LineHeight\s*=\s*(\d+)')
 $logLineHeight = if ($lineHeightMatch.Success) { [int]$lineHeightMatch.Groups[1].Value } else { 0 }
 Assert '日志行高 ≥ 18（原来 16 太挤）' ($logLineHeight -ge 18) "LineHeight=$logLineHeight"
+
+# 「清除显示」只清空界面视图：不删文件、不截断 login.log（唯一会删日志的入口是 --clear-log）
+$clearBody = [regex]::Match($mainCs, '(?s)private void ClearLog_Click.*?(?=private void FollowTail_Click)')
+Assert '「清除显示」不调用 Logger.Clear（不删本机日志）' ($clearBody.Success -and $clearBody.Value -notmatch '_log\.Clear\(') `
+    'ClearLog_Click 里出现了 _log.Clear('
+Assert '「清除显示」把渲染游标推到文件末尾' ($clearBody.Success -and $clearBody.Value -match '_logCursor = _log\.Sequence') `
+    'ClearLog_Click 没有推进渲染游标'
+Assert '「清除显示」提示本机日志文件未删除' ($clearBody.Success -and $clearBody.Value -match '本机日志文件未删除') `
+    'ClearLog_Click 没有给出「未删除」的提示'
+
+# 「高级设置」独立窗口：10 个输入项两列 × 5 行，没有滚动条；主窗口里不再留高级设置输入框
+Assert '主窗口「程序」卡片有高级设置按钮' ($mainXamlText -match 'x:Name="AdvancedButton"') '找不到 AdvancedButton'
+$advancedBoxes = @($advancedDoc.SelectNodes('//x:TextBox', $advancedNs))
+Assert '高级设置窗口有 10 个输入框' ($advancedBoxes.Count -eq 10) "TextBox=$($advancedBoxes.Count)"
+Assert '高级设置窗口没有 ScrollViewer（内容固定不滚动）' ($advancedDoc.SelectNodes('//x:ScrollViewer', $advancedNs).Count -eq 0) `
+    '高级设置窗口里出现了 ScrollViewer'
+$advancedGrid = $advancedDoc.SelectSingleNode('//x:Grid', $advancedNs)
+$advancedRows = $advancedGrid.SelectNodes('x:Grid.RowDefinitions/x:RowDefinition', $advancedNs).Count
+$advancedCols = $advancedGrid.SelectNodes('x:Grid.ColumnDefinitions/x:ColumnDefinition', $advancedNs).Count
+Assert '高级设置网格 5 行 × 两列输入框' ($advancedRows -ge 5 -and $advancedCols -ge 5) "行=$advancedRows 列=$advancedCols"
+$advancedTagged = 0
+foreach ($box in $advancedBoxes) { if ($box.GetAttribute('Tag')) { $advancedTagged++ } }
+Assert '高级设置 9 个数值项都带 Tag（范围校验用）' ($advancedTagged -ge 9) "带 Tag 的输入框=$advancedTagged"
+$mainTextBoxes = @($xamlDoc.SelectNodes('//x:TextBox', $ns))
+Assert '主窗口只剩账号一个输入框（高级设置已搬走）' ($mainTextBoxes.Count -eq 1) "主窗口 TextBox=$($mainTextBoxes.Count)"
 
 # 静态：仓库内所有 .ps1 都要能通过 PowerShell 解析器。
 # 假 Portal 一旦有语法错，整套场景会静默变成「Portal 连不上」，很容易被误读成功能回归。
@@ -941,42 +1039,18 @@ foreach ($psFile in (Get-ChildItem -LiteralPath (Join-Path $repo 'build') -Filte
 }
 Assert '仓库内 .ps1 全部能通过语法解析' ($scriptSyntaxErrors.Count -eq 0) ($scriptSyntaxErrors -join '；')
 
-# 主体内容必须放在 ScrollViewer 里：默认窗口高度下，展开「高级设置」后最后一行（HTTP 探测超时）
-# 会被挤出可视区，用户既看不到也点不到。
-$mainScroller = $null
-foreach ($scroller in $xamlDoc.SelectNodes('//x:ScrollViewer', $ns)) {
-    if ($scroller.GetAttribute('Grid.Row') -eq '2') { $mainScroller = $scroller; break }
-}
-$wrappedRows = 0
-if ($null -ne $mainScroller) {
-    $wrappedRows = $mainScroller.SelectNodes('.//x:Grid[x:Grid.RowDefinitions]', $ns).Count
-}
-Assert '主体内容被 ScrollViewer 包裹（最后一行不再被裁掉）' ($wrappedRows -ge 1) `
-    "ScrollViewer 里没有找到带行定义的 Grid（找到 $wrappedRows 个）"
-
-# 日志里两条记录相差多少秒（找不到任意一条返回 -1）
-function Get-LogSecondsBetween {
-    param([string]$Log, [string]$FromPattern, [string]$ToPattern)
-    $a = [regex]::Match($Log, '(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[^\r\n]*' + $FromPattern)
-    $b = [regex]::Match($Log, '(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[^\r\n]*' + $ToPattern)
-    if (-not $a.Success -or -not $b.Success) { return -1 }
-    $t1 = [datetime]::ParseExact($a.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $null)
-    $t2 = [datetime]::ParseExact($b.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $null)
-    return [math]::Round(($t2 - $t1).TotalSeconds, 0)
-}
-
 # 场景 33：最小间隔等待期内不再「睡满剩余间隔」（本机 2026-09-17 23:10:21→23:10:54 那次空窗）
 # 假 Portal：登录回 error2、chkstatus 始终说离线、内容校验要等登录后 30 秒才通过。
-# 复检阶梯加密到 6 档也只有 23 秒，够不着这个恢复时刻；老写法接下来会一路睡到 60 秒窗口结束，
-# 期间一次探测都不做 —— 新写法在等待期按约 5 秒的节奏只做本地探测，网络一通就立刻确认。
+# 复检阶梯 12 档也只有 24 秒，够不着这个恢复时刻；老写法接下来会一路睡到 60 秒窗口结束，
+# 期间一次探测都不做 —— 新写法在等待期按约 3 秒的节奏只做本地探测，网络一通就立刻确认。
 $n = Invoke-RawRun -Name 's33-login-wait-watch' -Scenario 'late-content' -Seconds 45 `
     -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" `
         -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -OfflineProbe 2 -MinInterval 60)
 Assert '等待期内本地探测到恢复（state 变在线）' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
 Assert '日志写明等待期内检测到网络恢复' ($n.Log -match '最小间隔等待期内检测到网络恢复') '日志里没有等待期恢复的说明'
-# 复检阶梯加密到 6 档后，这一轮本身就会查 7 次（1 次状态查询 + 6 档只读复检）；
-# 断言改成「不超过阶梯上限」——等待期里仍然一次都不再查 Portal。
-Assert '等待期内不再发 Portal 查询' ($n.Status -le 8) "chkstatus=$($n.Status)，等待期内每轮都不该再查 Portal"
+# 这一次事故的只读查询预算：1 次「探测不通」求证 + 1 次登录前确认 + 12 档复检 = 14。
+# 断言写成「不超过上限」——等待期里仍然一次都不再查 Portal。
+Assert '等待期内不再发 Portal 查询（总次数不超过阶梯上限）' ($n.Status -le 14) "chkstatus=$($n.Status)，等待期内每轮都不该再查 Portal"
 Assert '等待期恢复后仍然只提交 1 次登录' ($n.Login -eq 1) "login=$($n.Login)"
 $recoverDelta = Get-LogSecondsBetween -Log $n.Log -FromPattern '次尝试登录' -ToPattern '网络已恢复'
 Assert '登录后 25~40 秒内确认恢复（老写法要等满 60 秒窗口）' ($recoverDelta -ge 25 -and $recoverDelta -le 40) `
@@ -1004,14 +1078,23 @@ Assert '登录前本地校验翻案：只查了一次状态' ($n.Status -eq 1) "
 Assert '日志写明「登录前本地内容校验已能上网」' ($n.Log -match '登录前本地内容校验已能上网') '日志里没有这条记录'
 Assert '翻案后状态为 online' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
 
-# 场景 36：提交登录后的复检阶梯加密——Portal 在登录后第 13 秒才说在线，新阶梯应在 +14 秒确认
-# （旧阶梯只有 3/5/12，最后一档 +20 秒，做不到 +14 秒确认）
-$n = Invoke-RawRun -Name 's36-recovery-ladder' -Scenario 'online-after-login-13' -Seconds 25 `
+# 场景 36：提交登录后的复检阶梯加密——Portal 在登录后第 15 秒才说在线，2 秒一档的新阶梯
+# 应该在 +16 秒确认；旧阶梯（2/3/4/5/6/3，累计 2/5/9/14/20/23）只有 +20 秒那一档够得着。
+$n = Invoke-RawRun -Name 's36-recovery-ladder' -Scenario 'online-after-login-15' -Seconds 25 `
     -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" `
         -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -OfflineProbe 2 -MinInterval 60)
-Assert '阶梯加密后 +14 秒就确认恢复' ($n.Log -match 'Portal 显示账号已在线（\+14 秒）') '日志里没有 +14 秒确认的记录'
+# 假 Portal 在登录后第 15 秒才说在线，而阶梯起点（登录返回后的 2 秒等待 + 首次本地校验）
+# 已经先花掉几秒，所以命中可能落在 +12 / +14 / +16 这几个档位上；关键是「不超过 +16 秒」——
+# 旧阶梯（+2/+5/+9/+14/+20/+23）在这种情况下只能拖到 +20 秒。
+$ladderHit = [regex]::Match($n.Log, 'Portal 显示账号已在线（\+(\d+) 秒）')
+$ladderSeconds = if ($ladderHit.Success) { [int]$ladderHit.Groups[1].Value } else { -1 }
+Assert '阶梯加密后最多 +16 秒就确认恢复（旧阶梯要等到 +20 秒）' ($ladderSeconds -gt 0 -and $ladderSeconds -le 16) `
+    "确认档位=+$ladderSeconds 秒"
 Assert '阶梯场景只提交 1 次登录' ($n.Login -eq 1) "login=$($n.Login)"
 Assert '阶梯确认后状态为 login-ok' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
+# 一次事故的只读复检次数必须有上限：1 次登录前确认 + 12 档复检 = 13，留一点余量到 14。
+$ladderChecks = @(Get-RequestTimes -LogPath $n.LogPath -Kind 'chkstatus')
+Assert '一次事故的只读 chkstatus 次数 ≤ 14' ($ladderChecks.Count -le 14) "chkstatus=$($ladderChecks.Count)"
 
 # 场景 37：登录前确认延迟 3 秒 → 1 秒的一次性迁移（v6 → v7），自定义值原样保留
 function Invoke-ConfirmDelayMigration {
@@ -1036,9 +1119,97 @@ function Invoke-ConfirmDelayMigration {
 
 $delayMigrated = Invoke-ConfirmDelayMigration -Name 's37-delay-migrate' -Delay 3
 Assert '旧默认确认延迟 3 秒迁移为 1 秒' ($delayMigrated.LoginConfirmDelaySec -eq 1) "LoginConfirmDelaySec=$($delayMigrated.LoginConfirmDelaySec)"
-Assert '确认延迟迁移后写入 ConfigVersion=7' ($delayMigrated.ConfigVersion -eq 7) "ConfigVersion=$($delayMigrated.ConfigVersion)"
+Assert '确认延迟迁移后写入 ConfigVersion=8' ($delayMigrated.ConfigVersion -eq 8) "ConfigVersion=$($delayMigrated.ConfigVersion)"
 $delayCustom = Invoke-ConfirmDelayMigration -Name 's37-delay-custom' -Delay 5
 Assert '自定义确认延迟 5 秒不被改写' ($delayCustom.LoginConfirmDelaySec -eq 5) "LoginConfirmDelaySec=$($delayCustom.LoginConfirmDelaySec)"
+
+# 场景 38：v7 → v8 迁移——「发现掉线」的三个节奏间隔只改「等于旧默认值」的那一份
+function Invoke-PacingMigration {
+    param([string]$Name, [int]$Online, [int]$Offline, [int]$Session)
+    $dir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $legacy = [ordered]@{
+        ConfigVersion       = 7
+        PortalHost          = '127.0.0.1:65010'
+        OnlineProbeSeconds  = $Online
+        OfflineProbeSeconds = $Offline
+        SessionCheckSeconds = $Session
+        ProbeTargets        = @(Off-Target 65019)
+    }
+    ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
+    Set-TestCredentials -Dir $dir
+    & $Exe '--run-seconds' 3 '--data-dir' $dir | Out-String | Out-Null
+    return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+$paced = Invoke-PacingMigration -Name 's38-pacing-migrate' -Online 20 -Offline 5 -Session 120
+Assert 'v7 旧默认在线探测 20 秒迁移为 10 秒' ($paced.OnlineProbeSeconds -eq 10) "OnlineProbeSeconds=$($paced.OnlineProbeSeconds)"
+Assert 'v7 旧默认异常探测 5 秒迁移为 3 秒' ($paced.OfflineProbeSeconds -eq 3) "OfflineProbeSeconds=$($paced.OfflineProbeSeconds)"
+Assert 'v7 旧默认会话核对 120 秒迁移为 60 秒' ($paced.SessionCheckSeconds -eq 60) "SessionCheckSeconds=$($paced.SessionCheckSeconds)"
+Assert '节奏迁移后写入 ConfigVersion=8' ($paced.ConfigVersion -eq 8) "ConfigVersion=$($paced.ConfigVersion)"
+$pacedCustom = Invoke-PacingMigration -Name 's38-pacing-custom' -Online 30 -Offline 2 -Session 240
+Assert '自定义节奏 30/2/240 一律不被改写' ($pacedCustom.OnlineProbeSeconds -eq 30 -and $pacedCustom.OfflineProbeSeconds -eq 2 `
+    -and $pacedCustom.SessionCheckSeconds -eq 240) `
+    "Online=$($pacedCustom.OnlineProbeSeconds) Offline=$($pacedCustom.OfflineProbeSeconds) Session=$($pacedCustom.SessionCheckSeconds)"
+
+# 场景 39：今日登录计数——真正提交出去的请求才算「提交」，确认在线才算「成功」
+$n = Invoke-RawRun -Name 's39-day-count' -Scenario 'offline-ok' -Seconds 14 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @(Off-Target 65020) -OfflineProbe 2)
+Assert '今日登录成功一次后记为 1 次成功' ($n.State.DayLoginSuccess -eq 1) "DayLoginSuccess=$($n.State.DayLoginSuccess)"
+Assert '今日登录提交一次后记为 1 次提交' ($n.State.DayLoginAttempts -eq 1) "DayLoginAttempts=$($n.State.DayLoginAttempts)"
+Assert '今日计数带当天日期' ($n.State.DayKey -eq (Get-Date -Format 'yyyy-MM-dd')) "DayKey=$($n.State.DayKey)"
+
+# 同一个数据目录里再跑一次「登录必然失败」的场景：提交数要跟着涨，成功数不能跟着涨。
+# 最小间隔设为 0（测试专用）好让这一轮真的提交好几次；断言写成区间而不是等值，
+# 免得 `--run-seconds` 正好掐在「请求已发出、状态还没落盘」那一刻造成假红。
+$n2 = Invoke-RawRun -Name 's39-day-count' -Scenario 'garbage' -Seconds 14 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @(Off-Target 65020) -OfflineProbe 2 -MinInterval 0)
+$daySubmits = @($n2.Requests | Where-Object { $_ -match 'login' }).Count
+Assert '失败场景确实又提交了登录' ($daySubmits -ge 1) "本轮提交=$daySubmits"
+Assert '今日提交数随每次提交累加（1 + 本轮提交次数）' ($n2.State.DayLoginAttempts -ge $daySubmits -and $n2.State.DayLoginAttempts -le (1 + $daySubmits)) `
+    "DayLoginAttempts=$($n2.State.DayLoginAttempts) 本轮提交=$daySubmits"
+Assert '登录失败不增加今日成功数' ($n2.State.DayLoginSuccess -eq 1) "DayLoginSuccess=$($n2.State.DayLoginSuccess)"
+
+# 场景 40：跨零点惰性归零——预置「昨天 5 成功 / 7 提交」，跑一次成功后必须从今天重新数
+$crossDir = Join-Path $work 's40-cross-day'
+New-Item -ItemType Directory -Force -Path $crossDir | Out-Null
+$yesterday = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
+$yesterdayState = [ordered]@{
+    LastTrigger      = (Get-Date).AddMinutes(-2).ToString('yyyy-MM-dd HH:mm:ss')
+    LastResult       = 'online'
+    Online           = $true
+    DayKey           = $yesterday
+    DayLoginSuccess  = 5
+    DayLoginAttempts = 7
+} | ConvertTo-Json
+Set-Content -LiteralPath (Join-Path $crossDir 'state.json') -Value $yesterdayState -Encoding UTF8
+$n = Invoke-RawRun -Name 's40-cross-day' -Scenario 'offline-ok' -Seconds 14 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @(Off-Target 65021) -OfflineProbe 2)
+Assert '跨零点后今日日期换成今天' ($n.State.DayKey -eq (Get-Date -Format 'yyyy-MM-dd')) "DayKey=$($n.State.DayKey)"
+Assert '跨零点后今日成功数归零重算' ($n.State.DayLoginSuccess -eq 1) "DayLoginSuccess=$($n.State.DayLoginSuccess)"
+Assert '跨零点后今日提交数归零重算' ($n.State.DayLoginAttempts -eq 1) "DayLoginAttempts=$($n.State.DayLoginAttempts)"
+
+# 场景 41：累计计数不回退——磁盘上那份更大的计数重载时不能被清零或变小
+$monoDir = Join-Path $work 's41-monotonic'
+New-Item -ItemType Directory -Force -Path $monoDir | Out-Null
+$bigState = [ordered]@{
+    LastTrigger      = (Get-Date).AddSeconds(-5).ToString('yyyy-MM-dd HH:mm:ss')
+    LastResult       = 'online'
+    Online           = $true
+    IgnoredPrompts   = 33
+    DayKey           = (Get-Date -Format 'yyyy-MM-dd')
+    DayLoginSuccess  = 5
+    DayLoginAttempts = 7
+} | ConvertTo-Json
+# conflict 场景要走完 12 档复检（约 24 秒）才记账，这里给足时间再读 state.json。
+Set-Content -LiteralPath (Join-Path $monoDir 'state.json') -Value $bigState -Encoding UTF8
+$n = Invoke-RawRun -Name 's41-monotonic' -Scenario 'conflict' -Seconds 36 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" -Targets @(Off-Target 65022) -OfflineProbe 2)
+Assert '重载不会把「已忽略提示」清零（本机出现过 33 → 18 的倒退）' ($n.State.IgnoredPrompts -ge 34) "IgnoredPrompts=$($n.State.IgnoredPrompts)"
+Assert '今日提交计数只增不减' ($n.State.DayLoginAttempts -ge 8) "DayLoginAttempts=$($n.State.DayLoginAttempts)"
+Assert '今日成功计数只增不减' ($n.State.DayLoginSuccess -ge 5) "DayLoginSuccess=$($n.State.DayLoginSuccess)"
+$engineCs = Get-Content -LiteralPath (Join-Path $repo 'src\CampusNet\Core\Engine.cs') -Raw -Encoding UTF8
+Assert 'Reload 走单调合并而不是整份覆盖' ($engineCs -match '_state\.MergeFrom\(loaded\)') 'Engine.cs 里没有 MergeFrom(loaded)'
 
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ''

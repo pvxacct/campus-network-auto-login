@@ -1,6 +1,7 @@
 ﻿<#
   测试用假 Portal：把 Dr.COM ePortal 的几个接口用最简 HTTP 服务器复刻出来，
-  并把收到的每一次请求记进 -LogPath（每行一条 "METHOD /path"），供测试断言请求次数。
+  并把收到的每一次请求记进 -LogPath（每行一条 "METHOD /path @<毫秒时间戳>"），
+  供测试断言请求次数与请求间隔（时间戳跟在 "@" 后面，老断言按前缀匹配不受影响）。
   仅监听 127.0.0.1，不对外网开放。
 #>
 param(
@@ -58,9 +59,15 @@ function Read-Request {
     return $text
 }
 
+# 请求间隔断言用的时间戳：毫秒级 Unix 时间，跟在每行末尾的 "@" 之后。
+$epoch = [datetime]'1970-01-01T00:00:00Z'
+function Get-Stamp {
+    return [long](([datetime]::UtcNow - $epoch).TotalMilliseconds)
+}
+
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
 $listener.Start()
-Set-Content -LiteralPath $LogPath -Value "START $Scenario" -Encoding UTF8
+Set-Content -LiteralPath $LogPath -Value "START $Scenario @$(Get-Stamp)" -Encoding UTF8
 $counts = @{ chkstatus = 0; login = 0; logout = 0; error = 0 }
 $blackholeClients = New-Object System.Collections.Generic.List[object]
 # 内容校验何时开始返回关键字：late-content 用来复现「登录已经生效、程序却还在等」的场景
@@ -80,7 +87,7 @@ while ($true) {
         $parts = $firstLine -split ' '
         $method = $parts[0]
         $path = if ($parts.Length -gt 1) { $parts[1] } else { '/' }
-        Add-Content -LiteralPath $LogPath -Value ("$method $path") -Encoding UTF8
+        Add-Content -LiteralPath $LogPath -Value ("$method $path @$(Get-Stamp)") -Encoding UTF8
 
         if ($Scenario -eq 'blackhole') {
             # 「连接得过、内容永远不来」：用来验证探测是并行的（串行会成倍变慢）
@@ -103,6 +110,11 @@ while ($true) {
                 'online-after-login-13' {
                     $online = ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 13)
                 }
+                # 登录后第 15 秒起才显示在线：2 秒一档的新阶梯在 +16 秒能确认，
+                # 旧阶梯（2/3/4/5/6/3）只有 +20 秒那一档够得着。
+                'online-after-login-15' {
+                    $online = ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 15)
+                }
                 'content-ok' { $online = $true }
                 default { $online = $false }
             }
@@ -112,7 +124,8 @@ while ($true) {
         elseif ($path -like '*login*') {
             $counts.login++
             if ($null -eq $loginAt -and ($Scenario -eq 'late-content' -or
-                    $Scenario -eq 'instant-content' -or $Scenario -eq 'online-after-login-13')) {
+                    $Scenario -eq 'instant-content' -or $Scenario -eq 'online-after-login-13' -or
+                    $Scenario -eq 'online-after-login-15')) {
                 $loginAt = Get-Date
             }
             switch ($Scenario) {

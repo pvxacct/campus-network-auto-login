@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
@@ -24,7 +25,14 @@ namespace CampusNet
         private bool _allowClose;
         private bool _logDirty = true;
         private int _tick;
-        private string _logSignature = string.Empty;
+        /// <summary>日志视图已经渲染到的行号；-1 = 还没渲染过（下次整块重绘）。</summary>
+        private long _logCursor = -1;
+        /// <summary>日志视图当前承载的那一段（整块重绘时才换）。</summary>
+        private Paragraph _logParagraph;
+        private const int MaxLogLines = 400;
+        /// <summary>外部改动的配置文件时间戳：用于「别的程序改了 config.json 也自动生效」。</summary>
+        private DateTime _configStamp = DateTime.MinValue;
+        private DateTime _credentialStamp = DateTime.MinValue;
 
         public MainWindow(LoginEngine engine, Logger log, TrayIcon tray)
         {
@@ -41,6 +49,7 @@ namespace CampusNet
             {
                 _tick++;
                 UpdateUi();
+                WatchExternalChanges();
                 if (_logDirty || _tick % 3 == 0) { RefreshLog(); }
             };
             _timer.Start();
@@ -69,6 +78,9 @@ namespace CampusNet
         {
             Show();
             if (WindowState == WindowState.Minimized) { WindowState = WindowState.Normal; }
+            // 「清除显示」只作用于当次窗口显示；重新打开时按约定回到「最近 400 行」。
+            _logCursor = -1;
+            RefreshLog();
             Activate();
         }
 
@@ -126,6 +138,18 @@ namespace CampusNet
             StatError.Text = string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError;
             StatIgnored.Text = snapshot.IgnoredPrompts + " 次";
             StatForced.Text = ForcedReloginText(snapshot);
+            StatDay.Text = snapshot.DayLoginSuccess + " 次 / 提交 " + snapshot.DayLoginAttempts + " 次";
+            StatDay.ToolTip = string.IsNullOrEmpty(snapshot.DayKey)
+                ? null
+                : "统计日期 " + snapshot.DayKey + "（跨零点自动重新计数）";
+            StatRecovery.Text = snapshot.LastRecoverySeconds < 0
+                ? "—"
+                : snapshot.LastRecoverySeconds + " 秒 / 中位 " + snapshot.RecoveryMedianSeconds + " 秒";
+            StatRecovery.ToolTip = snapshot.LastRecoverySeconds < 0
+                ? "本次运行内还没有「提交登录 → 确认恢复」的样本"
+                : "最近一次恢复耗时；中位取自本次运行最近 " + snapshot.RecoverySampleCount + " 次样本";
+            StatError.ToolTip = string.IsNullOrEmpty(snapshot.LastError) ? null : snapshot.LastError;
+            ProbeText.ToolTip = string.IsNullOrEmpty(snapshot.ProbeSummary) ? null : snapshot.ProbeSummary;
 
             PauseButton.IsEnabled = !snapshot.Paused;
             ResumeButton.IsEnabled = snapshot.Paused;
@@ -196,32 +220,64 @@ namespace CampusNet
         private void RefreshLog()
         {
             bool warningsOnly = WarningOnlyCheck.IsChecked == true;
-            List<string> lines = _log.Recent(200, warningsOnly);
-            string signature = lines.Count + "|" + warningsOnly + "|" + (lines.Count > 0 ? lines[lines.Count - 1] : string.Empty);
             _logDirty = false;
-            if (signature == _logSignature) { return; }
-            _logSignature = signature;
+            if (_logCursor < 0) { RenderLogTail(warningsOnly); return; }
 
+            long last;
+            bool dropped;
+            List<string> fresh = _log.Since(_logCursor, MaxLogLines, warningsOnly, out last, out dropped);
+            if (dropped) { RenderLogTail(warningsOnly); return; }
+            if (fresh.Count == 0) { return; }
+            foreach (string line in fresh) { AppendLogLine(line); }
+            _logCursor = last;
+            TrimLogView();
+            // 只有勾着「跟随最新」才自动滚到底：用户往上翻历史时不再被强行拉回来。
+            if (FollowTailCheck.IsChecked == true) { LogView.ScrollToEnd(); }
+        }
+
+        /// <summary>整块重绘：显示内存里最近的一段日志（默认 400 行）。</summary>
+        private void RenderLogTail(bool warningsOnly)
+        {
             LogView.Document.Blocks.Clear();
             // 行高 18（原 16）：日志默认字号 11.5 时行距太挤，长日志看起来是一坨。
-            var paragraph = new Paragraph
+            _logParagraph = new Paragraph
             {
                 Margin = new Thickness(0),
                 LineHeight = 18,
                 LineStackingStrategy = LineStackingStrategy.BlockLineHeight
             };
-            foreach (string line in lines)
+            LogView.Document.Blocks.Add(_logParagraph);
+            _logCursor = _log.Sequence;
+
+            List<string> lines = _log.Recent(MaxLogLines, warningsOnly);
+            if (lines.Count == 0)
             {
-                SolidColorBrush brush;
-                if (line.IndexOf("[ERROR]", StringComparison.Ordinal) >= 0) { brush = new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26)); }
-                else if (line.IndexOf("[WARN]", StringComparison.Ordinal) >= 0) { brush = new SolidColorBrush(Color.FromRgb(0xEA, 0x58, 0x0C)); }
-                else { brush = new SolidColorBrush(Color.FromRgb(0x37, 0x41, 0x51)); }
-                paragraph.Inlines.Add(new Run(line) { Foreground = brush });
-                paragraph.Inlines.Add(new LineBreak());
+                _logParagraph.Inlines.Add(new Run("暂无日志。") { Foreground = BrushFor("gray") });
+                return;
             }
-            if (lines.Count == 0) { paragraph.Inlines.Add(new Run("暂无日志。")); }
-            LogView.Document.Blocks.Add(paragraph);
+            foreach (string line in lines) { AppendLogLine(line); }
             LogView.ScrollToEnd();
+        }
+
+        private void AppendLogLine(string line)
+        {
+            if (_logParagraph == null) { return; }
+            SolidColorBrush brush;
+            if (line.IndexOf("[ERROR]", StringComparison.Ordinal) >= 0) { brush = new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26)); }
+            else if (line.IndexOf("[WARN]", StringComparison.Ordinal) >= 0) { brush = new SolidColorBrush(Color.FromRgb(0xEA, 0x58, 0x0C)); }
+            else { brush = new SolidColorBrush(Color.FromRgb(0x37, 0x41, 0x51)); }
+            _logParagraph.Inlines.Add(new Run(line) { Foreground = brush });
+            _logParagraph.Inlines.Add(new LineBreak());
+        }
+
+        /// <summary>视图最多留 MaxLogLines 行：一次删两条（Run + 换行）保持成对。</summary>
+        private void TrimLogView()
+        {
+            if (_logParagraph == null) { return; }
+            while (_logParagraph.Inlines.Count > MaxLogLines * 2 && _logParagraph.Inlines.FirstInline != null)
+            {
+                _logParagraph.Inlines.Remove(_logParagraph.Inlines.FirstInline);
+            }
         }
 
         private void RefreshLegacyHint()
@@ -235,19 +291,11 @@ namespace CampusNet
 
         private void LoadSettingsIntoUi()
         {
-            AppConfig config = _engine.Config;
-            OnlineProbeBox.Text = config.OnlineProbeSeconds.ToString(CultureInfo.InvariantCulture);
-            OfflineProbeBox.Text = config.OfflineProbeSeconds.ToString(CultureInfo.InvariantCulture);
-            HourlyLimitBox.Text = config.LoginHourlyLimit.ToString(CultureInfo.InvariantCulture);
-            PortalHostBox.Text = config.PortalBase;   // 连协议一起显示，写成 https://… 也认
-            MinIntervalBox.Text = config.LoginMinIntervalSeconds.ToString(CultureInfo.InvariantCulture);
-            UpstreamProbeBox.Text = config.UpstreamProbeSeconds.ToString(CultureInfo.InvariantCulture);
-            ProbeTimeoutBox.Text = config.ProbeTimeoutMs.ToString(CultureInfo.InvariantCulture);
-            HttpProbeTimeoutBox.Text = config.HttpProbeTimeoutMs.ToString(CultureInfo.InvariantCulture);
-            SessionCheckBox.Text = config.SessionCheckSeconds.ToString(CultureInfo.InvariantCulture);
-            StuckReloginBox.Text = config.StuckReloginSeconds.ToString(CultureInfo.InvariantCulture);
             EngineSnapshot snapshot = _engine.Snapshot();
             if (snapshot.HasCredential) { UserNameBox.Text = snapshot.UserName; }
+            // 高级设置的 10 个输入框已经搬到 AdvancedWindow，这里只登记配置文件时间戳，
+            // 免得刚打开窗口就把「外部改动」判成一次重载。
+            NoteConfigSaved();
         }
 
         // ------------------------------------------------------------- 按钮
@@ -268,183 +316,13 @@ namespace CampusNet
                 PasswordInput.Clear();
                 _log.Info("已保存账号 " + Mask(user) + "（DPAPI 加密，仅当前 Windows 用户可解密）。");
                 _engine.Reload();
+                NoteConfigSaved();
                 UpdateUi();
                 MessageBox.Show("账号密码已保存，程序会立刻开始守护网络。", AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
             {
                 MessageBox.Show("保存失败：" + ex.Message, AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Error);
-            }
-        }
-
-        // ------------------------------------------------- 高级设置：改完自动保存（没有保存按钮）
-
-        /// <summary>各输入框的合法范围：键名对应 TextBox 的 Tag。</summary>
-        private static readonly Dictionary<string, int[]> AdvancedRanges = new Dictionary<string, int[]>
-        {
-            { "OnlineProbeSeconds", new[] { 5, 3600 } },
-            { "OfflineProbeSeconds", new[] { 1, 600 } },
-            { "LoginHourlyLimit", new[] { 0, 240 } },
-            { "LoginMinIntervalSeconds", new[] { 0, 3600 } },
-            { "UpstreamProbeSeconds", new[] { 30, 3600 } },
-            { "ProbeTimeoutMs", new[] { 200, 10000 } },
-            { "HttpProbeTimeoutMs", new[] { 500, 10000 } },
-            { "SessionCheckSeconds", new[] { 0, 3600 } },
-            { "StuckReloginSeconds", new[] { 0, 3600 } }
-        };
-
-        private void AdvancedBox_LostFocus(object sender, RoutedEventArgs e)
-        {
-            CommitAdvanced(sender as TextBox);
-        }
-
-        private void AdvancedBox_KeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.Key != Key.Enter) { return; }
-            e.Handled = true;
-            CommitAdvanced(sender as TextBox);
-        }
-
-        private void PortalHost_KeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.Key != Key.Enter) { return; }
-            e.Handled = true;
-            CommitPortalHost();
-        }
-
-        private void PortalHost_LostFocus(object sender, RoutedEventArgs e)
-        {
-            CommitPortalHost();
-        }
-
-        /// <summary>校验单个输入框并立即写盘、立即生效；非法值自动回退到当前值。</summary>
-        private void CommitAdvanced(TextBox box)
-        {
-            if (box == null || box.Tag == null) { return; }
-            string field = Convert.ToString(box.Tag, CultureInfo.InvariantCulture);
-            int[] range;
-            if (!AdvancedRanges.TryGetValue(field, out range)) { return; }
-
-            AppConfig config = _engine.Config;
-            int current = ReadField(config, field);
-            int parsed;
-            if (!int.TryParse((box.Text ?? string.Empty).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed))
-            {
-                box.Text = current.ToString(CultureInfo.InvariantCulture);
-                AdvancedHint.Text = "「" + FieldLabel(field) + "」需要 " + range[0] + "–" + range[1]
-                    + " 之间的整数，已还原为 " + current + "。";
-                return;
-            }
-
-            int value = Math.Max(range[0], Math.Min(range[1], parsed));
-            box.Text = value.ToString(CultureInfo.InvariantCulture);
-            if (value == current)
-            {
-                AdvancedHint.Text = "「" + FieldLabel(field) + "」未变化（允许 " + range[0] + "–" + range[1] + "）。";
-                return;
-            }
-
-            WriteField(config, field, value);
-            try
-            {
-                config.Save(AppPaths.ConfigFile);
-                _engine.Reload();
-                LoadSettingsIntoUi();
-                AdvancedHint.Text = "已保存并立即生效：" + FieldLabel(field) + " = " + value
-                    + "（允许 " + range[0] + "–" + range[1] + "）。";
-                _log.Info("设置已更新：" + FieldLabel(field) + " = " + value + "。");
-                RefreshLog();
-            }
-            catch (Exception ex)
-            {
-                AdvancedHint.Text = "保存失败：" + ex.Message;
-            }
-        }
-
-        private void CommitPortalHost()
-        {
-            AppConfig config = _engine.Config;
-            string host = (PortalHostBox.Text ?? string.Empty).Trim();
-            string scheme = config.PortalScheme;
-            // 允许直接把协议写进地址（https://10.66.209.2）——存盘时拆成 PortalScheme + PortalHost
-            if (host.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) { scheme = "https"; host = host.Substring(8); }
-            else if (host.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) { scheme = "http"; host = host.Substring(7); }
-            if (string.IsNullOrEmpty(host))
-            {
-                PortalHostBox.Text = config.PortalBase;
-                AdvancedHint.Text = "Portal 地址不能为空，已还原为 " + config.PortalBase + "。";
-                return;
-            }
-            if (string.Equals(host, config.PortalHost, StringComparison.OrdinalIgnoreCase)
-                && string.Equals(scheme, config.PortalScheme, StringComparison.OrdinalIgnoreCase))
-            {
-                PortalHostBox.Text = config.PortalBase;
-                return;
-            }
-            config.PortalHost = host;
-            config.PortalScheme = scheme;
-            try
-            {
-                config.Save(AppPaths.ConfigFile);
-                _engine.Reload();
-                LoadSettingsIntoUi();
-                AdvancedHint.Text = "已保存并立即生效：Portal 地址 = " + config.PortalBase + "。";
-                _log.Info("设置已更新：Portal 地址 = " + config.PortalBase + "。");
-                RefreshLog();
-            }
-            catch (Exception ex)
-            {
-                AdvancedHint.Text = "保存失败：" + ex.Message;
-            }
-        }
-
-        private static int ReadField(AppConfig config, string field)
-        {
-            switch (field)
-            {
-                case "OnlineProbeSeconds": return config.OnlineProbeSeconds;
-                case "OfflineProbeSeconds": return config.OfflineProbeSeconds;
-                case "LoginHourlyLimit": return config.LoginHourlyLimit;
-                case "LoginMinIntervalSeconds": return config.LoginMinIntervalSeconds;
-                case "UpstreamProbeSeconds": return config.UpstreamProbeSeconds;
-                case "ProbeTimeoutMs": return config.ProbeTimeoutMs;
-                case "HttpProbeTimeoutMs": return config.HttpProbeTimeoutMs;
-                case "SessionCheckSeconds": return config.SessionCheckSeconds;
-                case "StuckReloginSeconds": return config.StuckReloginSeconds;
-                default: return 0;
-            }
-        }
-
-        private static void WriteField(AppConfig config, string field, int value)
-        {
-            switch (field)
-            {
-                case "OnlineProbeSeconds": config.OnlineProbeSeconds = value; break;
-                case "OfflineProbeSeconds": config.OfflineProbeSeconds = value; break;
-                case "LoginHourlyLimit": config.LoginHourlyLimit = value; break;
-                case "LoginMinIntervalSeconds": config.LoginMinIntervalSeconds = value; break;
-                case "UpstreamProbeSeconds": config.UpstreamProbeSeconds = value; break;
-                case "ProbeTimeoutMs": config.ProbeTimeoutMs = value; break;
-                case "HttpProbeTimeoutMs": config.HttpProbeTimeoutMs = value; break;
-                case "SessionCheckSeconds": config.SessionCheckSeconds = value; break;
-                case "StuckReloginSeconds": config.StuckReloginSeconds = value; break;
-            }
-        }
-
-        private static string FieldLabel(string field)
-        {
-            switch (field)
-            {
-                case "OnlineProbeSeconds": return "正常时探测间隔";
-                case "OfflineProbeSeconds": return "异常时探测间隔";
-                case "LoginHourlyLimit": return "每小时登录上限";
-                case "LoginMinIntervalSeconds": return "登录最小间隔";
-                case "UpstreamProbeSeconds": return "兜底巡检间隔";
-                case "ProbeTimeoutMs": return "探测超时";
-                case "HttpProbeTimeoutMs": return "HTTP 探测超时";
-                case "SessionCheckSeconds": return "会话校验间隔";
-                case "StuckReloginSeconds": return "残留会话自动重登";
-                default: return field;
             }
         }
 
@@ -575,14 +453,53 @@ namespace CampusNet
             timer.Start();
         }
 
+        /// <summary>
+        /// 「清除显示」：只清空这个窗口里的日志视图，**不删除、不截断本机的 login.log**。
+        /// 想真正删掉历史日志文件，请用命令行 `--clear-log`。
+        /// </summary>
         private void ClearLog_Click(object sender, RoutedEventArgs e)
         {
-            MessageBoxResult answer = MessageBox.Show(
-                "确定要清空运行日志吗？\n\n会删除 login.log 与 login.log.old，删除后无法恢复。",
-                AppPaths.DisplayName, MessageBoxButton.YesNo, MessageBoxImage.Question);
-            if (answer != MessageBoxResult.Yes) { return; }
-            _log.Clear();
-            _logSignature = string.Empty;
+            LogView.Document.Blocks.Clear();
+            // 游标直接推进到当前末尾：之后只显示这之后新产生的事件。
+            _logCursor = _log.Sequence;
+            _logParagraph = new Paragraph
+            {
+                Margin = new Thickness(0),
+                LineHeight = 18,
+                LineStackingStrategy = LineStackingStrategy.BlockLineHeight
+            };
+            _logParagraph.Inlines.Add(new Run("显示已清除（本机日志文件未删除，新事件会继续显示在这里）")
+            {
+                Foreground = BrushFor("gray")
+            });
+            _logParagraph.Inlines.Add(new LineBreak());
+            LogView.Document.Blocks.Add(_logParagraph);
+        }
+
+        private void FollowTail_Click(object sender, RoutedEventArgs e)
+        {
+            // 勾上「跟随最新」时立刻跳到底部，符合直觉；取消则保持当前位置。
+            if (FollowTailCheck.IsChecked == true) { LogView.ScrollToEnd(); }
+        }
+
+        private void Advanced_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var window = new AdvancedWindow(_engine, _log, OnAdvancedSaved);
+                window.Owner = this;
+                window.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("打开高级设置失败：" + ex.Message, AppPaths.DisplayName, MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void OnAdvancedSaved()
+        {
+            NoteConfigSaved();
+            UpdateUi();
             RefreshLog();
         }
 
@@ -611,8 +528,44 @@ namespace CampusNet
 
         private void WarningOnly_Click(object sender, RoutedEventArgs e)
         {
-            _logSignature = string.Empty;
+            // 过滤条件变了：整块重绘一次，避免视图里新旧两种口径混在一起。
+            _logCursor = -1;
             RefreshLog();
+        }
+
+        // ------------------------------------------------- 外部改动自动生效
+
+        /// <summary>
+        /// 每 5 秒比一次 config.json / credentials.dat 的修改时间：别的程序（记事本、脚本、
+        /// 命令行 --set-credentials）改过配置后，运行中的程序会自己重载，不用重启。
+        /// </summary>
+        private void WatchExternalChanges()
+        {
+            if (_tick % 5 != 0) { return; }
+            DateTime config = Stamp(AppPaths.ConfigFile);
+            DateTime credential = Stamp(AppPaths.CredentialFile);
+            bool first = _configStamp == DateTime.MinValue && _credentialStamp == DateTime.MinValue;
+            if (config == _configStamp && credential == _credentialStamp) { return; }
+            _configStamp = config;
+            _credentialStamp = credential;
+            if (first) { return; }   // 第一次只是登记时间戳
+            _engine.Reload();
+            _log.Info("检测到配置文件变化，已自动重新加载。");
+            UpdateUi();
+            RefreshLog();
+        }
+
+        /// <summary>我们自己刚写过配置/凭据：立刻登记时间戳，免得下一轮把自己判成「外部改动」。</summary>
+        private void NoteConfigSaved()
+        {
+            _configStamp = Stamp(AppPaths.ConfigFile);
+            _credentialStamp = Stamp(AppPaths.CredentialFile);
+        }
+
+        private static DateTime Stamp(string path)
+        {
+            try { return File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue; }
+            catch { return DateTime.MinValue; }
         }
 
         private void CopyDiagnose_Click(object sender, RoutedEventArgs e)
