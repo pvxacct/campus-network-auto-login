@@ -1,8 +1,6 @@
-# 一次性工作流（跑完就删）：把仓库首页 "About" 里的简介与 topics 写上去。
-# 为什么走 Actions：本机没有留下任何 GitHub 令牌，只有推送用的 SSH 密钥；
-# 这里用仓库自带的 GITHUB_TOKEN，不需要配置任何密钥。
-# 只改仓库元数据（description / topics），不碰代码、不碰 Release、不碰任何附件。
-# 若 GITHUB_TOKEN 缺少 Administration 权限，下面的步骤会明确打印 HTTP 错误，代码与发布不受影响。
+# 一次性工作流（跑完就删）：写仓库首页 About 的简介与 topics，并把每次 API 调用的
+# 真实结果以 annotation 的形式报出来（本机没有 PAT，只能借仓库自带的 GITHUB_TOKEN）。
+# 只改仓库元数据，不碰代码、不碰 Release、不碰任何附件。
 name: One-off repo metadata
 
 on:
@@ -18,33 +16,41 @@ jobs:
   meta:
     runs-on: ubuntu-latest
     steps:
-      - name: Show current metadata
+      - name: Read current metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY" --jq '{description, homepage, topics}'
+          gh api "repos/$GITHUB_REPOSITORY" --jq '{description, homepage, topics}' || true
 
-      - name: Set description
+      - name: PATCH description (JSON body)
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           desc='Windows 校园网（Dr.COM / 哆点）自动登录 + 网络监控面板：网络正常时几乎不发请求，被踢下线后快速重连。单文件 exe、免安装运行时、不需要管理员权限，带托盘图标与实时日志。'
-          printf '%s' "$desc" > /tmp/desc.txt
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY" -F description=@/tmp/desc.txt --jq '{description, homepage}' \
-            || echo "::warning::PATCH repo 失败（多半是 GITHUB_TOKEN 没有 Administration 权限）"
+          jq -n --arg d "$desc" '{description:$d}' > /tmp/desc.json
+          if gh api -X PATCH "repos/$GITHUB_REPOSITORY" --input /tmp/desc.json > /tmp/out.txt 2>/tmp/err.txt; then
+            echo "::notice title=PATCH description::成功：$(tr -d '\n' < /tmp/out.txt | head -c 200)"
+          else
+            echo "::error title=PATCH description 失败::$(tr '\n' ' ' < /tmp/err.txt | head -c 500)"
+          fi
 
-      - name: Set topics
+      - name: PUT topics (JSON body)
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          printf '{"names":["windows","windows-10","drcom","eportal","captive-portal","campus-network","auto-login","network-monitor","wpf","dotnet-framework"]}' > /tmp/topics.json
-          gh api -X PUT "repos/$GITHUB_REPOSITORY/topics" --input /tmp/topics.json --jq '.names' \
-            || echo "::warning::PUT topics 失败（多半是 GITHUB_TOKEN 没有 Administration 权限）"
+          printf '%s' '{"names":["windows","windows-10","drcom","eportal","captive-portal","campus-network","auto-login","network-monitor","wpf","dotnet-framework"]}' > /tmp/topics.json
+          if gh api -X PUT "repos/$GITHUB_REPOSITORY/topics" --input /tmp/topics.json > /tmp/out2.txt 2>/tmp/err2.txt; then
+            echo "::notice title=PUT topics::成功：$(tr -d '\n' < /tmp/out2.txt | head -c 200)"
+          else
+            echo "::error title=PUT topics 失败::$(tr '\n' ' ' < /tmp/err2.txt | head -c 500)"
+          fi
 
-      - name: Show result
+      - name: Read metadata again
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY" --jq '{description, homepage, topics}'
+          gh api "repos/$GITHUB_REPOSITORY" --jq '{description, homepage, topics}' || true
