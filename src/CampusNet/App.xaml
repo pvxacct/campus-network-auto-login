@@ -43,6 +43,16 @@
             <Setter Property="TextTrimming" Value="CharacterEllipsis" />
         </Style>
 
+        <!-- 输入框里的灰色占位提示（WPF 自己不带 placeholder，用一层不可点的小字代替） -->
+        <Style x:Key="Placeholder" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI" />
+            <Setter Property="FontSize" Value="12.5" />
+            <Setter Property="Foreground" Value="#9AA3AE" />
+            <Setter Property="Margin" Value="9,0,0,0" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="IsHitTestVisible" Value="False" />
+        </Style>
+
         <Style x:Key="Card" TargetType="Border">
             <Setter Property="Background" Value="{StaticResource CardBrush}" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />

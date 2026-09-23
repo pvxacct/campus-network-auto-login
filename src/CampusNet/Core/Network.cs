@@ -289,6 +289,16 @@ namespace CampusNet.Core
         /// </summary>
         public static bool ContentCheck(AppConfig config, out int latencyMs)
         {
+            return ContentCheck(config, ContentRounds, out latencyMs);
+        }
+
+        /// <summary>
+        /// 同上，但可以指定复核轮数：复检阶梯里每秒一档、下一档马上还会再查，
+        /// 所以那里用 1 轮（少一半 HTTP 请求、少 300ms 间隔）；「登录前确认」这种
+        /// 只查一次就要做决定的场合仍用默认的 2 轮，宁可慢一点也不误判。
+        /// </summary>
+        public static bool ContentCheck(AppConfig config, int rounds, out int latencyMs)
+        {
             latencyMs = -1;
             var targets = new List<ProbeTarget>();
             foreach (string text in config.ProbeTargets)
@@ -303,7 +313,8 @@ namespace CampusNet.Core
             // 两轮并行复核（每轮同时跑所有内容校验目标）：
             // 这张校园网偶尔会「第一次握手成功但内容不来」，补测一轮比立刻去打扰 Portal 更省事；
             // 而并行保证了补测最多只多花一次超时，不会随目标条数线性变慢。
-            for (int round = 0; round < 2; round++)
+            int total = rounds < 1 ? 1 : rounds;
+            for (int round = 0; round < total; round++)
             {
                 if (round > 0) { System.Threading.Thread.Sleep(ContentRetryGapMs); }
                 RunParallel(config, targets, okFlags, latencies);
@@ -320,6 +331,8 @@ namespace CampusNet.Core
         }
 
         private const int ContentRetryGapMs = 300;
+        /// <summary>内容校验的默认复核轮数（见 ContentCheck 重载）。</summary>
+        private const int ContentRounds = 2;
 
         /// <summary>
         /// 内容校验探测：真正取回页面内容并核对关键字。
@@ -553,6 +566,11 @@ namespace CampusNet.Core
         public bool AlreadyOnline;
         /// <summary>true = 收到了 Portal 的业务提示（Msg/msga），而不是传输失败或无法识别的响应。</summary>
         public bool BusinessPrompt;
+        /// <summary>POST 登录接口本身的耗时（秒）；真机上它是「提交 → 恢复」里最大的一块。</summary>
+        public double PostSeconds;
+        /// <summary>为把出错码翻译成中文提示而多打的一次 GET 的耗时（秒）。</summary>
+        public double PromptSeconds;
+        public double TotalSeconds { get { return PostSeconds + PromptSeconds; } }
         public string Message = string.Empty;
     }
 
@@ -614,7 +632,10 @@ namespace CampusNet.Core
             string text;
             try
             {
+                var postWatch = System.Diagnostics.Stopwatch.StartNew();
                 text = Post(_config.LoginUrl, fields, _config.LoginTimeoutSec);
+                postWatch.Stop();
+                result.PostSeconds = postWatch.Elapsed.TotalSeconds;
             }
             catch (Exception ex)
             {
@@ -633,7 +654,10 @@ namespace CampusNet.Core
             {
                 string msg = Match(text, "Msg=(\\d+)");
                 string msga = Match(text, "msga='([^']*)'");
+                var promptWatch = System.Diagnostics.Stopwatch.StartNew();
                 string prompt = Translate(msga);
+                promptWatch.Stop();
+                result.PromptSeconds = promptWatch.Elapsed.TotalSeconds;
                 result.AlreadyOnline = msga.IndexOf("userid error2", StringComparison.OrdinalIgnoreCase) >= 0;
                 result.RateLimited = msga.IndexOf("waitsec", StringComparison.OrdinalIgnoreCase) >= 0;
                 result.BusinessPrompt = true;

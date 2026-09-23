@@ -96,14 +96,18 @@ namespace CampusNet.Core
         /// </summary>
         private const int SuspectVerifyMinSeconds = 10;
         /// <summary>
-        /// 提交登录后的复检节奏：先立刻看一眼（0 延迟的本地内容校验），再按**每档 2 秒**复检
-        /// 12 档（累计 2/4/6/8/…/24 秒，总窗口约 24 秒）。
-        /// 真机实测「提交 → 确认」中位 22 秒、p25 16 秒、p75 26 秒：上一版的 3~6 秒粒度太粗，
-        /// 真实信号出现后平均还要多等 2~4 秒才被看见，所以改成 2 秒一档。
-        /// 每档只多一次只读 chkstatus，不碰任何登录风控闸门。
+        /// 提交登录后的复检节奏：先立刻看一眼（0 延迟的本地内容校验），再按
+        /// **前 6 档每档 1 秒、后 6 档每档 2 秒**复检（累计 1/2/3/4/5/6/8/10/12/14/16/18 秒）。
+        /// 真机实测「提交 → 确认」中位 22 秒、p25 16 秒：这里再往前压两点——
+        ///   ① 前 6 档用 1 秒步长，真实信号（本机常见 +5~+12 秒）出现后最多 1 秒就被看见；
+        ///   ② 每档的只读 chkstatus 与本地内容校验**并行**跑，整档耗时 ≈ 两者较大值，
+        ///      不再是相加（真机每档原本多花约 0.9 秒，12 档累积就是十几秒）。
+        /// 档数仍是 12：一次事故的只读 chkstatus 上限不变，也不碰任何登录风控闸门。
         /// </summary>
         private static readonly int[] RecoveryWaitsSec =
-            new[] { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 };
+            new[] { 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2 };
+        /// <summary>复检档里等后台内容校验的上限（毫秒）：超了就当这一档没命中，下一档再来。</summary>
+        private const int RecoveryProbeJoinMs = 8000;
 
         private readonly object _gate = new object();
         private readonly Logger _log;
@@ -958,6 +962,13 @@ namespace CampusNet.Core
                 submittedAt = DateTime.Now;
                 PortalLoginResult result = portal.Login(credential.UserName, credential.Password);
                 lastSubmit = DateTime.Now;
+                // 真机实测：登录接口本身的返回时间差别极大（顺利时 ~2 秒，「账号已在别处在线」
+                // 这类要踢掉旧会话的情况下能到 20~30 秒），这段时间完全在 Portal 侧。
+                // 把它写进日志，才能分清「我们慢」还是「Portal 慢」。
+                _log.Info("登录接口返回耗时 " + result.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture)
+                    + " 秒（POST " + result.PostSeconds.ToString("0.0", CultureInfo.InvariantCulture)
+                    + " 秒 / 提示翻译 " + result.PromptSeconds.ToString("0.0", CultureInfo.InvariantCulture)
+                    + " 秒）。");
                 // 提交过登录请求就开始计时：最小间隔以内不再发第二次登录请求，
                 // 这段时间里的每一轮只做本地探测（见 EvaluateCore 的等待期分支）。
                 SetLoginWait(config.LoginMinIntervalSeconds);
@@ -966,6 +977,18 @@ namespace CampusNet.Core
 
                 if (result.Success)
                 {
+                    // 登录接口说成功，但 Portal 的会话有时还要几秒才真的能上网。
+                    // 先做一次 0 延迟的本地内容校验（不发 Portal 请求）：命中就直接收工，
+                    // 不必先白等 2 秒（老写法固定先睡 2 秒再查状态）。
+                    int instantLatency;
+                    if (NetworkProbe.ContentCheck(config, 1, out instantLatency))
+                    {
+                        success = true;
+                        how = "本地内容校验通过（登录接口返回后立刻命中）";
+                        _log.Info("登录接口返回成功，本地内容校验立刻通过（"
+                            + (instantLatency < 0 ? "延迟未知" : instantLatency + " ms") + "），不再等状态接口。");
+                        break;
+                    }
                     Thread.Sleep(2000);
                     StatusResult after = portal.GetStatus();
                     // 只有 Portal 明确回答「在线」才算成功。
@@ -1137,36 +1160,56 @@ namespace CampusNet.Core
 
         /// <summary>
         /// 登录返回「账号已在别处在线 / 密码错误」这类提示后，会话往往还要几秒才真正生效。
-        /// 先立刻做一次本地内容校验（0 延迟、不发 Portal 请求），再按每档 2 秒共 12 档
-        /// （累计 24 秒）做轻量复检（只读 chkstatus + 本地内容校验），通了就立刻算成功。
+        /// 先立刻做一次本地内容校验（0 延迟、不发 Portal 请求），再按 RecoveryWaitsSec 的
+        /// 12 档（前 6 档 1 秒、后 6 档 2 秒）做轻量复检，通了就立刻算成功。
+        ///
+        /// 每一档里「只读 chkstatus」与本机内容校验**并行**跑：串行时整档耗时是两者相加
+        /// （真机实测每档多花约 0.9 秒），并行后只取较大值，12 档累积能省十几秒。
+        /// 日志同时写出「计划档位」和「真实经过秒数」，免得把档位当成真实耗时看。
         /// </summary>
         private bool WaitForRecovery(AppConfig config, PortalClient portal, out string how)
         {
             how = string.Empty;
-            // 第 0 轮：立刻看一眼。登录瞬间生效时不必先白等 3 秒（老写法固定先睡 3 秒再查）。
-            // 注意别把这一轮写成「+0 秒」：ContentCheck 内部会并行跑两轮、每轮都有独立超时，
-            // 真机上这一轮实测可能要 4 秒。所以写成「首轮立刻命中」，只表达「这是立刻的那一轮」。
+            // 第 0 轮：立刻看一眼。登录瞬间生效时不必先白等（老写法固定先睡 2~3 秒再查）。
             int initialLatency;
-            if (NetworkProbe.ContentCheck(config, out initialLatency))
+            if (NetworkProbe.ContentCheck(config, 1, out initialLatency))
             {
                 how = "本地内容校验通过（首轮立刻命中）";
                 return true;
             }
-            int elapsed = 0;
-            foreach (int wait in RecoveryWaitsSec)
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            int planned = 0;
+            for (int step = 0; step < RecoveryWaitsSec.Length; step++)
             {
-                Thread.Sleep(Math.Max(1, wait) * 1000);
-                elapsed += wait;
+                int wait = Math.Max(1, RecoveryWaitsSec[step]);
+                Thread.Sleep(wait * 1000);
+                planned += wait;
+
+                // 两条检查互不依赖，并行跑：本地内容校验放后台线程，本线程同时问 Portal 状态。
+                bool contentOk = false;
+                int latency = -1;
+                var probe = new Thread(delegate()
+                {
+                    try { contentOk = NetworkProbe.ContentCheck(config, 1, out latency); }
+                    catch { contentOk = false; latency = -1; }
+                });
+                probe.IsBackground = true;
+                probe.Name = "CampusNet-RecoveryProbe";
+                probe.Start();
+
                 StatusResult status = portal.GetStatus();
+                probe.Join(RecoveryProbeJoinMs);
+
+                string elapsedText = "（+" + planned + " 秒档，实际 "
+                    + watch.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " 秒）";
                 if (status.Reachable && status.Online)
                 {
-                    how = "Portal 显示账号已在线（+" + elapsed + " 秒）";
+                    how = "Portal 显示账号已在线" + elapsedText;
                     return true;
                 }
-                int latency;
-                if (NetworkProbe.ContentCheck(config, out latency))
+                if (contentOk)
                 {
-                    how = "本地内容校验通过（+" + elapsed + " 秒）";
+                    how = "本地内容校验通过" + elapsedText;
                     return true;
                 }
                 // Portal 状态接口整个不可达（Portal 挂了 / 网络根本没通）时，后面几档问也问不出结果，

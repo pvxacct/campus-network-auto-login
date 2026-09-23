@@ -124,7 +124,8 @@ while ($true) {
         elseif ($path -like '*login*') {
             $counts.login++
             if ($null -eq $loginAt -and ($Scenario -eq 'late-content' -or
-                    $Scenario -eq 'instant-content' -or $Scenario -eq 'online-after-login-13' -or
+                    $Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or
+                    $Scenario -eq 'online-after-login-13' -or
                     $Scenario -eq 'online-after-login-15')) {
                 $loginAt = Get-Date
             }
@@ -183,12 +184,13 @@ while ($true) {
             Send-Response -Stream $stream -ContentType 'application/json; charset=utf-8' `
                 -Body ("dr1({`"result`":1,`"error_code`":`"$code`",`"error_prompt_zh`":`"$prompt`"})")
         }
-        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204' -or $Scenario -eq 'late-content' -or $Scenario -eq 'instant-content' -or $Scenario -eq 'content-from-4th') -and $path -like '*connecttest.txt*') {
+        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204' -or $Scenario -eq 'late-content' -or $Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or $Scenario -eq 'content-from-4th') -and $path -like '*connecttest.txt*') {
             # 内容校验测试用：content-ok 发关键字；content-204 发真正的 204 空响应；
-            # instant-content 在登录后立刻发关键字；late-content 要等登录后 30 秒才发。
+            # instant-content / instant-content-success 在登录后立刻发关键字（后者登录接口回「成功」）；
+            # late-content 要等登录后 30 秒才发。
             $contentHits++
             $serve = $true
-            if ($Scenario -eq 'instant-content' -or $Scenario -eq 'late-content') {
+            if ($Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or $Scenario -eq 'late-content') {
                 $serve = $false
                 if ($null -ne $loginAt) {
                     $waitSec = if ($Scenario -eq 'late-content') { 30 } else { 0 }

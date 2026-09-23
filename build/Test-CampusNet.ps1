@@ -978,16 +978,31 @@ $logView = $xamlDoc.SelectSingleNode('//x:RichTextBox[@xa:Name="LogView"]', $nsX
 $logFixedHeight = if ($null -ne $logView) { $logView.GetAttribute('Height') } else { 'missing' }
 $logMinHeight = if ($null -ne $logView -and $logView.GetAttribute('MinHeight')) { [int]$logView.GetAttribute('MinHeight') } else { 0 }
 Assert '日志区没有固定高度（跟着窗口伸缩）' ([string]::IsNullOrEmpty($logFixedHeight)) "LogView Height=$logFixedHeight"
-Assert '日志区最小高度 ≥ 110（窗口缩到最小时还能看几行）' ($logMinHeight -ge 110) "LogView MinHeight=$logMinHeight"
+Assert '日志区最小高度 ≥ 160（窗口缩到最小时也有 8 行可读）' ($logMinHeight -ge 160) "LogView MinHeight=$logMinHeight"
 Assert '日志区仍允许自身纵向滚动' ($null -ne $logView -and $logView.GetAttribute('VerticalScrollBarVisibility') -eq 'Auto') `
     "VerticalScrollBarVisibility=$($logView.GetAttribute('VerticalScrollBarVisibility'))"
 
-# 窗口不能小于「内容自然高度」：2.1.0 实测（UI Automation，100% DPI）把窗口拉到 960x700 时
-# 日志区被顶出窗口下沿（bottom 1011 > 窗口 bottom 976），760 仍溢出、780 才刚好放下。
-# 所以 MinHeight 必须 ≥ 780 —— 宁大勿小，免得又出现「控件被裁在窗口外」的老问题。
+# 运行统计只留「会变、看得懂」的项：2.1.1 删掉 4 行无效栏目。
+# 「连续失败」在完全忽略 Portal 提示之后长期是 0；「探测方式」跟配置绑定、开通后永不变化；
+# 「已忽略提示」与「最近结果 = 已忽略 Portal 提示」重复；「强制重登」几乎一直是「尚未发生」。
+foreach ($removedStat in @('StatFail', 'StatProbeMode', 'StatIgnored', 'StatForced')) {
+    Assert "运行统计不再有 $removedStat 这一行" ($mainXamlText -notmatch $removedStat) "MainWindow.xaml 里还有 $removedStat"
+}
+Assert '运行统计保留今日登录与恢复耗时' ($mainXamlText -match 'x:Name="StatDay"' -and $mainXamlText -match 'x:Name="StatRecovery"') `
+    '找不到 StatDay / StatRecovery'
+
+# 账号 / 密码框的灰色占位提示（WPF 没有内置 placeholder）
+Assert '账号与密码框都有占位提示' ($mainXamlText -match 'x:Name="UserNamePlaceholder"' -and $mainXamlText -match 'x:Name="PasswordPlaceholder"') `
+    '找不到 UserNamePlaceholder / PasswordPlaceholder'
+$appXamlText = Get-Content -LiteralPath $appXamlPath -Raw -Encoding UTF8
+Assert '占位提示用的是统一灰字样式' ($appXamlText -match 'x:Key="Placeholder"') 'App.xaml 里没有 Placeholder 样式'
+
+# 窗口不能小于「内容自然高度」：2.1.0 实测（UI Automation，100% DPI）780 才刚好放下；
+# 2.1.1 把日志区最小高度提到 160 之后重新实测：780 时仍有 1 个控件在窗口外，800 起才干净，
+# 所以取 820 留一点余量 —— 宁大勿小，免得又出现「控件被裁在窗口外」的老问题。
 $winMinHeightText = $xamlDoc.DocumentElement.GetAttribute('MinHeight')
 $winMinHeight = if ($winMinHeightText) { [int]$winMinHeightText } else { 0 }
-Assert '主窗口 MinHeight ≥ 780（不低于内容自然高度，避免日志区被顶出窗口）' ($winMinHeight -ge 780) "MinHeight=$winMinHeightText"
+Assert '主窗口 MinHeight ≥ 820（不低于内容自然高度，避免日志区被顶出窗口）' ($winMinHeight -ge 820) "MinHeight=$winMinHeightText"
 
 # 除日志之外不允许滚动：主体内容整体是 Auto 行，窗口缩到 MinHeight 也不裁切。
 # （2.0.0 曾为「高级设置最后一行被裁掉」把主体塞进 ScrollViewer；2.1.0 把高级设置
@@ -1093,7 +1108,7 @@ $n = Invoke-RawRun -Name 's36-recovery-ladder' -Scenario 'online-after-login-15'
 # 假 Portal 在登录后第 15 秒才说在线，而阶梯起点（登录返回后的 2 秒等待 + 首次本地校验）
 # 已经先花掉几秒，所以命中可能落在 +12 / +14 / +16 这几个档位上；关键是「不超过 +16 秒」——
 # 旧阶梯（+2/+5/+9/+14/+20/+23）在这种情况下只能拖到 +20 秒。
-$ladderHit = [regex]::Match($n.Log, 'Portal 显示账号已在线（\+(\d+) 秒）')
+$ladderHit = [regex]::Match($n.Log, 'Portal 显示账号已在线（\+(\d+) 秒档')
 $ladderSeconds = if ($ladderHit.Success) { [int]$ladderHit.Groups[1].Value } else { -1 }
 Assert '阶梯加密后最多 +16 秒就确认恢复（旧阶梯要等到 +20 秒）' ($ladderSeconds -gt 0 -and $ladderSeconds -le 16) `
     "确认档位=+$ladderSeconds 秒"
@@ -1102,6 +1117,18 @@ Assert '阶梯确认后状态为 login-ok' ($n.State.LastResult -eq 'login-ok') 
 # 一次事故的只读复检次数必须有上限：1 次登录前确认 + 12 档复检 = 13，留一点余量到 14。
 $ladderChecks = @(Get-RequestTimes -LogPath $n.LogPath -Kind 'chkstatus')
 Assert '一次事故的只读 chkstatus 次数 ≤ 14' ($ladderChecks.Count -le 14) "chkstatus=$($ladderChecks.Count)"
+
+# 场景 43：登录接口直接回「成功」时，先用 0 延迟的本地内容校验判定成功（不再白等 2 秒问状态）。
+# 假 Portal：登录回 Dr.COMWebLoginID_3.htm（成功），内容校验从登录那一刻起就返回关键字。
+$n = Invoke-RawRun -Name 's43-success-instant' -Scenario 'instant-content-success' -Seconds 12 `
+    -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" `
+        -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -OfflineProbe 2 -MinInterval 60)
+Assert '登录接口回成功时立刻用本地内容校验判定' ($n.Log -match '本地内容校验立刻通过') `
+    '日志里没有「本地内容校验立刻通过」'
+Assert '成功路径直接记 login-ok' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
+$successDelta = Get-LogSecondsBetween -Log $n.Log -FromPattern '次尝试登录' -ToPattern '自动登录成功'
+Assert '成功路径 ≤2 秒内确认（老写法固定先睡 2 秒再问状态）' ($successDelta -ge 0 -and $successDelta -le 2) `
+    "登录到确认相隔 $successDelta 秒"
 
 # 场景 37：登录前确认延迟 3 秒 → 1 秒的一次性迁移（v6 → v7），自定义值原样保留
 function Invoke-ConfirmDelayMigration {
@@ -1217,6 +1244,22 @@ Assert '今日提交计数只增不减' ($n.State.DayLoginAttempts -ge 8) "DayLo
 Assert '今日成功计数只增不减' ($n.State.DayLoginSuccess -ge 5) "DayLoginSuccess=$($n.State.DayLoginSuccess)"
 $engineCs = Get-Content -LiteralPath (Join-Path $repo 'src\CampusNet\Core\Engine.cs') -Raw -Encoding UTF8
 Assert 'Reload 走单调合并而不是整份覆盖' ($engineCs -match '_state\.MergeFrom\(loaded\)') 'Engine.cs 里没有 MergeFrom(loaded)'
+
+# 2.1.1：压缩「提交登录 → 确认恢复」的三处改动都要在源码里留痕（防止以后被误改回去）
+Assert '复检阶梯改成前 6 档 1 秒 + 后 6 档 2 秒' `
+    ($engineCs -match 'new\[\] \{ 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2 \}') 'RecoveryWaitsSec 不是 6 个 1 秒 + 6 个 2 秒'
+Assert '复检每档把 chkstatus 与内容校验并行跑（整档耗时取较大值）' `
+    ($engineCs -match 'CampusNet-RecoveryProbe' -and $engineCs -match 'probe\.Join\(RecoveryProbeJoinMs\)') `
+    'WaitForRecovery 里没有并行复检'
+Assert '复检日志同时写出计划档位与真实经过秒数' ($engineCs -match '秒档，实际 ') '复检日志里没有真实耗时'
+Assert '登录接口成功后先用 0 延迟本地内容校验判定' ($engineCs -match '本地内容校验立刻通过') '成功路径没有 0 延迟校验'
+Assert '登录接口自身耗时写进日志（分清 Portal 慢还是我们慢）' `
+    ($engineCs -match '登录接口返回耗时' -and $engineCs -match 'result\.PostSeconds') '日志里没有登录接口耗时'
+$networkCs = Get-Content -LiteralPath (Join-Path $repo 'src\CampusNet\Core\Network.cs') -Raw -Encoding UTF8
+Assert '内容校验支持指定复核轮数（复检阶梯里用 1 轮）' `
+    ($networkCs -match 'ContentCheck\(AppConfig config, int rounds, out int latencyMs\)') 'Network.cs 里没有带轮数的 ContentCheck'
+Assert '登录接口耗时字段有 PostSeconds / PromptSeconds' `
+    ($networkCs -match 'public double PostSeconds;' -and $networkCs -match 'public double PromptSeconds;') 'PortalLoginResult 里没有耗时字段'
 
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ''
