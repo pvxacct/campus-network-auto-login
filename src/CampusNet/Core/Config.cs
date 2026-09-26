@@ -10,8 +10,13 @@ namespace CampusNet.Core
     /// <summary>用户配置：门户地址、探测节奏、风控闸门、表单固定字段等。</summary>
     public sealed class AppConfig
     {
-        /// <summary>配置文件结构版本：小于当前值的老配置会在加载时自动迁移一次。</summary>
-        public const int CurrentConfigVersion = 8;
+        /// <summary>
+        /// 配置文件结构版本：小于当前值的老配置会在加载时自动迁移一次。
+        /// 2.1.2 直接把 2.1.0 / 2.1.1 的 v8 跳过，跳到 v9：那两版把「发现掉线」的节奏加密了
+        /// （在线 10 秒 / 异常 3 秒 / 会话核对 60 秒），实测在本网络下反而更容易错过恢复时机，
+        /// 因此核心逻辑整体回滚到 2.0.0，迁移也要跟着把配置改回去。
+        /// </summary>
+        public const int CurrentConfigVersion = 9;
 
         public const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -37,17 +42,11 @@ namespace CampusNet.Core
         public string ErrorPromptPath = "/eportal/portal/err_code/loadErrorPrompt";
         public string UserAgent = DefaultUserAgent;
 
-        /// <summary>
-        /// 网络正常时的探测间隔（秒）。只要探测能通就不碰 Portal。
-        /// 2.1.0 起默认 10 秒：掉线后「多久能发现」主要由它决定（上一版 20 秒，实测发现延迟中位偏大）。
-        /// </summary>
-        public int OnlineProbeSeconds = 10;
+        /// <summary>网络正常时的探测间隔（秒）。只要探测能通就不碰 Portal。</summary>
+        public int OnlineProbeSeconds = 20;
 
-        /// <summary>
-        /// 探测失败后的快速复检间隔（秒），用于尽快发现断网并重连。
-        /// 2.1.0 起默认 3 秒（上一版 5 秒）；「疑似掉线复测」「最小间隔等待期轮询」也跟着它走。
-        /// </summary>
-        public int OfflineProbeSeconds = 3;
+        /// <summary>探测失败后的快速复检间隔（秒），用于尽快发现断网并重连。</summary>
+        public int OfflineProbeSeconds = 5;
 
         /// <summary>「本机探测不通、但 Portal 显示账号在线」时的兜底巡检间隔（秒）。</summary>
         public int UpstreamProbeSeconds = 300;
@@ -98,10 +97,9 @@ namespace CampusNet.Core
         /// <summary>
         /// 在线时每隔多少秒只读核对一次 Portal 会话（0 = 关闭）。
         /// 这是「账号被踢下线」最主要的发现途径：间隔越短，被踢后恢复得越快。
-        /// 默认 60 秒 —— 2.1.0 起由 120 秒减半（实测 300 秒时「发现断网」的中位延迟高达 166 秒，
-        /// 而 120 秒时 2058 次定时核对一次都没发现掉线，仍按更勤的节奏兜底）。
+        /// 默认 120 秒 —— 实测 300 秒时「发现断网」的中位延迟高达 166 秒（最坏 410 秒）。
         /// </summary>
-        public int SessionCheckSeconds = 60;
+        public int SessionCheckSeconds = 120;
 
         /// <summary>
         /// 本机探测连续不通、但 Portal 说账号还在线时的容忍秒数；
@@ -275,10 +273,15 @@ namespace CampusNet.Core
             //   v5 -> v6：会话核对间隔默认 300 秒缩短为 120 秒（被踢下线后发现的更快），
             //             疑似掉线核对的最小间隔由 60 秒降到 20 秒（内部常量，不占配置键）。
             //   v6 -> v7：登录前二次确认默认 3 秒缩短为 1 秒，只改「等于旧默认值 3」的那一份。
-            //   v7 -> v8：整条「发现掉线」的节奏加密——在线探测 20 -> 10 秒、异常探测 5 -> 3 秒、
-            //             会话核对 120 -> 60 秒（只读 chkstatus，不碰登录风控）。同样只改等于旧默认值的那一份。
+            //   v8 -> v9：**回退**。2.1.0 / 2.1.1 的 v8 把在线探测加密到 10 秒、异常探测 3 秒、
+            //             会话核对 60 秒，实测会让「掉线后发现与恢复」变慢甚至不恢复；
+            //             2.1.2 把核心逻辑整体回滚到 2.0.0，配置也一并改回去
+            //             （10 -> 20 秒、3 -> 5 秒、60 -> 120 秒），仍然只改等于 2.1.x 默认值的那一份。
             if (config.ConfigVersion < CurrentConfigVersion)
             {
+                // 记下磁盘上的版本号：下面「回退节奏」的规则只对 v8 及以后的配置生效，
+                // 免得把 v7 及更早配置里用户自己填的 10 / 3 / 60 一起改掉。
+                int storedVersion = config.ConfigVersion;
                 if (SameTargets(config.ProbeTargets, LegacyProbeTargets)
                     || SameTargets(config.ProbeTargets, LegacyProbeTargetsV3))
                 {
@@ -289,10 +292,13 @@ namespace CampusNet.Core
                 if (config.SessionCheckSeconds == 300) { config.SessionCheckSeconds = 120; }
                 // 同上：只改等于旧默认值 3 的那一份；用户自己填的 5 / 10 之类原样保留。
                 if (config.LoginConfirmDelaySec == 3) { config.LoginConfirmDelaySec = new AppConfig().LoginConfirmDelaySec; }
-                // v7 -> v8：上一步刚把 v1 的 60 变成 20，这里继续把它带到新默认 10，链条不断。
-                if (config.OnlineProbeSeconds == 20) { config.OnlineProbeSeconds = 10; }
-                if (config.OfflineProbeSeconds == 5) { config.OfflineProbeSeconds = 3; }
-                if (config.SessionCheckSeconds == 120) { config.SessionCheckSeconds = 60; }
+                if (storedVersion >= 8)
+                {
+                    // 把 2.1.x 的激进节奏改回 2.0.0 的目标值（同样只改等于 2.1.x 默认值的那一份）。
+                    if (config.OnlineProbeSeconds == 10) { config.OnlineProbeSeconds = 20; }
+                    if (config.OfflineProbeSeconds == 3) { config.OfflineProbeSeconds = 5; }
+                    if (config.SessionCheckSeconds == 60) { config.SessionCheckSeconds = 120; }
+                }
                 if (config.ConfirmAttempts == 3 && config.ConfirmGapMs == 1000)
                 {
                     config.ConfirmAttempts = new AppConfig().ConfirmAttempts;
@@ -449,41 +455,6 @@ namespace CampusNet.Core
         /// <summary>最近一次「残留会话挡路 → 自动注销重登」的时间。</summary>
         public string LastForcedRelogin = string.Empty;
 
-        /// <summary>
-        /// 「今日登录」计数：本地日期（yyyy-MM-dd）+ 确认成功次数 + 真正提交出去的请求次数。
-        /// 以本机本地日期为界，跨零点惰性归零（RollDay）。
-        /// </summary>
-        public string DayKey = string.Empty;
-        public int DayLoginSuccess;
-        public int DayLoginAttempts;
-
-        public static string TodayKey(DateTime now)
-        {
-            return now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        }
-
-        /// <summary>跨零点惰性归零：不是今天就把三个值重置为今天。</summary>
-        public void RollDay(DateTime now)
-        {
-            string today = TodayKey(now);
-            if (string.Equals(DayKey, today, StringComparison.Ordinal)) { return; }
-            DayKey = today;
-            DayLoginSuccess = 0;
-            DayLoginAttempts = 0;
-        }
-
-        /// <summary>读今天已确认成功的登录次数（跨零点后显示 0，不写盘）。</summary>
-        public int TodaySuccess(DateTime now)
-        {
-            return string.Equals(DayKey, TodayKey(now), StringComparison.Ordinal) ? DayLoginSuccess : 0;
-        }
-
-        /// <summary>读今天已提交的登录请求次数（跨零点后显示 0，不写盘）。</summary>
-        public int TodayAttempts(DateTime now)
-        {
-            return string.Equals(DayKey, TodayKey(now), StringComparison.Ordinal) ? DayLoginAttempts : 0;
-        }
-
         public static AppState Load(string path)
         {
             var state = new AppState();
@@ -511,9 +482,6 @@ namespace CampusNet.Core
             state.IgnoredPrompts = Json.GetInt(map, "IgnoredPrompts", 0);
             state.LastIgnoredPrompt = Json.GetString(map, "LastIgnoredPrompt", string.Empty);
             state.LastForcedRelogin = Json.GetString(map, "LastForcedRelogin", string.Empty);
-            state.DayKey = Json.GetString(map, "DayKey", string.Empty);
-            state.DayLoginSuccess = Json.GetInt(map, "DayLoginSuccess", 0);
-            state.DayLoginAttempts = Json.GetInt(map, "DayLoginAttempts", 0);
             return state;
         }
 
@@ -546,10 +514,7 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.String("LastMessage", LastMessage) + ",");
             builder.AppendLine("  " + Json.Number("IgnoredPrompts", IgnoredPrompts) + ",");
             builder.AppendLine("  " + Json.String("LastIgnoredPrompt", LastIgnoredPrompt) + ",");
-            builder.AppendLine("  " + Json.String("LastForcedRelogin", LastForcedRelogin) + ",");
-            builder.AppendLine("  " + Json.String("DayKey", DayKey) + ",");
-            builder.AppendLine("  " + Json.Number("DayLoginSuccess", DayLoginSuccess) + ",");
-            builder.AppendLine("  " + Json.Number("DayLoginAttempts", DayLoginAttempts));
+            builder.AppendLine("  " + Json.String("LastForcedRelogin", LastForcedRelogin));
             builder.AppendLine("}");
             Json.WriteText(path, builder.ToString());
         }
@@ -583,78 +548,6 @@ namespace CampusNet.Core
             IgnoredPrompts = other.IgnoredPrompts;
             LastIgnoredPrompt = other.LastIgnoredPrompt;
             LastForcedRelogin = other.LastForcedRelogin;
-            DayKey = other.DayKey;
-            DayLoginSuccess = other.DayLoginSuccess;
-            DayLoginAttempts = other.DayLoginAttempts;
-        }
-
-        /// <summary>
-        /// 用磁盘快照刷新本对象，但**累计计数只增不减**。
-        /// 起因：本机出现过「已忽略提示 33 → 18」这类倒退——重载配置时把磁盘上那份更旧的
-        /// state.json 整个盖了回来。所以累计量取较大值，时间戳取较新的那个。
-        /// </summary>
-        public void MergeFrom(AppState other)
-        {
-            if (other == null) { return; }
-
-            // 先记住内存里这几个「只能前进」的值
-            long runCount = RunCount;
-            int ignored = IgnoredPrompts;
-            string dayKey = DayKey;
-            int daySuccess = DayLoginSuccess;
-            int dayAttempts = DayLoginAttempts;
-            string windowStart = LoginWindowStart;
-            int windowCount = LoginWindowCount;
-            string lastSuccess = LastLoginSuccess;
-            string lastSession = LastSessionCheck;
-            string lastForced = LastForcedRelogin;
-            string lastAttempt = LastLoginAttempt;
-
-            CopyFrom(other);
-
-            if (runCount > RunCount) { RunCount = runCount; }
-            if (ignored > IgnoredPrompts) { IgnoredPrompts = ignored; }
-
-            // 今日计数：同一天取较大值；日期不同时保留更新的那一天（避免被旧快照带回昨天）
-            if (string.Equals(dayKey, DayKey, StringComparison.Ordinal))
-            {
-                if (daySuccess > DayLoginSuccess) { DayLoginSuccess = daySuccess; }
-                if (dayAttempts > DayLoginAttempts) { DayLoginAttempts = dayAttempts; }
-            }
-            else if (string.CompareOrdinal(dayKey, DayKey) > 0)
-            {
-                DayKey = dayKey;
-                DayLoginSuccess = daySuccess;
-                DayLoginAttempts = dayAttempts;
-            }
-
-            // 小时窗口：起点更晚的胜出；同一起点取较大计数
-            DateTime? memStart = AppPaths.ParseTime(windowStart);
-            DateTime? diskStart = AppPaths.ParseTime(LoginWindowStart);
-            if (memStart.HasValue && (!diskStart.HasValue || memStart.Value > diskStart.Value))
-            {
-                LoginWindowStart = windowStart;
-                LoginWindowCount = windowCount;
-            }
-            else if (memStart.HasValue && diskStart.HasValue && memStart.Value == diskStart.Value
-                && windowCount > LoginWindowCount)
-            {
-                LoginWindowCount = windowCount;
-            }
-
-            if (IsNewer(lastSuccess, LastLoginSuccess)) { LastLoginSuccess = lastSuccess; }
-            if (IsNewer(lastSession, LastSessionCheck)) { LastSessionCheck = lastSession; }
-            if (IsNewer(lastForced, LastForcedRelogin)) { LastForcedRelogin = lastForced; }
-            if (IsNewer(lastAttempt, LastLoginAttempt)) { LastLoginAttempt = lastAttempt; }
-        }
-
-        private static bool IsNewer(string candidate, string current)
-        {
-            DateTime? a = AppPaths.ParseTime(candidate);
-            if (!a.HasValue) { return false; }
-            DateTime? b = AppPaths.ParseTime(current);
-            if (!b.HasValue) { return true; }
-            return a.Value > b.Value;
         }
 
         /// <summary>引擎心跳：每轮评估都会更新，写入节流最多滞后 60 秒。</summary>

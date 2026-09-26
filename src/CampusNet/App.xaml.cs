@@ -329,8 +329,6 @@ namespace CampusNet
             ConsoleBridge.Line("在线：" + (state.Online ? "是" : "否"));
             ConsoleBridge.Line("最近探测：" + Text(state.LastProbe) + Age(state.LastProbe));
             ConsoleBridge.Line("最近登录：" + Text(state.LastLoginSuccess));
-            ConsoleBridge.Line("今日登录：确认成功 " + state.TodaySuccess(DateTime.Now) + " 次 / 提交 "
-                + state.TodayAttempts(DateTime.Now) + " 次（" + AppState.TodayKey(DateTime.Now) + "）");
             ConsoleBridge.Line("连续失败：" + state.ConsecutiveFailures + "；本小时登录 " + state.LoginWindowCount + " 次");
             ConsoleBridge.Line("风控：" + "最小间隔 " + config.LoginMinIntervalSeconds + " 秒；每小时上限 "
                 + config.LoginHourlyLimit + " 次");
@@ -396,10 +394,6 @@ namespace CampusNet
             ConsoleBridge.Line("探测：" + snapshot.ProbeSummary);
             ConsoleBridge.Line("延迟：" + (snapshot.LatencyMs < 0 ? "未知" : snapshot.LatencyMs + " ms") + "；丢包：" + snapshot.LossPercent + "%");
             ConsoleBridge.Line("本小时登录：" + snapshot.LoginWindowCount + "；连续失败：" + snapshot.ConsecutiveFailures);
-            ConsoleBridge.Line("今日登录：" + snapshot.DayLoginSuccess + " 次成功 / " + snapshot.DayLoginAttempts + " 次提交");
-            ConsoleBridge.Line("恢复耗时：" + (snapshot.LastRecoverySeconds < 0
-                ? "本次进程还没有成功样本"
-                : "最近 " + snapshot.LastRecoverySeconds + " 秒；本次中位 " + snapshot.RecoveryMedianSeconds + " 秒"));
             ConsoleBridge.Line("累计检查：" + snapshot.RunCount);
             Shutdown(0);
         }

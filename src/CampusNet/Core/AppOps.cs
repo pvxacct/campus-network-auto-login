@@ -475,13 +475,6 @@ namespace CampusNet.Core
                 ? "尚未发生（本机不通而 Portal 说在线时才会自动注销重登）"
                 : Display(AppPaths.ParseTime(snapshot.LastForcedRelogin)) + Since(AppPaths.ParseTime(snapshot.LastForcedRelogin))));
             builder.AppendLine("累计检查  ：" + snapshot.RunCount + " 次");
-            builder.AppendLine("今日登录  ：确认成功 " + snapshot.DayLoginSuccess + " 次 / 提交 "
-                + snapshot.DayLoginAttempts + " 次"
-                + (string.IsNullOrEmpty(snapshot.DayKey) ? string.Empty : "（" + snapshot.DayKey + "）"));
-            builder.AppendLine("恢复耗时  ：" + (snapshot.LastRecoverySeconds < 0
-                ? "本次进程还没有成功样本"
-                : "最近 " + snapshot.LastRecoverySeconds + " 秒；本次中位 " + snapshot.RecoveryMedianSeconds
-                  + " 秒（" + snapshot.RecoverySampleCount + " 次样本）"));
             builder.AppendLine();
             builder.AppendLine("---- 网络 ----");
             builder.AppendLine("网卡      ：" + snapshot.Network.AdapterName + "（" + snapshot.Network.AdapterType + "）");

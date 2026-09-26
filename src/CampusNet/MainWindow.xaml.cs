@@ -134,16 +134,6 @@ namespace CampusNet
             StatNextProbe.Text = NextProbeText(snapshot);
             StatSession.Text = SessionText(snapshot);
             StatError.Text = string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError;
-            StatDay.Text = snapshot.DayLoginSuccess + " 次 / 提交 " + snapshot.DayLoginAttempts + " 次";
-            StatDay.ToolTip = string.IsNullOrEmpty(snapshot.DayKey)
-                ? null
-                : "统计日期 " + snapshot.DayKey + "（跨零点自动重新计数）";
-            StatRecovery.Text = snapshot.LastRecoverySeconds < 0
-                ? "—"
-                : snapshot.LastRecoverySeconds + " 秒 / 中位 " + snapshot.RecoveryMedianSeconds + " 秒";
-            StatRecovery.ToolTip = snapshot.LastRecoverySeconds < 0
-                ? "本次运行内还没有「提交登录 → 确认恢复」的样本"
-                : "最近一次恢复耗时；中位取自本次运行最近 " + snapshot.RecoverySampleCount + " 次样本";
             StatError.ToolTip = string.IsNullOrEmpty(snapshot.LastError) ? null : snapshot.LastError;
             ProbeText.ToolTip = string.IsNullOrEmpty(snapshot.ProbeSummary) ? null : snapshot.ProbeSummary;
 
