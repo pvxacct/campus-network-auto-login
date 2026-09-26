@@ -130,7 +130,11 @@ namespace CampusNet
             StatProbe.Text = Describe(snapshot.LastProbe);
             StatLogin.Text = Describe(snapshot.LastLoginSuccess);
             StatResult.Text = ResultText(snapshot.LastResult);
-            StatCount.Text = snapshot.LoginWindowCount + " 次";
+            StatCount.Text = "成功 " + snapshot.DayLoginSuccess + " 次 / 提交 " + snapshot.DayLoginAttempts + " 次";
+            StatDay.Text = snapshot.LastRecoverySeconds < 0 ? "—" : snapshot.LastRecoverySeconds + " 秒";
+            StatRecovery.Text = snapshot.RecoveryMedianSeconds < 0
+                ? "—"
+                : snapshot.RecoveryMedianSeconds + " 秒（最近 " + snapshot.RecoverySampleCount + " 次）";
             StatNextProbe.Text = NextProbeText(snapshot);
             StatSession.Text = SessionText(snapshot);
             StatError.Text = string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError;

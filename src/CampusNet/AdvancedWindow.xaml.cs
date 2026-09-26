@@ -10,7 +10,7 @@ namespace CampusNet
 {
     /// <summary>
     /// 高级设置独立窗口（2.1.0 起从主窗口的 Expander 搬出来）：
-    /// 10 个输入项排成两列 × 5 行，整窗高度固定、**不需要滚动条**，
+    /// 8 个输入项排成两列 × 4 行（2.1.3-pre.1 删掉了最小间隔与每小时上限两项限速），整窗高度固定、**不需要滚动条**，
     /// 也就不会再出现「展开后最后一行被裁在可视区外」的老问题。
     /// 行为与旧版一致：失焦或回车即校验、按范围钳制、立即写盘并重载（没有保存按钮）。
     /// </summary>
@@ -26,8 +26,6 @@ namespace CampusNet
         {
             { "OnlineProbeSeconds", new[] { 5, 3600 } },
             { "OfflineProbeSeconds", new[] { 1, 600 } },
-            { "LoginHourlyLimit", new[] { 0, 240 } },
-            { "LoginMinIntervalSeconds", new[] { 0, 3600 } },
             { "UpstreamProbeSeconds", new[] { 30, 3600 } },
             { "ProbeTimeoutMs", new[] { 200, 10000 } },
             { "HttpProbeTimeoutMs", new[] { 500, 10000 } },
@@ -44,15 +42,13 @@ namespace CampusNet
             Load();
         }
 
-        /// <summary>把当前配置灌进 10 个输入框。</summary>
+        /// <summary>把当前配置灌进 8 个输入框。</summary>
         public void Load()
         {
             AppConfig config = _engine.Config;
             OnlineProbeBox.Text = Number(config.OnlineProbeSeconds);
             OfflineProbeBox.Text = Number(config.OfflineProbeSeconds);
-            HourlyLimitBox.Text = Number(config.LoginHourlyLimit);
             PortalHostBox.Text = config.PortalBase;   // 连协议一起显示，写成 https://… 也认
-            MinIntervalBox.Text = Number(config.LoginMinIntervalSeconds);
             UpstreamProbeBox.Text = Number(config.UpstreamProbeSeconds);
             ProbeTimeoutBox.Text = Number(config.ProbeTimeoutMs);
             HttpProbeTimeoutBox.Text = Number(config.HttpProbeTimeoutMs);
@@ -183,8 +179,6 @@ namespace CampusNet
             {
                 case "OnlineProbeSeconds": return config.OnlineProbeSeconds;
                 case "OfflineProbeSeconds": return config.OfflineProbeSeconds;
-                case "LoginHourlyLimit": return config.LoginHourlyLimit;
-                case "LoginMinIntervalSeconds": return config.LoginMinIntervalSeconds;
                 case "UpstreamProbeSeconds": return config.UpstreamProbeSeconds;
                 case "ProbeTimeoutMs": return config.ProbeTimeoutMs;
                 case "HttpProbeTimeoutMs": return config.HttpProbeTimeoutMs;
@@ -200,8 +194,6 @@ namespace CampusNet
             {
                 case "OnlineProbeSeconds": config.OnlineProbeSeconds = value; break;
                 case "OfflineProbeSeconds": config.OfflineProbeSeconds = value; break;
-                case "LoginHourlyLimit": config.LoginHourlyLimit = value; break;
-                case "LoginMinIntervalSeconds": config.LoginMinIntervalSeconds = value; break;
                 case "UpstreamProbeSeconds": config.UpstreamProbeSeconds = value; break;
                 case "ProbeTimeoutMs": config.ProbeTimeoutMs = value; break;
                 case "HttpProbeTimeoutMs": config.HttpProbeTimeoutMs = value; break;
@@ -216,8 +208,6 @@ namespace CampusNet
             {
                 case "OnlineProbeSeconds": return "正常时探测间隔";
                 case "OfflineProbeSeconds": return "异常时探测间隔";
-                case "LoginHourlyLimit": return "每小时登录上限";
-                case "LoginMinIntervalSeconds": return "登录最小间隔";
                 case "UpstreamProbeSeconds": return "兜底巡检间隔";
                 case "ProbeTimeoutMs": return "探测超时";
                 case "HttpProbeTimeoutMs": return "HTTP 探测超时";

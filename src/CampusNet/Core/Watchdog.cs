@@ -273,12 +273,16 @@ namespace CampusNet.Core
                     // 探测：并行的每一轮约等于单条目标超时，复检 N 轮 + 内容补测两轮
                     int perProbeMs = Math.Max(500, Math.Max(config.HttpProbeTimeoutMs, config.ProbeTimeoutMs)) + 1500;
                     int probeRounds = Math.Max(1, config.ConfirmAttempts) + 2;
-                    // 登录：每次提交 = 登录超时 + 状态查询超时 + 固定等待（2 秒复检 + 1 秒余量）
-                    int perAttemptSeconds = Math.Max(1, config.LoginTimeoutSec) + Math.Max(1, config.StatusTimeoutSec) + 3;
+                    // 登录：每次提交 = 登录超时 + 状态查询超时 + 登录前二次确认 + 3 秒短窗
+                    // + 30 秒密集复检窗口（2.1.3-pre.1 起，每次提交都要跑满它）。
+                    int perAttemptSeconds = Math.Max(1, config.LoginTimeoutSec)
+                        + Math.Max(1, config.StatusTimeoutSec)
+                        + Math.Max(0, config.LoginConfirmDelaySec)
+                        + LoginEngine.RecoveryShortWatchSeconds
+                        + LoginEngine.RecoveryWatchSeconds;
                     int loginSeconds = Math.Max(1, config.RetryCount) * perAttemptSeconds;
                     budgetSeconds = (probeRounds * perProbeMs) / 1000
                         + loginSeconds
-                        + Math.Max(0, config.LoginConfirmDelaySec)
                         + (Math.Max(0, config.ConfirmGapMs) / 1000) + 1;
                 }
             }

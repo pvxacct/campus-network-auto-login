@@ -123,20 +123,16 @@
                         <TextBlock x:Name="StatLogin" Grid.Row="0" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,6" />
                         <TextBlock Grid.Row="1" Grid.Column="0" Text="最近结果" Style="{StaticResource Caption}" Margin="0,0,10,6" />
                         <TextBlock x:Name="StatResult" Grid.Row="1" Grid.Column="1" Style="{StaticResource Value}" Margin="0,0,16,6" />
-                        <TextBlock Grid.Row="1" Grid.Column="2" Text="本小时登录" Style="{StaticResource Caption}" Margin="0,0,10,6" />
+                        <TextBlock Grid.Row="1" Grid.Column="2" Text="今日登录" Style="{StaticResource Caption}" Margin="0,0,10,6" />
                         <TextBlock x:Name="StatCount" Grid.Row="1" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,6" />
                         <TextBlock Grid.Row="2" Grid.Column="0" Text="下次探测" Style="{StaticResource Caption}" Margin="0,0,10,6" />
                         <TextBlock x:Name="StatNextProbe" Grid.Row="2" Grid.Column="1" Style="{StaticResource Value}" Margin="0,0,16,6" />
                         <TextBlock Grid.Row="2" Grid.Column="2" Text="会话校验" Style="{StaticResource Caption}" Margin="0,0,10,6" />
                         <TextBlock x:Name="StatSession" Grid.Row="2" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,6" />
-                        <TextBlock Grid.Row="3" Grid.Column="0" Text="今日登录" Style="{StaticResource Caption}" Margin="0,0,10,0" />
-                        <!-- 2.1.2 把核心逻辑回滚到 2.0.0 后，「今日登录」「恢复耗时」不再有数据源；
-                             保留原位置与网格行（不动卡片高度），只显示占位横线。 -->
-                        <TextBlock x:Name="StatDay" Grid.Row="3" Grid.Column="1" Style="{StaticResource Value}" Margin="0,0,16,0"
-                                   Text="—" ToolTip="2.1.2 起不再统计（核心逻辑已回滚到 2.0.0）" />
+                        <TextBlock Grid.Row="3" Grid.Column="0" Text="上次恢复" Style="{StaticResource Caption}" Margin="0,0,10,0" />
+                        <TextBlock x:Name="StatDay" Grid.Row="3" Grid.Column="1" Style="{StaticResource Value}" Margin="0,0,16,0" />
                         <TextBlock Grid.Row="3" Grid.Column="2" Text="恢复耗时" Style="{StaticResource Caption}" Margin="0,0,10,0" />
-                        <TextBlock x:Name="StatRecovery" Grid.Row="3" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,0"
-                                   Text="—" ToolTip="2.1.2 起不再统计（核心逻辑已回滚到 2.0.0）" />
+                        <TextBlock x:Name="StatRecovery" Grid.Row="3" Grid.Column="3" Style="{StaticResource Value}" Margin="0,0,0,0" />
                         <TextBlock Grid.Row="4" Grid.Column="0" Text="最近错误" Style="{StaticResource Caption}" Margin="0,6,10,0" />
                         <TextBlock x:Name="StatError" Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="3" Style="{StaticResource Value}"
                                    TextWrapping="Wrap" TextTrimming="CharacterEllipsis" LineHeight="16" MaxHeight="32" Margin="0,6,0,0" />

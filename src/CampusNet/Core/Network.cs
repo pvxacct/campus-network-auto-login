@@ -218,15 +218,15 @@ namespace CampusNet.Core
             return outcome;
         }
 
-        private static bool RunTarget(AppConfig config, ProbeTarget target, out int latencyMs)
+        private static bool RunTarget(AppConfig config, ProbeTarget target, out int latencyMs, int httpTimeoutMs = 0)
         {
             if (target.Kind == "icmp") { return PingTarget(target.Host, config.ProbeTimeoutMs, out latencyMs); }
             if (target.Kind == "http")
             {
                 // HTTP 探测用单独的超时：内容校验目标（204 / connecttest）正常只要几十毫秒，
                 // 沿用 TCP 握手那种上限会让断网判定慢一大截，而这正是「被踢下线后多久能重连」。
-                return HttpTarget(target.Url, target.Expect, target.ExpectStatus,
-                    Math.Max(500, config.HttpProbeTimeoutMs), out latencyMs);
+                int timeout = httpTimeoutMs > 0 ? httpTimeoutMs : Math.Max(500, config.HttpProbeTimeoutMs);
+                return HttpTarget(target.Url, target.Expect, target.ExpectStatus, timeout, out latencyMs);
             }
             return TcpTarget(target.Host, target.Port, config.ProbeTimeoutMs, out latencyMs);
         }
@@ -235,7 +235,8 @@ namespace CampusNet.Core
         /// 每条目标一个后台线程并行跑，各自有自己的超时；整轮的总等待用一个共享预算封顶，
         /// 个别目标卡在 DNS 解析上也不会拖住整轮（超预算的按失败处理）。
         /// </summary>
-        private static void RunParallel(AppConfig config, List<ProbeTarget> targets, bool[] okFlags, int[] latencies)
+        private static void RunParallel(AppConfig config, List<ProbeTarget> targets, bool[] okFlags, int[] latencies,
+            int httpTimeoutMs = 0, int budgetMs = 0)
         {
             int count = targets.Count;
             // 每轮都用全新的结果数组：万一某条目标超预算没结束（例如 DNS 卡住），
@@ -250,7 +251,7 @@ namespace CampusNet.Core
                 {
                     int latency = -1;
                     bool ok = false;
-                    try { ok = RunTarget(config, targets[index], out latency); }
+                    try { ok = RunTarget(config, targets[index], out latency, httpTimeoutMs); }
                     catch { ok = false; latency = -1; }
                     roundOk[index] = ok;
                     roundLatency[index] = latency;
@@ -261,7 +262,11 @@ namespace CampusNet.Core
                 thread.Start();
             }
 
-            int budget = Math.Max(Math.Max(config.HttpProbeTimeoutMs, config.ProbeTimeoutMs), 500) + 1500;
+            // budgetMs > 0 时用调用方给的预算（密集复检窗口要的是「快」，宁可错过一次也马上进下一档）；
+            // 否则按配置算一个宽松的兜底（正常探测用）。
+            int budget = budgetMs > 0
+                ? budgetMs
+                : Math.Max(Math.Max(config.HttpProbeTimeoutMs, config.ProbeTimeoutMs), 500) + 1500;
             var watch = System.Diagnostics.Stopwatch.StartNew();
             for (int i = 0; i < count; i++)
             {
@@ -320,6 +325,33 @@ namespace CampusNet.Core
         }
 
         private const int ContentRetryGapMs = 300;
+
+        /// <summary>
+        /// 单轮「内容校验」：只跑一遍、只等一次短预算（min(HttpProbeTimeoutMs, 1500) 毫秒）。
+        /// 用于登录后的密集复检窗口（每 1 秒一档），必须快；重的复核交给 Probe(ConfirmAttempts, ConfirmGapMs)。
+        /// 配置里没有内容校验目标时直接返回 false（这时只能靠 TCP 连通性兜底）。
+        /// </summary>
+        public static bool QuickContentCheck(AppConfig config, out int latencyMs)
+        {
+            latencyMs = -1;
+            var targets = new List<ProbeTarget>();
+            foreach (string text in config.ProbeTargets)
+            {
+                ProbeTarget target = ProbeTarget.Parse(text);
+                if (target != null && target.ContentVerified) { targets.Add(target); }
+            }
+            if (targets.Count == 0) { return false; }
+
+            int budget = Math.Min(Math.Max(500, config.HttpProbeTimeoutMs), 1500);
+            var okFlags = new bool[targets.Count];
+            var latencies = new int[targets.Count];
+            RunParallel(config, targets, okFlags, latencies, budget, budget + 500);
+            for (int i = 0; i < targets.Count; i++)
+            {
+                if (okFlags[i]) { latencyMs = latencies[i]; return true; }
+            }
+            return false;
+        }
 
         /// <summary>
         /// 内容校验探测：真正取回页面内容并核对关键字。

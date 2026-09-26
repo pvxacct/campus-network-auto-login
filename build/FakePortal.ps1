@@ -65,6 +65,30 @@ function Get-Stamp {
     return [long](([datetime]::UtcNow - $epoch).TotalMilliseconds)
 }
 
+# 「会话是不是真的通了」：内容校验目标只在这一刻为真时才返回关键字。
+# chkstatus 说在线、内容却永远取不回来（或反过来）都是真实存在的故障，所以两边各判各的，
+# 但共用同一份「这一刻网络到底通不通」的判定，测试才写得清楚。
+function Test-SessionUp {
+    switch ($Scenario) {
+        'online' { return $true }
+        'confirm-online' { return $true }
+        'content-ok' { return $true }
+        'content-204' { return $true }
+        'offline-ok' { return ($counts.login -ge 1) }
+        'conflict-then-online' { return ($counts.chkstatus -ge 3) }
+        # 幽灵会话：Portal 一直回「已在别处在线」，只有见过一次 logout 之后本机才真的能上网
+        'ghost-session' { return ($counts.logout -ge 1) }
+        # 登录后第 N 秒才真的能上网：用来量密集复检窗口的粒度
+        'online-after-login-13' { return ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 13) }
+        'online-after-login-15' { return ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 15) }
+        'online-after-login-22' { return ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 22) }
+        'instant-content' { return ($null -ne $loginAt) }
+        'instant-content-success' { return ($null -ne $loginAt) }
+        'late-content' { return ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 30) }
+        default { return $false }
+    }
+}
+
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
 $listener.Start()
 Set-Content -LiteralPath $LogPath -Value "START $Scenario @$(Get-Stamp)" -Encoding UTF8
@@ -115,6 +139,10 @@ while ($true) {
                 'online-after-login-15' {
                     $online = ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 15)
                 }
+                # 登录后第 22 秒起才显示在线：量「1 秒一档」密集复检窗口的粒度（应落在 +22~+23 秒）。
+                'online-after-login-22' {
+                    $online = ($null -ne $loginAt) -and (((Get-Date) - $loginAt).TotalSeconds -ge 22)
+                }
                 'content-ok' { $online = $true }
                 default { $online = $false }
             }
@@ -126,14 +154,23 @@ while ($true) {
             if ($null -eq $loginAt -and ($Scenario -eq 'late-content' -or
                     $Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or
                     $Scenario -eq 'online-after-login-13' -or
-                    $Scenario -eq 'online-after-login-15')) {
+                    $Scenario -eq 'online-after-login-15' -or
+                    $Scenario -eq 'online-after-login-22')) {
                 $loginAt = Get-Date
             }
             switch ($Scenario) {
                 'rate-limited' {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='error5 waitsec 3';</script>"
                 }
+                # 长暂停：waitsec 30 比引擎「异常探测」的最短返回还长，用来验证暂停期内真的不再提交登录。
+                'rate-limited-long' {
+                    Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='error5 waitsec 30';</script>"
+                }
                 'conflict' {
+                    Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='userid error2';</script>"
+                }
+                # 幽灵会话：每次登录都回「已在别处在线」，本机却上不了网；只有先注销再登录才恢复。
+                'ghost-session' {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='userid error2';</script>"
                 }
                 # 登录回了「已在别处在线 / 密码错误」，但网络稍后真的通了：
@@ -184,19 +221,11 @@ while ($true) {
             Send-Response -Stream $stream -ContentType 'application/json; charset=utf-8' `
                 -Body ("dr1({`"result`":1,`"error_code`":`"$code`",`"error_prompt_zh`":`"$prompt`"})")
         }
-        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204' -or $Scenario -eq 'late-content' -or $Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or $Scenario -eq 'content-from-4th') -and $path -like '*connecttest.txt*') {
-            # 内容校验测试用：content-ok 发关键字；content-204 发真正的 204 空响应；
-            # instant-content / instant-content-success 在登录后立刻发关键字（后者登录接口回「成功」）；
-            # late-content 要等登录后 30 秒才发。
+        elseif ($path -like '*connecttest.txt*') {
+            # 内容校验目标：只有 Test-SessionUp 说「这一刻真的通了」才返回关键字；
+            # 否则回「连得上但没有关键字」，等价于校园网关代答 / 账号已被踢下线。
             $contentHits++
-            $serve = $true
-            if ($Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or $Scenario -eq 'late-content') {
-                $serve = $false
-                if ($null -ne $loginAt) {
-                    $waitSec = if ($Scenario -eq 'late-content') { 30 } else { 0 }
-                    $serve = ((Get-Date) - $loginAt).TotalSeconds -ge $waitSec
-                }
-            }
+            $serve = Test-SessionUp
             if ($Scenario -eq 'content-from-4th') {
                 # 前 3 次内容请求都回「连得上但没有关键字」（等价于会话没通），第 4 次起才真的返回。
                 # 前 3 次正好是「首轮探测 + 断网复检 2 轮」，第 4 次落在「登录前本地内容校验」那一步，

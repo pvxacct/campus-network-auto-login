@@ -9,9 +9,9 @@
         <StackPanel>
             <TextBlock Text="高级设置" Style="{StaticResource SectionTitle}" />
             <TextBlock Style="{StaticResource Caption}" TextWrapping="Wrap" Margin="0,0,0,10"
-                       Text="输入框改完（点开别处或按回车）即自动保存并立即生效；超出范围的整数会被钳制到边界。登录风控（最小间隔、每小时上限、登录前确认）不会因为这里的改动而失效。" />
+                       Text="输入框改完（点开别处或按回车）即自动保存并立即生效；超出范围的整数会被钳制到边界。本版已删除「最小间隔 / 每小时上限」两项限速，登录频率只剩「登录前 1 秒二次确认」和 Portal 自己返回的限流提示。" />
 
-            <!-- 两列 × 5 行：整窗内容固定，不需要滚动条。行/列数必须不小于用到的最大索引，
+            <!-- 两列 × 4 行（8 项）：整窗内容固定，不需要滚动条。行/列数必须不小于用到的最大索引，
                  WPF 对越界行号不报错而是塞进最后一行，两个控件就会叠印（pre.7 的界面回归）。 -->
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -22,7 +22,6 @@
                     <ColumnDefinition Width="90" MinWidth="80" />
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
@@ -39,20 +38,15 @@
                 <TextBlock Grid.Row="1" Grid.Column="3" Text="探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,8" />
                 <TextBox x:Name="ProbeTimeoutBox" Grid.Row="1" Grid.Column="4" Tag="ProbeTimeoutMs" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,8" />
 
-                <TextBlock Grid.Row="2" Grid.Column="0" Text="每小时登录上限（次）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,8" />
-                <TextBox x:Name="HourlyLimitBox" Grid.Row="2" Grid.Column="1" Tag="LoginHourlyLimit" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,8" />
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="Portal 地址" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,8" />
+                <TextBox x:Name="PortalHostBox" Grid.Row="2" Grid.Column="1" LostFocus="PortalHost_LostFocus" KeyDown="PortalHost_KeyDown" Margin="0,0,0,8" />
                 <TextBlock Grid.Row="2" Grid.Column="3" Text="HTTP 探测超时（毫秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,8" />
                 <TextBox x:Name="HttpProbeTimeoutBox" Grid.Row="2" Grid.Column="4" Tag="HttpProbeTimeoutMs" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,8" />
 
-                <TextBlock Grid.Row="3" Grid.Column="0" Text="Portal 地址" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,8" />
-                <TextBox x:Name="PortalHostBox" Grid.Row="3" Grid.Column="1" LostFocus="PortalHost_LostFocus" KeyDown="PortalHost_KeyDown" Margin="0,0,0,8" />
-                <TextBlock Grid.Row="3" Grid.Column="3" Text="会话核对间隔（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,8" />
-                <TextBox x:Name="SessionCheckBox" Grid.Row="3" Grid.Column="4" Tag="SessionCheckSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" Margin="0,0,0,8" />
-
-                <TextBlock Grid.Row="4" Grid.Column="0" Text="登录最小间隔（秒）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
-                <TextBox x:Name="MinIntervalBox" Grid.Row="4" Grid.Column="1" Tag="LoginMinIntervalSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
-                <TextBlock Grid.Row="4" Grid.Column="3" Text="残留会话自动重登（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
-                <TextBox x:Name="StuckReloginBox" Grid.Row="4" Grid.Column="4" Tag="StuckReloginSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
+                <TextBlock Grid.Row="3" Grid.Column="0" Text="会话核对间隔（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
+                <TextBox x:Name="SessionCheckBox" Grid.Row="3" Grid.Column="1" Tag="SessionCheckSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
+                <TextBlock Grid.Row="3" Grid.Column="3" Text="残留会话自动重登（秒，0=关闭）" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
+                <TextBox x:Name="StuckReloginBox" Grid.Row="3" Grid.Column="4" Tag="StuckReloginSeconds" LostFocus="AdvancedBox_LostFocus" KeyDown="AdvancedBox_KeyDown" />
             </Grid>
 
             <TextBlock x:Name="AdvancedHint" Style="{StaticResource Caption}" Margin="0,12,0,0" TextWrapping="Wrap"

@@ -12,11 +12,10 @@ namespace CampusNet.Core
     {
         /// <summary>
         /// 配置文件结构版本：小于当前值的老配置会在加载时自动迁移一次。
-        /// 2.1.2 直接把 2.1.0 / 2.1.1 的 v8 跳过，跳到 v9：那两版把「发现掉线」的节奏加密了
-        /// （在线 10 秒 / 异常 3 秒 / 会话核对 60 秒），实测在本网络下反而更容易错过恢复时机，
-        /// 因此核心逻辑整体回滚到 2.0.0，迁移也要跟着把配置改回去。
+        /// v10（2.1.3-pre.1）删掉了「最小间隔」「每小时上限」两个限速项，并把默认节奏收紧为
+        /// 在线 15 秒 / 异常 3 秒 / 残留会话自动重登 15 秒；迁移只改「恰好等于旧默认值」的那一份。
         /// </summary>
-        public const int CurrentConfigVersion = 9;
+        public const int CurrentConfigVersion = 10;
 
         public const string DefaultUserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -42,11 +41,15 @@ namespace CampusNet.Core
         public string ErrorPromptPath = "/eportal/portal/err_code/loadErrorPrompt";
         public string UserAgent = DefaultUserAgent;
 
-        /// <summary>网络正常时的探测间隔（秒）。只要探测能通就不碰 Portal。</summary>
-        public int OnlineProbeSeconds = 20;
+        /// <summary>
+        /// 网络正常时的探测间隔（秒）。只要探测能通就不碰 Portal。
+        /// 15 秒是 2.1.3-pre.1 的新默认：真机 9067 行日志显示「发现掉线」仍是最长的一段，
+        /// 而它只是纯本地探测，不产生任何 Portal 请求。
+        /// </summary>
+        public int OnlineProbeSeconds = 15;
 
         /// <summary>探测失败后的快速复检间隔（秒），用于尽快发现断网并重连。</summary>
-        public int OfflineProbeSeconds = 5;
+        public int OfflineProbeSeconds = 3;
 
         /// <summary>「本机探测不通、但 Portal 显示账号在线」时的兜底巡检间隔（秒）。</summary>
         public int UpstreamProbeSeconds = 300;
@@ -91,8 +94,6 @@ namespace CampusNet.Core
         /// 1 秒足够挡住「上一轮状态陈旧」这类误判，又把「发现 → 提交」压到约 1 秒。
         /// </summary>
         public int LoginConfirmDelaySec = 1;
-        public int LoginMinIntervalSeconds = 60;
-        public int LoginHourlyLimit = 12;
 
         /// <summary>
         /// 在线时每隔多少秒只读核对一次 Portal 会话（0 = 关闭）。
@@ -103,8 +104,9 @@ namespace CampusNet.Core
 
         /// <summary>
         /// 本机探测连续不通、但 Portal 说账号还在线时的容忍秒数；
-        /// 超过它判定为「残留会话挡路」，自动注销后重新登录（0 = 关闭）。</summary>
-        public int StuckReloginSeconds = 60;
+        /// 超过它判定为「残留会话挡路」，自动注销后重新登录（0 = 关闭）。
+        /// 15 秒是 2.1.3-pre.1 的新默认：真机日志里「注销 + 重新登录」6/6 都在 5 秒内恢复。</summary>
+        public int StuckReloginSeconds = 15;
 
         public int StatusTimeoutSec = 8;
         public int LoginTimeoutSec = 15;
@@ -218,8 +220,6 @@ namespace CampusNet.Core
             config.ConfirmGapMs = Clamp(Json.GetInt(map, "ConfirmGapMs", config.ConfirmGapMs), 100, 5000);
 
             config.LoginConfirmDelaySec = Clamp(Json.GetInt(map, "LoginConfirmDelaySec", config.LoginConfirmDelaySec), 0, 60);
-            config.LoginMinIntervalSeconds = Clamp(Json.GetInt(map, "LoginMinIntervalSeconds", config.LoginMinIntervalSeconds), 0, 3600);
-            config.LoginHourlyLimit = Clamp(Json.GetInt(map, "LoginHourlyLimit", config.LoginHourlyLimit), 0, 240);
             config.SessionCheckSeconds = Clamp(Json.GetInt(map, "SessionCheckSeconds", config.SessionCheckSeconds), 0, 3600);
             config.StuckReloginSeconds = Clamp(Json.GetInt(map, "StuckReloginSeconds", config.StuckReloginSeconds), 0, 3600);
             config.StatusTimeoutSec = Clamp(Json.GetInt(map, "StatusTimeoutSec", config.StatusTimeoutSec), 2, 60);
@@ -304,6 +304,12 @@ namespace CampusNet.Core
                     config.ConfirmAttempts = new AppConfig().ConfirmAttempts;
                     config.ConfirmGapMs = new AppConfig().ConfirmGapMs;
                 }
+                // v9 -> v10：把「等于 2.1.2 默认值」的那一份收紧到 2.1.3-pre.1 的新默认
+                // （在线 20 -> 15 秒、异常 5 -> 3 秒），并把长期默认的「残留重登 60 秒」改成 15 秒。
+                // 仍然只改恰好等于旧默认值的那一份，用户自己填过的值原样保留。
+                if (config.OnlineProbeSeconds == 20) { config.OnlineProbeSeconds = new AppConfig().OnlineProbeSeconds; }
+                if (config.OfflineProbeSeconds == 5) { config.OfflineProbeSeconds = new AppConfig().OfflineProbeSeconds; }
+                if (config.StuckReloginSeconds == 60) { config.StuckReloginSeconds = new AppConfig().StuckReloginSeconds; }
                 config.ConfigVersion = CurrentConfigVersion;
                 try { config.Save(path); } catch { }
             }
@@ -342,8 +348,6 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.Number("ConfirmGapMs", ConfirmGapMs) + ",");
             builder.AppendLine("  \"ProbeTargets\": [" + JoinQuoted(ProbeTargets) + "],");
             builder.AppendLine("  " + Json.Number("LoginConfirmDelaySec", LoginConfirmDelaySec) + ",");
-            builder.AppendLine("  " + Json.Number("LoginMinIntervalSeconds", LoginMinIntervalSeconds) + ",");
-            builder.AppendLine("  " + Json.Number("LoginHourlyLimit", LoginHourlyLimit) + ",");
             builder.AppendLine("  " + Json.Number("SessionCheckSeconds", SessionCheckSeconds) + ",");
             builder.AppendLine("  " + Json.Number("StuckReloginSeconds", StuckReloginSeconds) + ",");
             builder.AppendLine("  " + Json.Number("StatusTimeoutSec", StatusTimeoutSec) + ",");
@@ -441,8 +445,6 @@ namespace CampusNet.Core
         public string LastSessionResult = string.Empty;
         /// <summary>上一次会话核对的来源：periodic（定时巡检）/ suspect（疑似掉线核对）。</summary>
         public string LastSessionCheckKind = string.Empty;
-        public string LoginWindowStart = string.Empty;
-        public int LoginWindowCount;
         public long RunCount;
         public bool Paused;
         public string PauseUntil = string.Empty;
@@ -454,6 +456,41 @@ namespace CampusNet.Core
 
         /// <summary>最近一次「残留会话挡路 → 自动注销重登」的时间。</summary>
         public string LastForcedRelogin = string.Empty;
+
+        /// <summary>
+        /// 「今日登录」计数：本地日期（yyyy-MM-dd）+ 确认成功次数 + 真正提交出去的登录请求次数。
+        /// 以本机本地日期为界，跨零点惰性归零（RollDay）。
+        /// </summary>
+        public string DayKey = string.Empty;
+        public int DayLoginSuccess;
+        public int DayLoginAttempts;
+
+        public static string TodayKey(DateTime now)
+        {
+            return now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>跨零点惰性归零：不是今天就把三个值重置为今天。</summary>
+        public void RollDay(DateTime now)
+        {
+            string today = TodayKey(now);
+            if (string.Equals(DayKey, today, StringComparison.Ordinal)) { return; }
+            DayKey = today;
+            DayLoginSuccess = 0;
+            DayLoginAttempts = 0;
+        }
+
+        /// <summary>读今天已确认成功的登录次数（跨零点后显示 0，不写盘）。</summary>
+        public int TodaySuccess(DateTime now)
+        {
+            return string.Equals(DayKey, TodayKey(now), StringComparison.Ordinal) ? DayLoginSuccess : 0;
+        }
+
+        /// <summary>读今天已提交的登录请求次数（跨零点后显示 0，不写盘）。</summary>
+        public int TodayAttempts(DateTime now)
+        {
+            return string.Equals(DayKey, TodayKey(now), StringComparison.Ordinal) ? DayLoginAttempts : 0;
+        }
 
         public static AppState Load(string path)
         {
@@ -473,8 +510,6 @@ namespace CampusNet.Core
             state.LastSessionCheck = Json.GetString(map, "LastSessionCheck", string.Empty);
             state.LastSessionResult = Json.GetString(map, "LastSessionResult", string.Empty);
             state.LastSessionCheckKind = Json.GetString(map, "LastSessionCheckKind", string.Empty);
-            state.LoginWindowStart = Json.GetString(map, "LoginWindowStart", string.Empty);
-            state.LoginWindowCount = Json.GetInt(map, "LoginWindowCount", 0);
             state.RunCount = Json.GetInt(map, "RunCount", 0);
             state.Paused = Json.GetBool(map, "Paused", false);
             state.PauseUntil = Json.GetString(map, "PauseUntil", string.Empty);
@@ -482,6 +517,9 @@ namespace CampusNet.Core
             state.IgnoredPrompts = Json.GetInt(map, "IgnoredPrompts", 0);
             state.LastIgnoredPrompt = Json.GetString(map, "LastIgnoredPrompt", string.Empty);
             state.LastForcedRelogin = Json.GetString(map, "LastForcedRelogin", string.Empty);
+            state.DayKey = Json.GetString(map, "DayKey", string.Empty);
+            state.DayLoginSuccess = Json.GetInt(map, "DayLoginSuccess", 0);
+            state.DayLoginAttempts = Json.GetInt(map, "DayLoginAttempts", 0);
             return state;
         }
 
@@ -506,15 +544,16 @@ namespace CampusNet.Core
             builder.AppendLine("  " + Json.String("LastSessionCheck", LastSessionCheck) + ",");
             builder.AppendLine("  " + Json.String("LastSessionResult", LastSessionResult) + ",");
             builder.AppendLine("  " + Json.String("LastSessionCheckKind", LastSessionCheckKind) + ",");
-            builder.AppendLine("  " + Json.String("LoginWindowStart", LoginWindowStart) + ",");
-            builder.AppendLine("  " + Json.Number("LoginWindowCount", LoginWindowCount) + ",");
             builder.AppendLine("  " + Json.Number("RunCount", RunCount) + ",");
             builder.AppendLine("  " + Json.Bool("Paused", Paused) + ",");
             builder.AppendLine("  " + Json.String("PauseUntil", PauseUntil) + ",");
             builder.AppendLine("  " + Json.String("LastMessage", LastMessage) + ",");
             builder.AppendLine("  " + Json.Number("IgnoredPrompts", IgnoredPrompts) + ",");
             builder.AppendLine("  " + Json.String("LastIgnoredPrompt", LastIgnoredPrompt) + ",");
-            builder.AppendLine("  " + Json.String("LastForcedRelogin", LastForcedRelogin));
+            builder.AppendLine("  " + Json.String("LastForcedRelogin", LastForcedRelogin) + ",");
+            builder.AppendLine("  " + Json.String("DayKey", DayKey) + ",");
+            builder.AppendLine("  " + Json.Number("DayLoginSuccess", DayLoginSuccess) + ",");
+            builder.AppendLine("  " + Json.Number("DayLoginAttempts", DayLoginAttempts));
             builder.AppendLine("}");
             Json.WriteText(path, builder.ToString());
         }
@@ -539,8 +578,6 @@ namespace CampusNet.Core
             LastSessionCheck = other.LastSessionCheck;
             LastSessionResult = other.LastSessionResult;
             LastSessionCheckKind = other.LastSessionCheckKind;
-            LoginWindowStart = other.LoginWindowStart;
-            LoginWindowCount = other.LoginWindowCount;
             RunCount = other.RunCount;
             Paused = other.Paused;
             PauseUntil = other.PauseUntil;
@@ -548,6 +585,9 @@ namespace CampusNet.Core
             IgnoredPrompts = other.IgnoredPrompts;
             LastIgnoredPrompt = other.LastIgnoredPrompt;
             LastForcedRelogin = other.LastForcedRelogin;
+            DayKey = other.DayKey;
+            DayLoginSuccess = other.DayLoginSuccess;
+            DayLoginAttempts = other.DayLoginAttempts;
         }
 
         /// <summary>引擎心跳：每轮评估都会更新，写入节流最多滞后 60 秒。</summary>
@@ -557,7 +597,6 @@ namespace CampusNet.Core
         public DateTime? LastLoginSuccessTime { get { return AppPaths.ParseTime(LastLoginSuccess); } }
         public DateTime? LastSessionCheckTime { get { return AppPaths.ParseTime(LastSessionCheck); } }
         public DateTime? PauseUntilTime { get { return AppPaths.ParseTime(PauseUntil); } }
-        public DateTime? LoginWindowStartTime { get { return AppPaths.ParseTime(LoginWindowStart); } }
         public DateTime? LastForcedReloginTime { get { return AppPaths.ParseTime(LastForcedRelogin); } }
 
     }

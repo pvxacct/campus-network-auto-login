@@ -466,7 +466,13 @@ namespace CampusNet.Core
                 : Display(AppPaths.ParseTime(snapshot.LastSessionCheck)) + Since(AppPaths.ParseTime(snapshot.LastSessionCheck))
                     + "（" + DescribeSession(snapshot.LastSessionResult)
                     + (string.IsNullOrEmpty(snapshot.LastSessionCheckKind) ? string.Empty : " · " + DescribeSessionKind(snapshot.LastSessionCheckKind)) + "）"));
-            builder.AppendLine("连续失败  ：" + snapshot.ConsecutiveFailures + " 次；本小时登录 " + snapshot.LoginWindowCount + " 次");
+            builder.AppendLine("连续失败  ：" + snapshot.ConsecutiveFailures + " 次");
+            builder.AppendLine("今日登录  ：确认成功 " + snapshot.DayLoginSuccess + " 次 / 提交 " + snapshot.DayLoginAttempts
+                + " 次" + (string.IsNullOrEmpty(snapshot.DayKey) ? string.Empty : "（" + snapshot.DayKey + "）"));
+            builder.AppendLine("恢复耗时  ：" + (snapshot.LastRecoverySeconds < 0
+                ? "本次运行还没有样本（重启即清空）"
+                : "最近 " + snapshot.LastRecoverySeconds + " 秒；本次中位 " + snapshot.RecoveryMedianSeconds
+                    + " 秒（" + snapshot.RecoverySampleCount + " 次样本）"));
             builder.AppendLine("暂停      ：" + (snapshot.Paused ? "是" + (snapshot.PauseUntil.HasValue ? "，直到 " + Display(snapshot.PauseUntil) : string.Empty) : "否"));
             builder.AppendLine("最近错误  ：" + (string.IsNullOrEmpty(snapshot.LastError) ? "无" : snapshot.LastError));
             builder.AppendLine("已忽略提示：" + snapshot.IgnoredPrompts + " 次"
@@ -498,8 +504,8 @@ namespace CampusNet.Core
                 + config.ConfirmAttempts + " 轮（间隔 " + config.ConfirmGapMs + " 毫秒）；兜底巡检每 " + config.UpstreamProbeSeconds + " 秒");
             builder.AppendLine("探测超时  ：TCP/ICMP " + config.ProbeTimeoutMs + " 毫秒；HTTP " + config.HttpProbeTimeoutMs
                 + " 毫秒（并行探测，整轮约等于单次超时）");
-            builder.AppendLine("风控闸门  ：最小间隔 " + config.LoginMinIntervalSeconds + " 秒；每小时上限 "
-                + config.LoginHourlyLimit + " 次；登录前确认 " + config.LoginConfirmDelaySec + " 秒；会话核对每 "
+            builder.AppendLine("登录节流  ：登录前二次确认 " + config.LoginConfirmDelaySec + " 秒；"
+                + "限速已移除（仅保留 Portal 限流提示的暂停）；会话核对每 "
                 + (config.SessionCheckSeconds > 0 ? config.SessionCheckSeconds + " 秒" : "关闭"));
             builder.AppendLine("残留重登  ：" + (config.StuckReloginSeconds > 0
                 ? "本机连续 " + config.StuckReloginSeconds + " 秒不通但 Portal 说在线时，自动注销并重新登录"
