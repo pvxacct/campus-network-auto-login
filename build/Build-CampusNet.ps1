@@ -3,7 +3,7 @@
   产物：dist\CampusNet.exe（仓库内提交的可执行文件）+ dist\CampusNet.exe.sha256
         + dist\CampusNet.exe.src.sha256（源码指纹，供 CI 判断产物是否与源码对应）
 
-  需要 .NET SDK（本机已带 9.0.304，GitHub Actions 的 windows-latest 也自带）。
+  需要 Windows + .NET 8 SDK + .NET Framework 4.8 引用程序集（与 CI 一致）。
   用法： powershell -ExecutionPolicy Bypass -File build\Build-CampusNet.ps1 [-SkipTests]
 #>
 param(
@@ -42,7 +42,7 @@ Write-Host ('源码指纹：{0}' -f $fingerprint)
 Write-Host ''
 Write-Host '== 版本自检 ==' -ForegroundColor Cyan
 $version = (& $exe --version | Out-String).Trim()
-if ($version -ne '2.1.2') { throw "版本号不符合预期：$version" }
+if ($version -ne '2.2.0-pre.1') { throw "版本号不符合预期：$version" }
 Write-Host "版本：$version"
 
 if (-not $SkipTests) {
@@ -50,6 +50,7 @@ if (-not $SkipTests) {
     Write-Host '== 端到端测试 ==' -ForegroundColor Cyan
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'build\Test-CampusNet.ps1') -Exe $exe
     if ($LASTEXITCODE -ne 0) { throw '端到端测试未通过。' }
+    & (Join-Path $PSScriptRoot 'Test-Recovery.ps1')
 }
 
 Write-Host ''

@@ -14,7 +14,7 @@ namespace CampusNet.Core
     {
         public const string AppName = "CampusNet";
         public const string DisplayName = "校园网自动登录";
-        public const string Version = "2.1.2";
+        public const string Version = "2.2.0-pre.1";
 
         /// <summary>旧版（1.x PowerShell 版）残留位置，仅用于检测与清理。</summary>
         public const string LegacyScriptDir = @"C:\CampusAutoLogin";
@@ -156,6 +156,7 @@ namespace CampusNet.Core
     public static class Json
     {
         private static readonly JavaScriptSerializer Serializer = CreateSerializer();
+        private static readonly object WriteGate = new object();
 
         private static JavaScriptSerializer CreateSerializer()
         {
@@ -168,7 +169,9 @@ namespace CampusNet.Core
         public static Dictionary<string, object> ReadObject(string path)
         {
             if (!File.Exists(path)) { return null; }
-            string text = File.ReadAllText(path, Encoding.UTF8);
+            string text;
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var reader = new StreamReader(stream, Encoding.UTF8)) { text = reader.ReadToEnd(); }
             if (string.IsNullOrWhiteSpace(text)) { return null; }
             return ReadObjectFromText(text);
         }
@@ -187,40 +190,33 @@ namespace CampusNet.Core
         ///
         /// 这里刻意不用「先删目标再改名」：那中间有一瞬间文件是不存在的，
         /// 此刻断电 / 崩溃就会把用户配置整个丢掉（丢掉配置 = 下次启动用默认 Portal 登录）。
-        /// 先用 File.Replace 原地替换，只有它不被支持时才退回删除 + 改名。
-        /// 临时文件名带随机后缀：并发写入（界面保存 + 后台线程）不会互相踩。
+        /// 使用 File.Replace 原地替换；替换失败时保留原文件并报告错误。
+        /// 临时文件名带随机后缀，同进程写入串行化，读取允许原子替换。
         /// </summary>
         public static void WriteText(string path, string text)
         {
-            string dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir)) { Directory.CreateDirectory(dir); }
-            string temp = path + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
-            try
+            lock (WriteGate)
             {
-                using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
-                using (var writer = new StreamWriter(stream, Utf8WithBom))
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) { Directory.CreateDirectory(dir); }
+                string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
                 {
-                    writer.Write(text);
-                    writer.Flush();
-                    stream.Flush(true);   // 落到磁盘之后再替换，断电也不会得到半截内容
-                }
-                if (File.Exists(path))
-                {
-                    try
+                    using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    using (var writer = new StreamWriter(stream, Utf8WithBom))
                     {
-                        File.Replace(temp, path, null, true);
-                        return;
+                        writer.Write(text);
+                        writer.Flush();
+                        stream.Flush(true);
                     }
-                    catch (PlatformNotSupportedException) { }
-                    catch (IOException) { }
-                    catch (UnauthorizedAccessException) { }
+                    // Never delete a valid destination as a fallback for sharing/IO errors.
+                    if (File.Exists(path)) { File.Replace(temp, path, null, true); }
+                    else { File.Move(temp, path); }
                 }
-                if (File.Exists(path)) { File.Delete(path); }
-                File.Move(temp, path);
-            }
-            finally
-            {
-                try { if (File.Exists(temp)) { File.Delete(temp); } } catch { }
+                finally
+                {
+                    try { if (File.Exists(temp)) { File.Delete(temp); } } catch { }
+                }
             }
         }
 

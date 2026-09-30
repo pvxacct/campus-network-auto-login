@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -105,6 +108,8 @@ namespace CampusNet.Core
         public bool HasVerifiedTargets;
         public int Successes;
         public int Attempts;
+        public int Incomplete;
+        public long ElapsedMilliseconds;
         public int LatencyMs = -1;
         public int LossPercent = 100;
         public readonly List<string> Failures = new List<string>();
@@ -116,7 +121,7 @@ namespace CampusNet.Core
             get
             {
                 if (ConfigError) { return "探测目标配置无效（没有任何一条合法目标）"; }
-                if (Attempts == 0) { return "没有可用的探测目标"; }
+                if (Attempts == 0) { return Incomplete > 0 ? "探测未完成" : "没有可用的探测目标"; }
                 if (Online)
                 {
                     string head = Verified ? "内容校验通过" : (HasVerifiedTargets ? "只有 TCP 握手、内容校验未通过" : "连通");
@@ -140,291 +145,305 @@ namespace CampusNet.Core
         public bool HasAdapter;
     }
 
-    /// <summary>纯本地网络探测：不发任何 Portal 请求，只做 TCP 连接与 ICMP。</summary>
+    /// <summary>本地发起的 HTTP 内容 / TCP / ICMP 探测，不发任何 Portal 请求。</summary>
     public static class NetworkProbe
     {
+
+        // A timed-out DNS lookup may outlive Abort on .NET Framework. Reserve a slot
+        // before queuing work, so repeated rounds can never create unlimited workers.
+        private static readonly SemaphoreSlim TargetSlots = new SemaphoreSlim(8, 8);
+
+        private sealed class TargetResult
+        {
+            public bool Completed;
+            public bool Success;
+            public int Latency = -1;
+        }
+
         public static ProbeOutcome Probe(AppConfig config, int rounds, int gapMs)
         {
+            return Probe(config, rounds, gapMs, CancellationToken.None);
+        }
+
+        public static ProbeOutcome Probe(AppConfig config, int rounds, int gapMs,
+            CancellationToken cancellation, bool contentOnly = false)
+        {
+            var watch = Stopwatch.StartNew();
             var outcome = new ProbeOutcome();
             var targets = new List<ProbeTarget>();
             foreach (string text in config.ProbeTargets)
             {
                 ProbeTarget target = ProbeTarget.Parse(text);
-                if (target != null) { targets.Add(target); }
+                if (target == null) { continue; }
+                if (target.ContentVerified) { outcome.HasVerifiedTargets = true; }
+                if (!contentOnly || target.ContentVerified) { targets.Add(target); }
             }
-            // 一条合法目标都没有：绝不能默认「在线」（那会让自动登录永远不触发），
-            // 也不能强行当「离线」（那会拿着坏配置反复登录）。显式报配置错误，由上层停下来提示用户。
             if (targets.Count == 0)
             {
-                outcome.ConfigError = true;
-                outcome.Online = false;
-                outcome.LossPercent = 100;
-                outcome.Failures.Add("ProbeTargets 里没有任何一条合法目标");
+                outcome.ConfigError = !contentOnly;
                 return outcome;
             }
 
-            foreach (ProbeTarget target in targets)
+            var details = new Dictionary<string, string>();
+            for (int round = 0; round < Math.Max(1, rounds); round++)
             {
-                if (target.ContentVerified) { outcome.HasVerifiedTargets = true; break; }
-            }
-
-            var detailMap = new Dictionary<string, string>();
-            int round = Math.Max(1, rounds);
-            int count = targets.Count;
-            var okFlags = new bool[count];
-            var latencies = new int[count];
-            for (int i = 0; i < round; i++)
-            {
-                if (i > 0 && gapMs > 0) { System.Threading.Thread.Sleep(gapMs); }
-                // 并行跑一轮：整轮耗时 ≈ 最慢的那一条目标（约一次超时），
-                // 而不是所有目标的超时相加。完全断网时这是「秒级」和「几十秒」的区别。
-                RunParallel(config, targets, okFlags, latencies);
-                for (int t = 0; t < count; t++)
+                cancellation.ThrowIfCancellationRequested();
+                if (round > 0 && gapMs > 0 && cancellation.WaitHandle.WaitOne(gapMs))
                 {
-                    ProbeTarget target = targets[t];
-                    bool ok = okFlags[t];
-                    int latency = latencies[t];
-                    outcome.Attempts++;
-                    if (ok)
-                    {
-                        outcome.Successes++;
-                        if (target.ContentVerified) { outcome.Verified = true; }
-                        // 延迟取「按配置顺序第一个成功目标」而不是所有目标里的最小值：
-                        // 最小值会被本机/网关代答的目标拉到 0 ms，界面看起来就像坏了。
-                        if (outcome.LatencyMs < 0 && latency >= 0) { outcome.LatencyMs = latency; }
-                    }
-                    else if (!outcome.Failures.Contains(target.Display))
-                    {
-                        outcome.Failures.Add(target.Display);
-                    }
-                    string detail = target.Display + (ok
-                        ? " " + latency + " ms" + (latency >= 0 && latency < 5 ? "（本地代答）" : string.Empty)
-                        : " 失败");
-                    string previous;
-                    if (!detailMap.TryGetValue(target.Display, out previous) || ok) { detailMap[target.Display] = detail; }
+                    cancellation.ThrowIfCancellationRequested();
                 }
-                if (outcome.Successes > 0) { break; }
+                TargetResult[] results = RunParallel(config, targets, cancellation);
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    ProbeTarget target = targets[i];
+                    TargetResult result = results[i];
+                    string detail;
+                    if (!result.Completed)
+                    {
+                        outcome.Incomplete++;
+                        detail = target.Display + " 未完成";
+                    }
+                    else
+                    {
+                        outcome.Attempts++;
+                        if (result.Success)
+                        {
+                            outcome.Successes++;
+                            if (target.ContentVerified) { outcome.Verified = true; }
+                            if (outcome.LatencyMs < 0) { outcome.LatencyMs = result.Latency; }
+                            detail = target.Display + " " + result.Latency + " ms";
+                        }
+                        else
+                        {
+                            if (!outcome.Failures.Contains(target.Display)) { outcome.Failures.Add(target.Display); }
+                            detail = target.Display + " 失败";
+                        }
+                    }
+                    string previous;
+                    if (!details.TryGetValue(target.Display, out previous) || result.Success ||
+                        previous.EndsWith("未完成", StringComparison.Ordinal))
+                    {
+                        details[target.Display] = detail;
+                    }
+                }
+                if (outcome.Verified || (!outcome.HasVerifiedTargets && outcome.Successes > 0)) { break; }
             }
-
             outcome.Online = outcome.Successes > 0;
-            outcome.LossPercent = outcome.Attempts == 0
-                ? 100
-                : (int)Math.Round(100.0 * (outcome.Attempts - outcome.Successes) / outcome.Attempts);
-            foreach (ProbeTarget target in targets)
-            {
-                string detail;
-                if (detailMap.TryGetValue(target.Display, out detail)) { outcome.Details.Add(detail); }
-            }
+            outcome.LossPercent = outcome.Attempts == 0 ? -1 :
+                (int)Math.Round(100.0 * (outcome.Attempts - outcome.Successes) / outcome.Attempts);
+            foreach (ProbeTarget target in targets) { outcome.Details.Add(details[target.Display]); }
+            outcome.ElapsedMilliseconds = watch.ElapsedMilliseconds;
+            cancellation.ThrowIfCancellationRequested();
             return outcome;
         }
 
-        private static bool RunTarget(AppConfig config, ProbeTarget target, out int latencyMs)
+        private static TargetResult[] RunParallel(AppConfig config, List<ProbeTarget> targets,
+            CancellationToken cancellation)
         {
-            if (target.Kind == "icmp") { return PingTarget(target.Host, config.ProbeTimeoutMs, out latencyMs); }
-            if (target.Kind == "http")
+            int budget = 500;
+            bool hasContent = false;
+            foreach (ProbeTarget target in targets)
             {
-                // HTTP 探测用单独的超时：内容校验目标（204 / connecttest）正常只要几十毫秒，
-                // 沿用 TCP 握手那种上限会让断网判定慢一大截，而这正是「被踢下线后多久能重连」。
-                return HttpTarget(target.Url, target.Expect, target.ExpectStatus,
-                    Math.Max(500, config.HttpProbeTimeoutMs), out latencyMs);
+                budget = Math.Max(budget, target.ContentVerified ? config.HttpProbeTimeoutMs : config.ProbeTimeoutMs);
+                hasContent |= target.ContentVerified;
             }
-            return TcpTarget(target.Host, target.Port, config.ProbeTimeoutMs, out latencyMs);
-        }
-
-        /// <summary>
-        /// 每条目标一个后台线程并行跑，各自有自己的超时；整轮的总等待用一个共享预算封顶，
-        /// 个别目标卡在 DNS 解析上也不会拖住整轮（超预算的按失败处理）。
-        /// </summary>
-        private static void RunParallel(AppConfig config, List<ProbeTarget> targets, bool[] okFlags, int[] latencies)
-        {
-            int count = targets.Count;
-            // 每轮都用全新的结果数组：万一某条目标超预算没结束（例如 DNS 卡住），
-            // 它稍后写回的是自己那一轮的结果，不会污染下一轮。
-            var roundOk = new bool[count];
-            var roundLatency = new int[count];
-            var threads = new System.Threading.Thread[count];
-            for (int i = 0; i < count; i++)
+            var results = new TargetResult[targets.Count];
+            var tasks = new List<Task<TargetResult>>();
+            var indices = new List<int>();
+            using (var round = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
             {
-                int index = i;
-                var thread = new System.Threading.Thread(delegate()
+                round.CancelAfter(budget);
+                CancellationToken token = round.Token;
+                for (int i = 0; i < targets.Count; i++) { results[i] = new TargetResult(); }
+                int nextTarget = 0;
+                try
                 {
-                    int latency = -1;
-                    bool ok = false;
-                    try { ok = RunTarget(config, targets[index], out latency); }
-                    catch { ok = false; latency = -1; }
-                    roundOk[index] = ok;
-                    roundLatency[index] = latency;
-                });
-                thread.IsBackground = true;
-                thread.Name = "CampusNet-Probe-" + index;
-                threads[i] = thread;
-                thread.Start();
-            }
-
-            int budget = Math.Max(Math.Max(config.HttpProbeTimeoutMs, config.ProbeTimeoutMs), 500) + 1500;
-            var watch = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < count; i++)
-            {
-                int remain = budget - (int)watch.ElapsedMilliseconds;
-                if (remain < 0) { remain = 0; }
-                bool finished = false;
-                try { finished = threads[i].Join(remain); } catch { }
-                if (!finished)
-                {
-                    okFlags[i] = false;
-                    latencies[i] = -1;
-                }
-                else
-                {
-                    okFlags[i] = roundOk[i];
-                    latencies[i] = roundLatency[i];
-                }
-            }
-        }
-
-        /// <summary>
-        /// 只跑一遍「内容校验」目标，返回是否有目标真的取回了预期文本。
-        /// 用于「TCP 都通、只有内容校验失败」时的第二次机会：先补测一次，
-        /// 只有补测也失败才去打扰 Portal——避免单次超时（校园网里并不罕见）造成的误判。
-        /// </summary>
-        public static bool ContentCheck(AppConfig config, out int latencyMs)
-        {
-            latencyMs = -1;
-            var targets = new List<ProbeTarget>();
-            foreach (string text in config.ProbeTargets)
-            {
-                ProbeTarget target = ProbeTarget.Parse(text);
-                if (target != null && target.ContentVerified) { targets.Add(target); }
-            }
-            if (targets.Count == 0) { return false; }
-
-            var okFlags = new bool[targets.Count];
-            var latencies = new int[targets.Count];
-            // 两轮并行复核（每轮同时跑所有内容校验目标）：
-            // 这张校园网偶尔会「第一次握手成功但内容不来」，补测一轮比立刻去打扰 Portal 更省事；
-            // 而并行保证了补测最多只多花一次超时，不会随目标条数线性变慢。
-            for (int round = 0; round < 2; round++)
-            {
-                if (round > 0) { System.Threading.Thread.Sleep(ContentRetryGapMs); }
-                RunParallel(config, targets, okFlags, latencies);
-                for (int i = 0; i < targets.Count; i++)
-                {
-                    if (okFlags[i])
+                    while (!token.IsCancellationRequested)
                     {
-                        latencyMs = latencies[i];
-                        return true;
+                        // Schedule the remaining targets as slots are released. More than
+                        // eight configured targets must not starve the later entries.
+                        while (nextTarget < targets.Count && !token.IsCancellationRequested && TargetSlots.Wait(0))
+                        {
+                            ProbeTarget target = targets[nextTarget];
+                            try
+                            {
+                                tasks.Add(Task.Factory.StartNew(delegate
+                                {
+                                    try
+                                    {
+                                        token.ThrowIfCancellationRequested();
+                                        int latency;
+                                        bool success = RunTarget(config, target, token, out latency);
+                                        return new TargetResult { Completed = !token.IsCancellationRequested,
+                                            Success = success, Latency = latency };
+                                    }
+                                    catch (OperationCanceledException) { return new TargetResult(); }
+                                    catch { return new TargetResult { Completed = !token.IsCancellationRequested }; }
+                                    finally { TargetSlots.Release(); }
+                                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default));
+                                indices.Add(nextTarget++);
+                            }
+                            catch { TargetSlots.Release(); throw; }
+                        }
+                        if (tasks.Count == 0)
+                        {
+                            if (nextTarget >= targets.Count) { break; }
+                            token.WaitHandle.WaitOne(25);
+                            continue;
+                        }
+                        int finished = Task.WaitAny(tasks.ToArray(), 25);
+                        if (finished < 0) { continue; }
+                        int index = indices[finished];
+                        TargetResult result = tasks[finished].GetAwaiter().GetResult();
+                        results[index] = result;
+                        tasks.RemoveAt(finished);
+                        indices.RemoveAt(finished);
+                        if (result.Success && (targets[index].ContentVerified || !hasContent)) { break; }
+                    }
+                    // Capture only completed results. Late workers have no reference to
+                    // this outcome or the engine and cannot overwrite the next round.
+                    for (int i = 0; i < tasks.Count; i++)
+                    {
+                        if (tasks[i].Status == TaskStatus.RanToCompletion) { results[indices[i]] = tasks[i].Result; }
                     }
                 }
+                finally { round.Cancel(); }
             }
-            return false;
+            cancellation.ThrowIfCancellationRequested();
+            return results;
         }
 
-        private const int ContentRetryGapMs = 300;
+        private static bool RunTarget(AppConfig config, ProbeTarget target, CancellationToken token, out int latency)
+        {
+            if (target.Kind == "http")
+            {
+                return HttpTarget(target.Url, target.Expect, target.ExpectStatus,
+                    Math.Max(500, config.HttpProbeTimeoutMs), token, out latency);
+            }
+            if (target.Kind == "icmp") { return PingTarget(target.Host, config.ProbeTimeoutMs, token, out latency); }
+            return TcpTarget(target.Host, target.Port, config.ProbeTimeoutMs, token, out latency);
+        }
 
-        /// <summary>
-        /// 内容校验探测：真正取回页面内容并核对关键字。
-        /// 只做 TCP 握手是不够的——有些网络（例如本机的校园网关）会替任意地址代答握手，
-        /// 「连接成功」根本说明不了能上网；只有拿到预期文本才算端到端连通。
-        /// </summary>
+        public static bool ContentCheck(AppConfig config, out int latencyMs)
+        {
+            return ContentCheck(config, CancellationToken.None, out latencyMs);
+        }
+
+        public static bool ContentCheck(AppConfig config, CancellationToken token, out int latencyMs)
+        {
+            ProbeOutcome outcome = Probe(config, 2, 300, token, true);
+            latencyMs = outcome.LatencyMs;
+            return outcome.Verified;
+        }
+
         public static bool HttpTarget(string url, string expect, int expectStatus, int timeoutMs, out int latencyMs)
         {
+            return HttpTarget(url, expect, expectStatus, timeoutMs, CancellationToken.None, out latencyMs);
+        }
+
+        private static bool HttpTarget(string url, string expect, int expectStatus, int timeoutMs,
+            CancellationToken token, out int latencyMs)
+        {
             latencyMs = -1;
-            var watch = System.Diagnostics.Stopwatch.StartNew();
+            var watch = Stopwatch.StartNew();
             try
             {
+                token.ThrowIfCancellationRequested();
                 var request = (HttpWebRequest)WebRequest.Create(url);
                 request.Method = "GET";
-                request.Proxy = null;                 // 直连，避免被本机代理影响判断
-                request.AllowAutoRedirect = false;    // 被跳到 Portal 登录页 = 未认证
+                request.Proxy = null;
+                request.AllowAutoRedirect = false;
                 request.Timeout = timeoutMs;
                 request.ReadWriteTimeout = timeoutMs;
                 request.UserAgent = AppConfig.DefaultUserAgent;
                 request.KeepAlive = false;
+                request.CachePolicy = new System.Net.Cache.RequestCachePolicy(System.Net.Cache.RequestCacheLevel.NoCacheNoStore);
+                using (token.Register(delegate { try { request.Abort(); } catch { } }))
                 using (var response = (HttpWebResponse)request.GetResponse())
                 {
                     int code = (int)response.StatusCode;
-                    if (expectStatus > 0)
+                    if (expectStatus > 0 ? code != expectStatus : code < 200 || code > 299) { return false; }
+                    if (!string.IsNullOrEmpty(expect))
                     {
-                        // 只认状态码的目标（例如 generate_204）：被门户劫持时通常返回 200/302，一律算失败。
-                        if (code != expectStatus) { return false; }
+                        string body = ReadProbeBody(response, 4096);
+                        if (body.IndexOf(expect, StringComparison.OrdinalIgnoreCase) < 0) { return false; }
                     }
-                    else if (code < 200 || code > 299) { return false; }
-                    string body = ReadProbeBody(response, 4096);
-                    if (!string.IsNullOrEmpty(expect) &&
-                        body.IndexOf(expect, StringComparison.OrdinalIgnoreCase) < 0) { return false; }
                 }
-                watch.Stop();
+                token.ThrowIfCancellationRequested();
                 latencyMs = (int)watch.ElapsedMilliseconds;
                 return true;
             }
-            catch
-            {
-                return false;
-            }
+            catch { token.ThrowIfCancellationRequested(); return false; }
         }
 
         private static string ReadProbeBody(HttpWebResponse response, int maxChars)
         {
-            try
+            using (Stream stream = response.GetResponseStream())
+            using (var reader = new StreamReader(stream, Encoding.UTF8, true))
             {
-                using (Stream stream = response.GetResponseStream())
-                {
-                    if (stream == null) { return string.Empty; }
-                    using (var reader = new StreamReader(stream, Encoding.UTF8, true))
-                    {
-                        var buffer = new char[maxChars];
-                        int read = reader.Read(buffer, 0, buffer.Length);
-                        return read > 0 ? new string(buffer, 0, read) : string.Empty;
-                    }
-                }
+                var buffer = new char[maxChars];
+                int read = reader.Read(buffer, 0, buffer.Length);
+                return read > 0 ? new string(buffer, 0, read) : string.Empty;
             }
-            catch { return string.Empty; }
         }
 
         public static bool TcpTarget(string host, int port, int timeoutMs, out int latencyMs)
         {
+            return TcpTarget(host, port, timeoutMs, CancellationToken.None, out latencyMs);
+        }
+
+        private static bool TcpTarget(string host, int port, int timeoutMs, CancellationToken token, out int latencyMs)
+        {
             latencyMs = -1;
-            var client = new TcpClient();
-            var watch = System.Diagnostics.Stopwatch.StartNew();
-            try
+            var watch = Stopwatch.StartNew();
+            using (var client = new TcpClient())
             {
-                IAsyncResult result = client.BeginConnect(host, port, null, null);
-                if (!result.AsyncWaitHandle.WaitOne(timeoutMs))
+                try
                 {
-                    return false;
+                    token.ThrowIfCancellationRequested();
+                    using (token.Register(delegate { try { client.Close(); } catch { } }))
+                    {
+                        IAsyncResult pending = client.BeginConnect(host, port, null, null);
+                        using (WaitHandle ready = pending.AsyncWaitHandle)
+                        {
+                            if (WaitHandle.WaitAny(new[] { ready, token.WaitHandle }, timeoutMs) != 0)
+                            {
+                                token.ThrowIfCancellationRequested();
+                                return false;
+                            }
+                        }
+                        client.EndConnect(pending);
+                    }
+                    latencyMs = (int)watch.ElapsedMilliseconds;
+                    return true;
                 }
-                client.EndConnect(result);
-                watch.Stop();
-                latencyMs = (int)watch.ElapsedMilliseconds;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                try { client.Close(); } catch { }
+                catch { token.ThrowIfCancellationRequested(); return false; }
             }
         }
 
         public static bool PingTarget(string host, int timeoutMs, out int latencyMs)
         {
+            return PingTarget(host, timeoutMs, CancellationToken.None, out latencyMs);
+        }
+
+        private static bool PingTarget(string host, int timeoutMs, CancellationToken token, out int latencyMs)
+        {
             latencyMs = -1;
             try
             {
+                token.ThrowIfCancellationRequested();
                 using (var ping = new Ping())
+                using (token.Register(delegate { try { ping.SendAsyncCancel(); } catch { } }))
                 {
-                    PingReply reply = ping.Send(host, timeoutMs);
-                    if (reply != null && reply.Status == IPStatus.Success)
-                    {
-                        latencyMs = (int)reply.RoundtripTime;
-                        return true;
-                    }
+                    Task<PingReply> pending = ping.SendPingAsync(host, timeoutMs);
+                    if (!pending.Wait(timeoutMs, token)) { return false; }
+                    PingReply reply = pending.Result;
+                    if (reply.Status != IPStatus.Success) { return false; }
+                    latencyMs = (int)reply.RoundtripTime;
+                    return true;
                 }
             }
-            catch { }
-            return false;
+            catch { token.ThrowIfCancellationRequested(); return false; }
         }
 
         private static readonly object InfoGate = new object();
@@ -553,6 +572,7 @@ namespace CampusNet.Core
         public bool AlreadyOnline;
         /// <summary>true = 收到了 Portal 的业务提示（Msg/msga），而不是传输失败或无法识别的响应。</summary>
         public bool BusinessPrompt;
+        public long ResponseMilliseconds;
         public string Message = string.Empty;
     }
 
@@ -560,17 +580,42 @@ namespace CampusNet.Core
     public sealed class PortalClient
     {
         private readonly AppConfig _config;
+        private static readonly SemaphoreSlim StatusSlots = new SemaphoreSlim(2, 2);
 
         public PortalClient(AppConfig config) { _config = config; }
 
-        public StatusResult GetStatus()
+        public StatusResult GetStatus() { return GetStatus(CancellationToken.None); }
+
+        public StatusResult GetStatus(CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            // Cancellation normally aborts immediately; bounded slots also cover a DNS
+            // lookup that outlives its cancelled engine generation on .NET Framework.
+            if (!StatusSlots.Wait(0, token)) { return new StatusResult { Error = "旧的状态请求仍在结束，本轮跳过" }; }
+            try
+            {
+                using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(token))
+                {
+                    deadline.CancelAfter(Math.Max(1, _config.StatusTimeoutSec) * 1000);
+                    try { return GetStatusCore(deadline.Token); }
+                    catch (OperationCanceledException)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        return new StatusResult { Error = "状态请求超过整轮截止时间" };
+                    }
+                }
+            }
+            finally { StatusSlots.Release(); }
+        }
+
+        private StatusResult GetStatusCore(CancellationToken token)
         {
             var result = new StatusResult();
             try
             {
                 string callback = "dr" + new Random().Next(100, 9999).ToString(CultureInfo.InvariantCulture);
                 string url = _config.StatusUrl + "?callback=" + callback + "&v=" + callback + "&lang=zh&jsVersion=4.X";
-                string text = Get(url, _config.StatusTimeoutSec);
+                string text = Get(url, _config.StatusTimeoutSec, token);
                 result.Text = text;
                 Dictionary<string, object> map = ParseJsonp(text);
                 if (map != null && map.ContainsKey("result"))
@@ -595,12 +640,16 @@ namespace CampusNet.Core
             }
             catch (Exception ex)
             {
+                token.ThrowIfCancellationRequested();
                 result.Error = Describe(ex);
             }
             return result;
         }
 
         public PortalLoginResult Login(string userName, string password)
+        { return Login(userName, password, CancellationToken.None); }
+
+        public PortalLoginResult Login(string userName, string password, CancellationToken token)
         {
             var result = new PortalLoginResult();
             var fields = new List<KeyValuePair<string, string>>();
@@ -612,12 +661,16 @@ namespace CampusNet.Core
             }
 
             string text;
+            var responseWatch = Stopwatch.StartNew();
             try
             {
-                text = Post(_config.LoginUrl, fields, _config.LoginTimeoutSec);
+                text = Post(_config.LoginUrl, fields, _config.LoginTimeoutSec, token);
+                result.ResponseMilliseconds = responseWatch.ElapsedMilliseconds;
             }
             catch (Exception ex)
             {
+                token.ThrowIfCancellationRequested();
+                result.ResponseMilliseconds = responseWatch.ElapsedMilliseconds;
                 result.Message = Describe(ex);
                 return result;
             }
@@ -633,11 +686,11 @@ namespace CampusNet.Core
             {
                 string msg = Match(text, "Msg=(\\d+)");
                 string msga = Match(text, "msga='([^']*)'");
-                string prompt = Translate(msga);
+                // Translation is diagnostic only; never block recovery on another HTTP request.
                 result.AlreadyOnline = msga.IndexOf("userid error2", StringComparison.OrdinalIgnoreCase) >= 0;
                 result.RateLimited = msga.IndexOf("waitsec", StringComparison.OrdinalIgnoreCase) >= 0;
                 result.BusinessPrompt = true;
-                result.Message = "Msg=" + msg + ", " + msga + " -> " + prompt;
+                result.Message = "Msg=" + msg + ", " + msga;
                 return result;
             }
             if (text.IndexOf("Error code:", StringComparison.OrdinalIgnoreCase) >= 0 && text.IndexOf("205", StringComparison.Ordinal) >= 0)
@@ -656,17 +709,19 @@ namespace CampusNet.Core
             return result;
         }
 
-        public bool Logout()
+        public bool Logout() { return Logout(CancellationToken.None); }
+
+        public bool Logout(CancellationToken token)
         {
             try
             {
                 string callback = "dr" + new Random().Next(100, 9999).ToString(CultureInfo.InvariantCulture);
                 string url = _config.LogoutUrl + "?callback=" + callback + "&v=" + callback + "&lang=zh&jsVersion=4.X";
-                string text = Get(url, _config.StatusTimeoutSec);
+                string text = Get(url, _config.StatusTimeoutSec, token);
                 Dictionary<string, object> map = ParseJsonp(text);
                 return map != null && Json.GetInt(map, "result", 0) == 1;
             }
-            catch { return false; }
+            catch { token.ThrowIfCancellationRequested(); return false; }
         }
 
         public string Translate(string code)
@@ -723,8 +778,13 @@ namespace CampusNet.Core
         }
 
         private string Get(string url, int timeoutSec)
+        { return Get(url, timeoutSec, CancellationToken.None); }
+
+        private string Get(string url, int timeoutSec, CancellationToken token)
         {
+            token.ThrowIfCancellationRequested();
             HttpWebRequest request = CreateRequest(url, timeoutSec, "GET", true);
+            using (token.Register(delegate { try { request.Abort(); } catch { } }))
             using (var response = (HttpWebResponse)request.GetResponse())
             {
                 EnsureSameHost(request, response);
@@ -732,29 +792,33 @@ namespace CampusNet.Core
             }
         }
 
-        private string Post(string url, List<KeyValuePair<string, string>> fields, int timeoutSec)
+        private string Post(string url, List<KeyValuePair<string, string>> fields, int timeoutSec, CancellationToken token)
         {
             // 登录请求带着账号密码，绝不能自动跟随跳转：
             // 一个 307/308 就能把「账号 + 密码」原样转发到别的地址。
+            token.ThrowIfCancellationRequested();
             HttpWebRequest request = CreateRequest(url, timeoutSec, "POST", false);
-            request.ContentType = "application/x-www-form-urlencoded";
-            request.Referer = _config.PortalBase + "/";
-            var body = new StringBuilder();
-            foreach (var pair in fields)
+            using (token.Register(delegate { try { request.Abort(); } catch { } }))
             {
-                if (body.Length > 0) { body.Append('&'); }
-                body.Append(Uri.EscapeDataString(pair.Key)).Append('=').Append(Uri.EscapeDataString(pair.Value));
-            }
-            byte[] payload = Encoding.UTF8.GetBytes(body.ToString());
-            request.ContentLength = payload.Length;
-            using (Stream stream = request.GetRequestStream())
-            {
-                stream.Write(payload, 0, payload.Length);
-            }
-            using (var response = (HttpWebResponse)request.GetResponse())
-            {
-                EnsureSameHost(request, response);
-                return ReadText(response, request);
+                request.ContentType = "application/x-www-form-urlencoded";
+                request.Referer = _config.PortalBase + "/";
+                var body = new StringBuilder();
+                foreach (var pair in fields)
+                {
+                    if (body.Length > 0) { body.Append('&'); }
+                    body.Append(Uri.EscapeDataString(pair.Key)).Append('=').Append(Uri.EscapeDataString(pair.Value));
+                }
+                byte[] payload = Encoding.UTF8.GetBytes(body.ToString());
+                request.ContentLength = payload.Length;
+                using (Stream stream = request.GetRequestStream())
+                {
+                    stream.Write(payload, 0, payload.Length);
+                }
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    EnsureSameHost(request, response);
+                    return ReadText(response, request);
+                }
             }
         }
 

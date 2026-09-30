@@ -719,6 +719,8 @@ namespace CampusNet
             {
                 case "periodic": return "定时巡检";
                 case "suspect": return "疑似掉线核对";
+                case "confirm": return "登录前确认";
+                case "recovery": return "恢复观察";
                 default: return string.Empty;
             }
         }

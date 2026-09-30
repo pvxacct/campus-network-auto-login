@@ -133,7 +133,7 @@ while ($true) {
                 'rate-limited' {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='error5 waitsec 3';</script>"
                 }
-                'conflict' {
+                { $_ -in @('conflict', 'conflict-then-online') } {
                     Send-Response -Stream $stream -Body "<!--Dr.COMWebLoginID_2.htm--><script>Msg=01;msga='userid error2';</script>"
                 }
                 # 登录回了「已在别处在线 / 密码错误」，但网络稍后真的通了：
@@ -184,12 +184,13 @@ while ($true) {
             Send-Response -Stream $stream -ContentType 'application/json; charset=utf-8' `
                 -Body ("dr1({`"result`":1,`"error_code`":`"$code`",`"error_prompt_zh`":`"$prompt`"})")
         }
-        elseif (($Scenario -eq 'content-ok' -or $Scenario -eq 'content-204' -or $Scenario -eq 'late-content' -or $Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or $Scenario -eq 'content-from-4th') -and $path -like '*connecttest.txt*') {
+        elseif (($Scenario -eq 'offline-ok' -or $Scenario -eq 'conflict-then-online' -or $Scenario -eq 'content-ok' -or $Scenario -eq 'content-204' -or $Scenario -eq 'late-content' -or $Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or $Scenario -eq 'content-from-4th') -and $path -like '*connecttest.txt*') {
             # 内容校验测试用：content-ok 发关键字；content-204 发真正的 204 空响应；
             # instant-content / instant-content-success 在登录后立刻发关键字（后者登录接口回「成功」）；
             # late-content 要等登录后 30 秒才发。
             $contentHits++
             $serve = $true
+            if ($Scenario -in @('offline-ok', 'conflict-then-online')) { $serve = $counts.login -gt 0 }
             if ($Scenario -eq 'instant-content' -or $Scenario -eq 'instant-content-success' -or $Scenario -eq 'late-content') {
                 $serve = $false
                 if ($null -ne $loginAt) {
