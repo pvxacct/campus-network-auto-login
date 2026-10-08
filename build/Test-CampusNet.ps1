@@ -243,14 +243,14 @@ Write-Host "临时目录：$work"
 Write-Host ''
 
 # 场景 1：网络正常 → 完全不请求 Portal
-$n = Invoke-Scenario -Name 's1-online' -Scenario 'content-ok' -PortalHost "127.0.0.1:$Port" `
-    -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -Seconds 10 -OnlineProbe 2
+$n = Invoke-Scenario -Name 's1-online' -Scenario 'online' -PortalHost "127.0.0.1:$Port" `
+    -Targets @("tcp:127.0.0.1:$Port") -Seconds 10 -OnlineProbe 2
 Assert '正常联网时不请求 Portal' ($n.Status -eq 0 -and $n.Login -eq 0) "chkstatus=$($n.Status) login=$($n.Login)"
 Assert '启动时订阅了系统网络变化事件' ($n.Log -match '已订阅网络变化事件') '登录日志里没有订阅记录'
 
 # 场景 2：断网 → 自动登录成功
 $n = Invoke-Scenario -Name 's2-offline-login' -Scenario 'offline-ok' -PortalHost "127.0.0.1:$Port" `
-    -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
+    -Targets @(Off-Target 65001) -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
 Assert '断网后自动登录且只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
 Assert '登录成功后状态为 login-ok/online' ($n.State.LastResult -eq 'login-ok' -or $n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
 
@@ -263,7 +263,7 @@ Assert '复检在线时不登录' ($n.Login -eq 0) "login=$($n.Login)"
 $n = Invoke-Scenario -Name 's4-ratelimit' -Scenario 'rate-limited' -PortalHost "127.0.0.1:$Port" `
     -Targets @(Off-Target 65003) -Seconds 14 -OnlineProbe 2 -OfflineProbe 2
 Assert '限流后只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
-Assert '限流后结果记为 login-throttled' (($n.State.LastResult -in @('login-throttled', 'login-wait')) -and -not $n.State.Online) "LastResult=$($n.State.LastResult)"
+Assert '限流后结果记为 login-throttled' ($n.State.LastResult -eq 'login-throttled') "LastResult=$($n.State.LastResult)"
 Assert '限流原因写入状态' ($n.State.LastError -match '限流') "LastError=$($n.State.LastError)"
 Assert 'state.json 不再有冷却字段' (-not ($n.State.PSObject.Properties.Name -contains 'CooldownUntil') `
     -and -not ($n.State.PSObject.Properties.Name -contains 'CooldownReason')) "字段=$($n.State.PSObject.Properties.Name -join ',')"
@@ -283,7 +283,7 @@ Assert 'state.json 不再出现 login-conflict' ($n.State.LastResult -ne 'login-
 $n = Invoke-Scenario -Name 's6-mininterval' -Scenario 'garbage' -PortalHost "127.0.0.1:$Port" `
     -Targets @(Off-Target 65005) -Seconds 16 -OnlineProbe 2 -OfflineProbe 1
 Assert '失败后 60 秒内不重复登录' ($n.Login -eq 1) "login=$($n.Login)（16 秒内应只有 1 次）"
-Assert '无法识别的登录响应记为 login-failed' (($n.State.LastResult -in @('login-failed', 'login-wait')) -and $n.State.ConsecutiveFailures -ge 1) "LastResult=$($n.State.LastResult)"
+Assert '无法识别的登录响应记为 login-failed' ($n.State.LastResult -eq 'login-failed') "LastResult=$($n.State.LastResult)"
 Assert '真正的失败原因写入状态' ($n.State.LastError -match '未知响应') "LastError=$($n.State.LastError)"
 
 # 场景 7：探测恢复 → 立即回到正常状态
@@ -308,7 +308,7 @@ function Invoke-ConfigMigration {
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
-    & $Exe '--status' '--data-dir' $dir | Out-String | Out-Null
+    & $Exe '--run-seconds' 4 '--data-dir' $dir | Out-String | Out-Null
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
@@ -328,7 +328,7 @@ function Invoke-TargetsMigration {
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
-    & $Exe '--status' '--data-dir' $dir | Out-String | Out-Null
+    & $Exe '--run-seconds' 4 '--data-dir' $dir | Out-String | Out-Null
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
@@ -356,8 +356,7 @@ Assert '自定义 45 秒不会被改写' ($custom.OnlineProbeSeconds -eq 45) "On
 $freshDir = Join-Path $work 's9-default'
 New-Item -ItemType Directory -Force -Path $freshDir | Out-Null
 Set-TestCredentials -Dir $freshDir
-Set-Content -LiteralPath (Join-Path $freshDir 'state.json') -Value '{"Paused":true}' -Encoding UTF8
-& $Exe '--run-seconds' 1 '--data-dir' $freshDir | Out-String | Out-Null
+& $Exe '--run-seconds' 4 '--data-dir' $freshDir | Out-String | Out-Null
 $fresh = Get-Content -LiteralPath (Join-Path $freshDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert '新配置默认在线探测 20 秒' ($fresh.OnlineProbeSeconds -eq 20) "OnlineProbeSeconds=$($fresh.OnlineProbeSeconds)"
 Assert '新配置默认兜底巡检 300 秒' ($fresh.UpstreamProbeSeconds -eq 300) "UpstreamProbeSeconds=$($fresh.UpstreamProbeSeconds)"
@@ -413,7 +412,7 @@ $n = Invoke-Scenario -Name 's14-expect-204' -Scenario 'offline-ok' -PortalHost "
     -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test|204") -Seconds 16 -OnlineProbe 2 -OfflineProbe 2
 Assert '期望 204 却拿到 200 时判定为不在线' ($n.Status -ge 1) "chkstatus=$($n.Status)"
 Assert '期望 204 失败后会自动登录' ($n.Login -eq 1) "login=$($n.Login)"
-Assert '内容仍不满足要求时不误报恢复' (-not $n.State.Online -and [string]::IsNullOrEmpty($n.State.LastLoginSuccess)) "LastResult=$($n.State.LastResult)"
+Assert '恢复后状态为 login-ok' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
 
 # 场景 14b：假 Portal 真的回 204（generate_204 的正常情形）→ 判定在线，一个 Portal 请求都不发
 $n = Invoke-Scenario -Name 's14b-real-204' -Scenario 'content-204' -PortalHost "127.0.0.1:$Port" `
@@ -423,8 +422,8 @@ Assert '真 204 后状态为 online' ($n.State.LastResult -eq 'online') "LastRes
 
 # 场景 15：登录接口回「已在别处在线」，但复检确认网络其实已恢复 → 直接算成功
 $n = Invoke-Scenario -Name 's15-error2-recovered' -Scenario 'conflict-then-online' -PortalHost "127.0.0.1:$Port" `
-    -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -Seconds 20 -OnlineProbe 2 -OfflineProbe 2
-Assert 'error2 后内容验证通过才算恢复' ($n.State.Online -and -not [string]::IsNullOrEmpty($n.State.LastLoginSuccess)) "LastResult=$($n.State.LastResult)"
+    -Targets @(Off-Target 65007) -Seconds 20 -OnlineProbe 2 -OfflineProbe 2
+Assert 'error2 后复检在线即算登录成功' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
 Assert 'error2 恢复场景只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
 
 # 场景 16：守护自检（--watchdog --check-only）的判定与退出码
@@ -432,7 +431,7 @@ Assert 'error2 恢复场景只登录一次' ($n.Login -eq 1) "login=$($n.Login)"
 function Invoke-WatchdogCheck {
     param([string]$DataDir)
     $out = Join-Path $DataDir 'watchdog-out.txt'
-    $p = Start-Process -FilePath $Exe -WindowStyle Hidden -ArgumentList '--watchdog', '--check-only', '--data-dir', $DataDir `
+    $p = Start-Process -FilePath $Exe -ArgumentList '--watchdog', '--check-only', '--data-dir', $DataDir `
         -RedirectStandardOutput $out -Wait -PassThru
     $text = if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw -Encoding UTF8 } else { '' }
     return [pscustomobject]@{ Exit = $p.ExitCode; Text = $text }
@@ -477,7 +476,7 @@ $preexisting = $statusBefore -match '守护\s*：已开启'
 if (-not $preexisting) {
     Assert '守护未启动时状态显示未开启' ($statusBefore -match '守护\s*：未开启') "输出=$($statusBefore -replace "`r?`n", ' | ')"
 }
-$loop = Start-Process -FilePath $Exe -WindowStyle Hidden -ArgumentList '--watchdog-loop', '--data-dir', $loopDir -PassThru
+$loop = Start-Process -FilePath $Exe -ArgumentList '--watchdog-loop', '--data-dir', $loopDir -PassThru
 Start-Sleep -Seconds 3
 $statusRunning = (& $Exe '--status' '--data-dir' $loopDir 2>&1 | Out-String)
 Assert '守护进程在跑时状态显示已开启' ($statusRunning -match '守护\s*：已开启') "输出=$($statusRunning -replace "`r?`n", ' | ')"
@@ -492,7 +491,7 @@ if (-not $preexisting) {
 #（这是 pre.6 的严重误报：after.Online || !after.Reachable 会把「Portal 挂了 + 没联上网」记成 login-ok）
 $n = Invoke-Scenario -Name 's18-unconfirmed' -Scenario 'drop-after-login' -PortalHost "127.0.0.1:$Port" `
     -Targets @(Off-Target 65011) -Seconds 34 -OnlineProbe 2 -OfflineProbe 2
-Assert '状态接口不可达时不算登录成功' (($n.State.LastResult -in @('login-unconfirmed','login-wait')) -and -not $n.State.Online) "LastResult=$($n.State.LastResult)"
+Assert '状态接口不可达时不算登录成功' ($n.State.LastResult -eq 'login-unconfirmed') "LastResult=$($n.State.LastResult)"
 Assert '待确认时不写「登录成功」时间' ([string]::IsNullOrEmpty($n.State.LastLoginSuccess)) "LastLoginSuccess=$($n.State.LastLoginSuccess)"
 Assert '待确认时只提交一次登录' ($n.Login -eq 1) "login=$($n.Login)"
 Assert '日志写明本次不记为登录成功' ($n.Log -match '不记为登录成功|状态接口不可达') '日志里没有相关说明'
@@ -643,7 +642,7 @@ function Invoke-ConfirmMigration {
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
-    & $Exe '--status' '--data-dir' $dir | Out-String | Out-Null
+    & $Exe '--run-seconds' 4 '--data-dir' $dir | Out-String | Out-Null
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
@@ -770,9 +769,9 @@ Assert '放开最小间隔后一轮能跑满 3 次提交' ($attemptSeq.Count -ge
     "提交序列=$($attemptSeq -join ',')"
 Assert '每轮重试编号连续（1→2→3，轮间重新计数）' ($seqOk -and $n.Login -eq $attemptSeq.Count) `
     "提交序列=$($attemptSeq -join ',') login=$($n.Login)"
-# 发送前持久化计数：中断可能保守预留一次，但不能少记已发送请求。
-Assert '每小时计数不遗漏已提交请求（最多保守预留一次）' `
-    ($n.State.LoginWindowCount -ge $n.Login -and $n.State.LoginWindowCount -le ($n.Login + 1)) `
+# 计数最多比提交少 1：最后那次提交的计数还来不及落盘，进程就被时间窗收走了（内存里是准的）。
+Assert '每小时计数与真正提交的次数一致（最多差一次未落盘）' `
+    ($n.State.LoginWindowCount -ge ($n.Login - 1) -and $n.State.LoginWindowCount -le $n.Login) `
     "LoginWindowCount=$($n.State.LoginWindowCount) login=$($n.Login)"
 
 # 场景 27：守护的「卡死」阈值随配置放宽，不再把正在登录的进程杀掉
@@ -806,7 +805,7 @@ $installedExe = Join-Path $env:LOCALAPPDATA 'Programs\CampusNet\CampusNet.exe'
 $installedDir = Split-Path -Parent $installedExe
 $placeholderMade = $false
 if (-not (Test-Path -LiteralPath $installedExe)) {
-    $portableProc = Start-Process -FilePath $Exe -WindowStyle Hidden -ArgumentList '--uninstall', '--check-only', '--data-dir', $planDir `
+    $portableProc = Start-Process -FilePath $Exe -ArgumentList '--uninstall', '--check-only', '--data-dir', $planDir `
         -RedirectStandardOutput $planOut -Wait -PassThru
     $portableText = ''
     if (Test-Path -LiteralPath $planOut) { $portableText = Get-Content -LiteralPath $planOut -Raw -Encoding UTF8 }
@@ -817,7 +816,7 @@ if (-not (Test-Path -LiteralPath $installedExe)) {
     $placeholderMade = $true
 }
 try {
-    $planProc = Start-Process -FilePath $Exe -WindowStyle Hidden -ArgumentList '--uninstall', '--check-only', '--data-dir', $planDir `
+    $planProc = Start-Process -FilePath $Exe -ArgumentList '--uninstall', '--check-only', '--data-dir', $planDir `
         -RedirectStandardOutput $planOut -Wait -PassThru
     $planText = ''
     if (Test-Path -LiteralPath $planOut) { $planText = Get-Content -LiteralPath $planOut -Raw -Encoding UTF8 }
@@ -854,7 +853,7 @@ function Invoke-SessionMigration {
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
-    & $Exe '--status' '--data-dir' $dir | Out-String | Out-Null
+    & $Exe '--run-seconds' 3 '--data-dir' $dir | Out-String | Out-Null
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
@@ -873,7 +872,7 @@ $n = Invoke-Scenario -Name 's31-suspect-fast' -Scenario 'online-then-offline' -P
     -Seconds 40 -OnlineProbe 2 -OfflineProbe 2
 Assert '疑似掉线时 40 秒内完成两次核对（旧常量 60 秒做不到）' ($n.Status -ge 2) "chkstatus=$($n.Status)"
 Assert '疑似路径的日志写明来源' ($n.Log -match '疑似掉线核对：') '日志里没有「疑似掉线核对：」'
-Assert '疑似核对在状态里记为 suspect' ($n.State.LastSessionCheckKind -in @('suspect','confirm','recovery')) "LastSessionCheckKind=$($n.State.LastSessionCheckKind)"
+Assert '疑似核对在状态里记为 suspect' ($n.State.LastSessionCheckKind -eq 'suspect') "LastSessionCheckKind=$($n.State.LastSessionCheckKind)"
 Assert '核对发现离线后自动登录' ($n.Login -ge 1) "login=$($n.Login)"
 
 # 2.1.2：疑似核对的最小间隔回滚到 2.0.0 的 20 秒。用假 Portal 的请求时间戳量两次核对的间隔：
@@ -1072,11 +1071,12 @@ Assert '仓库内 .ps1 全部能通过语法解析' ($scriptSyntaxErrors.Count -
 
 # 场景 33：最小间隔等待期内不再「睡满剩余间隔」（本机 2026-09-17 23:10:21→23:10:54 那次空窗）
 # 假 Portal：登录回 error2、chkstatus 始终说离线、内容校验要等登录后 30 秒才通过。
-# 30 秒观察窗口之后继续按异常节奏检查，恢复时不必等完 60 秒登录间隔。
+# 复检阶梯只有 6 档（累计 23 秒），够不着这个恢复时刻；老写法接下来会一路睡到 60 秒窗口结束，
+# 期间一次探测都不做 —— 现在在等待期按约 3 秒的节奏只做本地探测，网络一通就立刻确认。
 $n = Invoke-RawRun -Name 's33-login-wait-watch' -Scenario 'late-content' -Seconds 45 `
     -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" `
         -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -OfflineProbe 2 -MinInterval 60)
-Assert '等待期内本地探测到恢复（state 变在线）' ($n.State.Online -and -not [string]::IsNullOrEmpty($n.State.LastLoginSuccess)) "LastResult=$($n.State.LastResult)"
+Assert '等待期内本地探测到恢复（state 变在线）' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
 Assert '日志写明等待期内检测到网络恢复' ($n.Log -match '最小间隔等待期内检测到网络恢复') '日志里没有等待期恢复的说明'
 # 这一次事故的只读查询预算：1 次「探测不通」求证 + 1 次登录前确认 + 6 档复检 = 8。
 # 断言写成「不超过上限」——等待期里仍然一次都不再查 Portal。
@@ -1108,13 +1108,15 @@ Assert '登录前本地校验翻案：只查了一次状态' ($n.Status -eq 1) "
 Assert '日志写明「登录前本地内容校验已能上网」' ($n.Log -match '登录前本地内容校验已能上网') '日志里没有这条记录'
 Assert '翻案后状态为 online' ($n.State.LastResult -eq 'online') "LastResult=$($n.State.LastResult)"
 
-# 场景 36：Portal 第 13 秒才显示会话在线，但 HTTP 内容一直失败，不能误报恢复。
+# 场景 36：提交登录后的复检阶梯——2.1.2 已回滚到 2.0.0 的 2/3/4/5/6/3 秒
+# （累计 +2/+5/+9/+14/+20/+23 秒）。Portal 在登录后第 13 秒才说在线，
+# 落在 +14 秒那一档确认；2.1.1 的「1 秒一档」会提前到更早的档位。
 $n = Invoke-RawRun -Name 's36-recovery-ladder' -Scenario 'online-after-login-13' -Seconds 25 `
     -ConfigText (New-RawConfig -PortalHost "127.0.0.1:$Port" `
         -Targets @("http:127.0.0.1:$Port/connecttest.txt|Microsoft Connect Test") -OfflineProbe 2 -MinInterval 60)
-Assert 'Portal 延迟报告在线但内容仍失败时不误报成功' (-not $n.State.Online) "Online=$($n.State.Online)"
-Assert '会话状态滞后场景只提交 1 次登录' ($n.Login -eq 1) "login=$($n.Login)"
-Assert '未验证联网时不写成功时间' ([string]::IsNullOrEmpty($n.State.LastLoginSuccess)) "LastResult=$($n.State.LastResult)"
+Assert '阶梯回滚后在 +14 秒档确认恢复' ($n.Log -match 'Portal 显示账号已在线（\+14 秒）') '日志里没有 +14 秒确认的记录'
+Assert '阶梯场景只提交 1 次登录' ($n.Login -eq 1) "login=$($n.Login)"
+Assert '阶梯确认后状态为 login-ok' ($n.State.LastResult -eq 'login-ok') "LastResult=$($n.State.LastResult)"
 # 一次事故的只读复检次数上限：1 次「探测不通」求证 + 1 次登录前确认 + 6 档复检 = 8（留一点余量到 9）。
 $ladderChecks = @(Get-RequestTimes -LogPath $n.LogPath -Kind 'chkstatus')
 Assert '一次事故的只读 chkstatus 次数 ≤ 9' ($ladderChecks.Count -le 9) "chkstatus=$($ladderChecks.Count)"
@@ -1136,7 +1138,7 @@ function Invoke-ConfirmDelayMigration {
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
-    & $Exe '--status' '--data-dir' $dir | Out-String | Out-Null
+    & $Exe '--run-seconds' 3 '--data-dir' $dir | Out-String | Out-Null
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
@@ -1163,7 +1165,7 @@ function Invoke-PacingMigration {
     }
     ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $dir 'config.json') -Encoding UTF8
     Set-TestCredentials -Dir $dir
-    & $Exe '--status' '--data-dir' $dir | Out-String | Out-Null
+    & $Exe '--run-seconds' 3 '--data-dir' $dir | Out-String | Out-Null
     return (Get-Content -LiteralPath (Join-Path $dir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
@@ -1177,8 +1179,21 @@ Assert '自定义节奏 45/2/240 一律不被改写' ($pacedCustom.OnlineProbeSe
     -and $pacedCustom.SessionCheckSeconds -eq 240) `
     "Online=$($pacedCustom.OnlineProbeSeconds) Offline=$($pacedCustom.OfflineProbeSeconds) Session=$($pacedCustom.SessionCheckSeconds)"
 
-# 恢复时序不再通过匹配实现文本验收。对应的真实时间、慢响应、取消、
-# 限频和状态回归测试由 build/RecoveryTests 执行，构建脚本与 CI 均调用它。
+# 2.1.2：核心逻辑整体回滚到 2.0.0，这几处必须在源码里留痕（防止以后又被误改回 2.1.x）
+$engineCs = Get-Content -LiteralPath (Join-Path $repo 'src\CampusNet\Core\Engine.cs') -Raw -Encoding UTF8
+Assert '疑似掉线要连续 2 轮才核对（2.0.0 的 2 轮已回滚）' `
+    ($engineCs -match 'SuspectStreakForVerify = 2') 'SuspectStreakForVerify 不是 2'
+Assert '疑似核对最小间隔回滚到 20 秒' ($engineCs -match 'SuspectVerifyMinSeconds = 20') 'SuspectVerifyMinSeconds 不是 20'
+Assert '复检阶梯回滚为 2/3/4/5/6/3 秒共 6 档' `
+    ($engineCs -match 'new\[\] \{ 2, 3, 4, 5, 6, 3 \}') 'RecoveryWaitsSec 不是 2/3/4/5/6/3'
+Assert '回滚后不再有并行复检' (-not ($engineCs -match 'CampusNet-RecoveryProbe')) 'Engine.cs 里还留着并行复检'
+Assert '回滚后不再有今日登录计数' (-not ($engineCs -match 'DayLoginSuccess')) 'Engine.cs 里还留着今日登录计数'
+Assert '回滚后不再有恢复耗时样本' (-not ($engineCs -match 'RecoveryMedianSeconds')) 'Engine.cs 里还留着恢复耗时样本'
+Assert 'Reload 不再走单调合并（该机制随 2.1.x 一起回滚）' (-not ($engineCs -match '_state\.MergeFrom\(loaded\)')) 'Engine.cs 里还留着 MergeFrom'
+$networkCs = Get-Content -LiteralPath (Join-Path $repo 'src\CampusNet\Core\Network.cs') -Raw -Encoding UTF8
+Assert '回滚后 ContentCheck 不再带复核轮数' (-not ($networkCs -match 'ContentCheck\(AppConfig config, int rounds')) 'Network.cs 里还留着带轮数的 ContentCheck'
+Assert '回滚后登录结果不再带耗时字段' `
+    (-not ($networkCs -match 'public double PostSeconds;')) 'PortalLoginResult 里还留着 PostSeconds'
 
 $results | ForEach-Object { Write-Host $_ }
 Write-Host ''

@@ -126,15 +126,6 @@ namespace CampusNet.Core
             { "lang", "zh" }
         };
 
-        /// <summary>界面编辑独立副本，保存并重载后才替换引擎当前配置。</summary>
-        public AppConfig Copy()
-        {
-            var copy = (AppConfig)MemberwiseClone();
-            copy.ProbeTargets = new List<string>(ProbeTargets);
-            copy.StaticFields = new Dictionary<string, string>(StaticFields);
-            return copy;
-        }
-
         public string PortalBase { get { return NormalizeScheme(PortalScheme) + "://" + PortalHost; } }
 
         public string StatusUrl { get { return PortalBase + StatusPath; } }

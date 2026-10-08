@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -270,13 +270,16 @@ namespace CampusNet.Core
                 AppConfig config = AppConfig.Load(AppPaths.ConfigFile);
                 if (!config.Corrupted)
                 {
-                    int perProbeMs = Math.Max(500, Math.Max(config.HttpProbeTimeoutMs, config.ProbeTimeoutMs));
-                    int probeRounds = Math.Max(1, config.ConfirmAttempts) + 3;
-                    int loginSeconds = Math.Max(1, config.RetryCount) * Math.Max(1, config.LoginTimeoutSec);
+                    // 探测：并行的每一轮约等于单条目标超时，复检 N 轮 + 内容补测两轮
+                    int perProbeMs = Math.Max(500, Math.Max(config.HttpProbeTimeoutMs, config.ProbeTimeoutMs)) + 1500;
+                    int probeRounds = Math.Max(1, config.ConfirmAttempts) + 2;
+                    // 登录：每次提交 = 登录超时 + 状态查询超时 + 固定等待（2 秒复检 + 1 秒余量）
+                    int perAttemptSeconds = Math.Max(1, config.LoginTimeoutSec) + Math.Max(1, config.StatusTimeoutSec) + 3;
+                    int loginSeconds = Math.Max(1, config.RetryCount) * perAttemptSeconds;
                     budgetSeconds = (probeRounds * perProbeMs) / 1000
-                        + (Math.Max(0, config.ConfirmAttempts - 1) * Math.Max(0, config.ConfirmGapMs)) / 1000
-                        + loginSeconds + 2 * Math.Max(1, config.StatusTimeoutSec)
-                        + Math.Max(0, config.LoginConfirmDelaySec) + 30 + 3;
+                        + loginSeconds
+                        + Math.Max(0, config.LoginConfirmDelaySec)
+                        + (Math.Max(0, config.ConfirmGapMs) / 1000) + 1;
                 }
             }
             catch { }

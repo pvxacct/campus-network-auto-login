@@ -382,8 +382,8 @@ namespace CampusNet
             Logger log = CreateLogger();
             log.Info("命令行模式启动（" + (relogin ? "立即重连" : "单次检查") + "，运行 " + seconds + " 秒）。");
             var engine = new LoginEngine(log);
-            if (relogin) { engine.Relogin(); }
             engine.Start();
+            if (relogin) { engine.Relogin(); }
             var deadline = DateTime.Now.AddSeconds(seconds);
             while (DateTime.Now < deadline) { Thread.Sleep(250); }
             EngineSnapshot snapshot = engine.Snapshot();
@@ -411,9 +411,9 @@ namespace CampusNet
             int budget = Math.Max(10, maxSeconds);
             log.Info("命令行模式启动（立即重连，等待流程跑完，最长 " + budget + " 秒）。");
             var engine = new LoginEngine(log);
+            engine.Start();
             long startId = engine.Snapshot().EvaluationId;
             engine.Relogin();
-            engine.Start();
 
             var deadline = DateTime.Now.AddSeconds(budget);
             bool completed = false;
@@ -488,8 +488,6 @@ namespace CampusNet
             {
                 case "periodic": return "定时巡检";
                 case "suspect": return "疑似掉线核对";
-                case "confirm": return "登录前确认";
-                case "recovery": return "恢复观察";
                 default: return string.Empty;
             }
         }
@@ -526,19 +524,15 @@ namespace CampusNet
             }
 
             _log = CreateLogger();
-            if (!selfTest) { EnableAutoRestart(); }
+            EnableAutoRestart();
             _log.Info("程序启动：" + AppPaths.Version + "，" + (startHidden ? "托盘后台模式" : "主窗口模式")
                 + "，数据目录 " + AppPaths.DataDir);
             // 守护进程：独立于本进程，主程序崩溃或卡死时由它拉起来（不需要管理员权限）
-            if (!selfTest)
-            {
-                Watchdog.ResetIntent();
-                Watchdog.EnsureRunning(_log);
-            }
+            Watchdog.ResetIntent();
+            Watchdog.EnsureRunning(_log);
             _engine = new LoginEngine(_log);
             _engine.StatusChanged += OnEngineStatusChanged;
-            // UI self-test must not submit credentials or leave a watchdog behind.
-            if (!selfTest) { _engine.Start(); }
+            _engine.Start();
 
             _tray = new TrayIcon(_engine.Config.ShowBalloon);
             _tray.OpenRequested += ShowWindow;
@@ -548,7 +542,7 @@ namespace CampusNet
             _tray.ExitRequested += delegate { RequestExit(); };
 
             _window = new MainWindow(_engine, _log, _tray);
-            if (!selfTest) { WatchForShowRequest(); }
+            WatchForShowRequest();
 
             if (startHidden && !selfTest)
             {
