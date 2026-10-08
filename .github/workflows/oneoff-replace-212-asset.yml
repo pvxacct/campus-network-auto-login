@@ -23,21 +23,29 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           repo="$GITHUB_REPOSITORY"
           cp dist/CampusNet.exe CampusNet-v2.1.2.exe
-          expected="$(cut -d' ' -f1 dist/CampusNet.exe.sha256)"
+          expected="$(cut -d' ' -f1 dist/CampusNet.exe.sha256 | tr -d '\r')"
           actual="$(sha256sum CampusNet-v2.1.2.exe | cut -d' ' -f1)"
-          echo "dist sha256 : $expected"
-          echo "upload sha256: $actual"
+          echo "::notice title=sha256::dist=$expected upload=$actual"
           if [ "$expected" != "$actual" ]; then
             echo "::error title=产物哈希不一致::dist 里的 sha256 与实际文件不符，拒绝上传"
             exit 1
           fi
-          if grep -q '251731646' dist/CampusNet.exe; then
+          if grep -aq '251731646' dist/CampusNet.exe; then
             echo "::error title=产物仍含真实学号::拒绝上传"
             exit 1
           fi
-          gh release upload v2.1.2 CampusNet-v2.1.2.exe --repo "$repo" --clobber
-          echo "=== v2.1.2 附件 ==="
-          gh release view v2.1.2 --repo "$repo" --json tagName,prerelease,assets
+          echo "::notice title=开始上传::asset=CampusNet-v2.1.2.exe"
+          if out=$(gh release upload v2.1.2 CampusNet-v2.1.2.exe --repo "$repo" --clobber 2>&1); then
+            echo "::notice title=上传成功::$out"
+          else
+            echo "::error title=上传失败::$out"
+            exit 1
+          fi
+          if info=$(gh release view v2.1.2 --repo "$repo" --json tagName,prerelease,assets 2>&1); then
+            echo "::notice title=v2.1.2 现状::$info"
+          else
+            echo "::warning title=读取 Release 失败::$info"
+          fi
