@@ -160,7 +160,7 @@
                         <TextBlock Grid.Row="0" Grid.Column="0" Text="账号" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,6" />
                         <Grid Grid.Row="0" Grid.Column="1" Margin="0,0,0,6">
                             <TextBox x:Name="UserNameBox" />
-                            <TextBlock x:Name="UserNamePlaceholder" Style="{StaticResource Placeholder}" Text="填学号 / 账号，例如 251731646" />
+                            <TextBlock x:Name="UserNamePlaceholder" Style="{StaticResource Placeholder}" Text="填学号 / 账号，例如 2xxxxxxxx" />
                         </Grid>
                         <TextBlock Grid.Row="1" Grid.Column="0" Text="密码" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,10,0" />
                         <Grid Grid.Row="1" Grid.Column="1">
